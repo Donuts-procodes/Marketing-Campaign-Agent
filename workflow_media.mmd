@@ -1,0 +1,138 @@
+flowchart TD
+    %% ============================================================
+    %% 1. TOP: CLIENT & INGRESS LAYER
+    %% ============================================================
+    subgraph INGRESS_LAYER["Ingress & Client Interface"]
+        direction LR
+        FE["Frontend (Next.js Dashboard)<br>• Objectives, Constraints & Asset Ingest<br>• Real-Time SSE Stream<br>• Creative Canvas & HITL Review"]
+
+        API["API Gateway (FastAPI Controller)<br>• Auth, Tenant Boundary & Credential Vault<br>• Sliding-Window Rate Limiting (Redis ZSET)<br>• Endpoints: /jobs, /stream, /approve, /ingest-references"]
+
+        FE -->|"POST /jobs | POST /approve"| API
+        API -.->|"GET /stream (SSE Broadcast)"| FE
+    end
+
+    %% ============================================================
+    %% 2. CORE MIDDLE SECTION: 2-COLUMN BALANCED GRID
+    %% ============================================================
+
+    %% LEFT COLUMN: DATABASE & STATE SERVICES
+    subgraph DB_COLUMN["Database & State Services"]
+        direction TB
+        REDIS[("Redis Broker & Ephemeral State<br>• ZSET Rate Limiters<br>• Task Queues (LPUSH/RPOPLPUSH)<br>• Pub/Sub Telemetry Stream<br>• HITL Wait Locks & 72h Fatigue Buffer")]
+
+        MONGO[("MongoDB Primary Document Store<br>• campaign_briefs (Strategy & Personas)<br>• media_assets (AST Layouts & Copy Variants)<br>• visual_patterns (Competitor Hooks & Rules)<br>• platform_deployments (Remote IDs & Logs)")]
+
+        S3[("S3 / Cloudflare R2 Media Store<br>• Ingested Competitor Screenshots<br>• Rendered Multi-Ratio Canvases<br>• Generated Diffusion Assets & Public CDN")]
+    end
+
+    %% RIGHT COLUMN: LANGGRAPH STATE MACHINE
+    subgraph LG_COLUMN["LangGraph Orchestrator (Media Execution Engine)"]
+        direction TB
+
+        subgraph LOOP_1["Loop 1: Context & Visual Pattern Extraction"]
+            direction TB
+            T_HYDRATE["Thought: Hydrate brief, brand kit & competitor screenshots"]
+            GATE_CREDS{"Decision: Credentials<br>valid & active?"}
+            T_VISION["Thought: Deconstruct competitor visual patterns via Vision LLM"]
+
+            T_HYDRATE --> GATE_CREDS
+            GATE_CREDS -- "YES" --> T_VISION
+        end
+
+        subgraph LOOP_2["Loop 2: Trends Mining & Template AST Synthesis"]
+            direction TB
+            T_TRENDS["Thought: Query trending hashtags & category hooks"]
+            T_TEMPLATES["Thought: Synthesize unique brand-aligned AST templates & channel copy"]
+
+            T_TRENDS --> T_TEMPLATES
+        end
+
+        subgraph LOOP_3["Loop 3: Programmatic Assembly & Policy Gate"]
+            direction TB
+            T_RENDER["Thought: Render image canvases via Diffusion & Canvas Engine"]
+            GATE_POLICY{"Decision: Clean policy<br>pass on all channels?"}
+
+            T_RENDER --> GATE_POLICY
+        end
+
+        subgraph LOOP_4["Loop 4: HITL Review & Remote Setup"]
+            direction TB
+            T_SUSPEND["Thought: Persist rendered previews & enter interrupt"]
+            GATE_HITL{"Decision: User approved<br>creatives & setup?"}
+            T_SETUP["Thought: Remote campaign creation via Ad APIs (State: PAUSED)"]
+            T_HANDOFF["Thought: Package approved asset CDN URLs & live platform IDs"]
+
+            T_SUSPEND --> GATE_HITL
+            GATE_HITL -- "APPROVED" --> T_SETUP --> T_HANDOFF
+        end
+
+        %% Clean Linear Handoffs Between Loops
+        T_VISION --> T_TRENDS
+        T_TEMPLATES --> T_RENDER
+        GATE_POLICY -- "PASS" --> T_SUSPEND
+    end
+
+    %% ============================================================
+    %% 3. BOTTOM: EXTERNAL TOOLS, PLATFORMS & RUNTIME SERVICES
+    %% ============================================================
+    subgraph EXT_LAYER["External Services & Tool Integrations"]
+        direction LR
+
+        LLM_CAG["BYOK Multimodal LLM<br>• Vision Image Deconstruction<br>• Prompt Pinned KV-Cache (CAG)<br>• Structured AST Schema Generation<br>• Zero-Shot Ad Policy Audit"]
+
+        DIFF_TOOL["Canvas & Diffusion Engine<br>• Flux / SDXL / Recraft API<br>• Programmatic AST Compositor<br>• Canvases: 1:1, 9:16, 16:9"]
+
+        TRENDS_TOOL["Trend Discovery Service<br>• Tavily Search API (/search)<br>• Category Viral Hook Mining"]
+
+        AD_PLATFORMS["Ad Platform Network APIs<br>• Meta Marketing API (v21.0)<br>• Google Ads API (REST/gRPC)<br>• LinkedIn Campaign Manager"]
+    end
+
+    %% ============================================================
+    %% 4. CRITICAL CROSS-BOUNDARY ROUTING (CLEAN & SHORT)
+    %% ============================================================
+
+    %% Ingress to State & Storage
+    API -->|"Enqueues Tasks & Limits"| REDIS
+    API -->|"Uploads Raw Media"| S3
+    API -->|"Reads/Writes Briefs"| MONGO
+
+    %% Queue Dispatch & Event Telemetry
+    REDIS -->|"Task Dispatch"| T_HYDRATE
+    LG_COLUMN -.->|"Telemetry Events (PUBLISH)"| REDIS
+    REDIS -.->|"SSE Broadcast (SUBSCRIBE)"| API
+
+    %% Persistence Calls
+    T_HYDRATE <-->|"Read Brief & Context"| MONGO
+    T_SUSPEND -->|"Save Rendered Variants"| MONGO
+    T_SETUP -->|"Store Platform IDs"| MONGO
+
+    %% Model & Tool Calls (Straight Vertical Links)
+    T_VISION <-->|"Deconstruct Images"| LLM_CAG
+    T_TEMPLATES <-->|"Layout AST Generation"| LLM_CAG
+    GATE_POLICY <-->|"Audit Copy Rules"| LLM_CAG
+
+    T_TRENDS <-->|"Fetch Trends"| TRENDS_TOOL
+    T_RENDER <-->|"Generate & Composite"| DIFF_TOOL
+    DIFF_TOOL -->|"Save CDN Assets"| S3
+    T_SETUP <-->|"Deploy Remote Campaigns"| AD_PLATFORMS
+
+    %% Downstream Agent Handoff
+    T_HANDOFF ==>|"POST /api/v1/publishing/schedule/jobs"| DOWNSTREAM_AGENT["Downstream: Publishing & Scheduling Agent"]
+
+    %% ============================================================
+    %% 5. STYLING DIRECTIVES
+    %% ============================================================
+    classDef ingressBox fill:#0f172a,stroke:#475569,stroke-width:1.5px,color:#f8fafc;
+    classDef storageBox fill:#022c22,stroke:#10b981,stroke-width:1.5px,color:#f8fafc;
+    classDef graphLoopBox fill:#081026,stroke:#38bdf8,stroke-width:1.5px,color:#f8fafc;
+    classDef toolBox fill:#18181b,stroke:#f59e0b,stroke-width:1.5px,color:#f8fafc;
+    classDef decisionNode fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#ffffff;
+    classDef handoffNode fill:#3b0764,stroke:#c084fc,stroke-width:2px,color:#ffffff;
+
+    class FE,API ingressBox;
+    class REDIS,MONGO,S3 storageBox;
+    class T_HYDRATE,T_VISION,T_TRENDS,T_TEMPLATES,T_RENDER,T_SUSPEND,T_SETUP,T_HANDOFF graphLoopBox;
+    class GATE_CREDS,GATE_POLICY,GATE_HITL decisionNode;
+    class LLM_CAG,DIFF_TOOL,TRENDS_TOOL,AD_PLATFORMS toolBox;
+    class DOWNSTREAM_AGENT handoffNode;

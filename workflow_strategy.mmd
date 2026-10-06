@@ -1,0 +1,130 @@
+flowchart TD
+    %% ============================================================
+    %% CLIENT & INGRESS LAYER
+    %% ============================================================
+    FE["Frontend (Next.js Dashboard)\n• Strategy Planner Interface\n• Objective & Budget Constraints Input\n• Real-Time Synthesis Telemetry (SSE)\n• Interactive Brief Review & Approval Checkpoint"]
+    API["API Gateway (FastAPI Controller)\n• Auth & Tenant Boundary (merchant_id Context)\n• Job & Approval Dispatcher\n• Sliding Window Rate Limiter (Redis ZSET)"]
+
+    FE -->|"1. POST /api/v1/campaign/strategy/jobs"| API
+    FE -->|"POST /api/v1/campaign/strategy/{id}/approve (Human Action)"| API
+    API -.->|"GET /api/v1/campaign/strategy/jobs/{id}/stream (SSE Telemetry)"| FE
+
+    %% ============================================================
+    %% DATABASE & STATE SERVICES
+    %% ============================================================
+    subgraph DB_SERVICES["Database & State Services"]
+        REDIS[("Redis Broker & State Cache\n• ZSET: Sliding Window Rate Limiting\n• LPUSH/RPOPLPUSH: Background Task Queues\n• Pub/Sub: Real-Time Telemetry & Milestone Stream")]
+        MONGO[("MongoDB (Primary Document Store)\n• Upstream: SWOT Reports & Competitor Benchmarks\n• Upstream: Audience Personas, ICPs & Pain Points\n• Historical Campaign Logs & Performance\n• Completed Campaign Strategy Briefs")]
+    end
+
+    %% ============================================================
+    %% BYOK LLM & INFERENCE LAYER (CAG RUNTIME)
+    %% ============================================================
+    subgraph MODEL_SERVICES["BYOK LLM Layer (Reasoning & Optimization Engine)"]
+        LLM_CAG["BYOK LLM Layer (OpenAI / Anthropic / Groq)\n• System Prompt Pinned KV-Cache (CAG)\n• Ingests Unbroken Upstream Research + Personas\n• Structured Pydantic Output Generation"]
+    end
+
+    %% ============================================================
+    %% STATE MACHINE & THOUGHT LOOPS (LANGGRAPH)
+    %% ============================================================
+    subgraph ORCHESTRATOR["LangGraph Orchestrator (Strategy Planning Engine)"]
+        direction TB
+
+        %% Loop 1: Ingestion & Upstream Convergence
+        subgraph LOOP_1["Loop 1: Context Hydration & Objective Decomp (UC-01, UC-02, UC-09)"]
+            T_HYDRATE["Thought: Hydrate business objectives, constraints & upstream artifacts into RAM"]
+            GATE_OBJECTIVE{"Decision: Objective actionable\n& constraints clear?"}
+            T_CLARIFY["Thought: Generate focused clarification prompt (UC-09)"]
+            T_DECOMPOSE["Thought: Decompose objective into measurable target metrics"]
+
+            T_HYDRATE --> GATE_OBJECTIVE
+            GATE_OBJECTIVE -- "NO (Vague Goal)" --> T_CLARIFY
+            GATE_OBJECTIVE -- "YES" --> T_DECOMPOSE
+        end
+
+        %% Loop 2: Strategic Synthesis & Matrix Correlation
+        subgraph LOOP_2["Loop 2: Strategic Synthesis & Channel Matrix (UC-03, UC-04, UC-05)"]
+            T_CORRELATE["Thought: Correlate persona pain points with competitor positioning gaps"]
+            T_CHANNEL_FIT["Thought: Derive channel priority matrix from audience behavior & historical ROI"]
+            T_CORRELATE --> T_CHANNEL_FIT
+        end
+
+        %% Loop 3: Optimization & Schedule Modeling
+        subgraph LOOP_3["Loop 3: Budget Optimization & Milestone Routing (UC-06, UC-07, UC-08)"]
+            T_BUDGET["Thought: Calculate channel spend splits & flag budget assumptions"]
+            T_TIMELINE["Thought: Build dependency calendar, phases & launch milestones"]
+            T_CONSOLIDATE["Thought: Compile structured execution-ready Campaign Brief"]
+            T_BUDGET --> T_TIMELINE --> T_CONSOLIDATE
+        end
+
+        %% Loop 4: Approval & Downstream Handoff
+        subgraph LOOP_4["Loop 4: Governance Gate & Downstream Dispatch (UC-10, UC-11)"]
+            T_SUSPEND["Thought: Persist draft brief & enter LangGraph interrupt (Await Review)"]
+            GATE_APPROVAL{"Decision: Founder Approval Received?"}
+            T_REPLAN["Thought: Adjust constraints based on founder feedback"]
+            T_DISPATCH["Thought: Deconstruct brief into specialized downstream execution payloads"]
+
+            T_SUSPEND --> GATE_APPROVAL
+            GATE_APPROVAL -- "REJECT / FEEDBACK" --> T_REPLAN
+            GATE_APPROVAL -- "APPROVED" --> T_DISPATCH
+        end
+
+        %% Transitions inside LangGraph
+        T_DECOMPOSE --> T_CORRELATE
+        T_CHANNEL_FIT --> T_BUDGET
+        T_CONSOLIDATE --> T_SUSPEND
+        T_REPLAN --> T_CHANNEL_FIT
+    end
+
+    %% ============================================================
+    %% INGRESS & ORCHESTRATION WIRING
+    %% ============================================================
+    API -->|"Redis LPUSH (Job Queue) / ZREMRANGEBYSCORE (Rate Check)"| REDIS
+    REDIS -->|"Worker RPOPLPUSH (Task Dispatch)"| T_HYDRATE
+
+    %% Telemetry Stream Lines
+    T_DECOMPOSE -.->|"Redis PUBLISH (Target Metrics Telemetry)"| REDIS
+    T_CHANNEL_FIT -.->|"Redis PUBLISH (Channel Recommendation Stream)"| REDIS
+    T_CONSOLIDATE -.->|"Redis PUBLISH (Draft Brief Ready for Review)"| REDIS
+    REDIS -.->|"Redis SUBSCRIBE -> SSE Broadcast"| API
+
+    %% Database Read/Write Lines
+    T_HYDRATE <-->|"Read Upstream SWOT, Personas & Past Campaign Metrics"| MONGO
+    T_SUSPEND -->|"INSERT draft Campaign Brief (status: PENDING_APPROVAL)"| MONGO
+    T_DISPATCH -->|"UPDATE Campaign Brief (status: APPROVED_AND_DISPATCHED)"| MONGO
+
+    %% CAG Prompt Seeding & Inference
+    T_HYDRATE -->|"Seed System Prompt Prefix: Intact SWOT + Personas (cache_control: ephemeral)"| LLM_CAG
+    T_CORRELATE <-->|"Fast CAG Read: Evaluate Persona-Competitor Intersections"| LLM_CAG
+    T_CHANNEL_FIT <-->|"Pydantic Structured Output: Channel Mix Matrix"| LLM_CAG
+    T_BUDGET <-->|"Structured Reasoning: Budget Allocation Splits"| LLM_CAG
+    T_CONSOLIDATE <-->|"Generate Full Campaign Brief Schema"| LLM_CAG
+
+    %% Human Approval Ingress Trigger
+    API -->|"POST /approve (Resumes LangGraph Worker via Redis Interrupt)"| GATE_APPROVAL
+
+    %% Downstream Handoffs
+    T_DISPATCH ==>|"POST /api/v1/media/campaign/brief (Channel Mix, Creative Angles, Budgets)"| MEDIA_AGENT["Downstream: Media Agent (Ad Setup & Assets)"]
+    T_DISPATCH ==>|"POST /api/v1/publishing/schedule/brief (Milestones, Dates, Dependencies)"| PUBLISH_AGENT["Downstream: Publishing & Scheduling Agent"]
+
+    %% Clarification Line
+    T_CLARIFY -.->|"Emit Clarification Event -> Halt for User Input"| API
+
+    %% ============================================================
+    %% STYLING
+    %% ============================================================
+    classDef feApi fill:#1e293b,stroke:#64748b,stroke-width:1.5px,color:#f8fafc;
+    classDef loopBox fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#f8fafc;
+    classDef decision fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+    classDef warnBox fill:#431407,stroke:#fb923c,stroke-width:1.5px,color:#f8fafc;
+    classDef db fill:#064e3b,stroke:#10b981,stroke-width:1.5px,color:#f8fafc;
+    classDef tool fill:#27272a,stroke:#f59e0b,stroke-width:1.5px,color:#f8fafc;
+    classDef handoff fill:#3b0764,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+
+    class FE,API feApi;
+    class T_HYDRATE,T_DECOMPOSE,T_CORRELATE,T_CHANNEL_FIT,T_BUDGET,T_TIMELINE,T_CONSOLIDATE,T_SUSPEND,T_DISPATCH loopBox;
+    class GATE_OBJECTIVE,GATE_APPROVAL decision;
+    class T_CLARIFY,T_REPLAN warnBox;
+    class REDIS,MONGO db;
+    class LLM_CAG tool;
+    class MEDIA_AGENT,PUBLISH_AGENT handoff;

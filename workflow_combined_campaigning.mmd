@@ -1,0 +1,133 @@
+flowchart TD
+    %% Global Palette & High-Contrast Typography
+    classDef initNode fill:#f8fafc,stroke:#0f172a,stroke-width:1.5px,color:#0f172a,font-size:12px;
+    classDef orchNode fill:#0f172a,stroke:#0f172a,stroke-width:1.5px,color:#ffffff,font-weight:bold,font-size:12px;
+    classDef agentNode fill:#ffffff,stroke:#334155,stroke-width:1.5px,color:#0f172a,font-size:11px;
+    classDef outNode fill:#f1f5f9,stroke:#0f172a,stroke-width:1.5px,font-weight:bold,color:#0f172a,font-size:11px;
+    classDef gateNode fill:#ffffff,stroke:#2563eb,stroke-width:2px,color:#1e3a8a,font-weight:bold,font-size:12px;
+    classDef loopNode fill:#fef2f2,stroke:#dc2626,stroke-width:1.5px,stroke-dasharray: 4 4,color:#991b1b,font-size:11px;
+    classDef channelNode fill:#f8fafc,stroke:#475569,stroke-width:1.5px,color:#0f172a,font-size:11px;
+
+    %% -----------------------------------------------------------
+    %% STAGE 1: INGESTION & CONTEXT ORCHESTRATION
+    %% -----------------------------------------------------------
+    subgraph S1 ["STAGE 1 · CAMPAIGN INITIATION & CONTEXT ORCHESTRATION"]
+        direction LR
+        Merchant["Merchant Business Directive<br/>• Objectives, Budget ($50k) & Target Market<br/>• Service Catalogue & Target Actions"]:::initNode
+        Orchestrator["Campaigning Agent (Central Orchestrator)<br/>• Generates Global Campaign Context<br/>• Normalizes Schemas & Dispatches Scope"]:::orchNode
+        Merchant -->|"Initialize"| Orchestrator
+    end
+
+    %% -----------------------------------------------------------
+    %% STAGE 2: PARALLEL UPSTREAM RESEARCH
+    %% -----------------------------------------------------------
+    subgraph S2 ["STAGE 2 · DUAL-TRACK RESEARCH & DISCOVERY (PARALLEL)"]
+        direction LR
+
+        subgraph TrackA ["Market & Competitor Research Agent"]
+            direction LR
+            R1["Competitor Discovery<br/>(Category Querying)"]:::agentNode
+            R2["Live Ad & Price Scan<br/>(Transparency APIs)"]:::agentNode
+            R3["SWOT & Positioning Brief<br/>(Data Gaps Flagged)"]:::outNode
+            R1 --> R2 --> R3
+        end
+
+        subgraph TrackB ["Audience & Persona Agent"]
+            direction LR
+            P1["Stock-Led Profiling<br/>(Catalogue Utility)"]:::agentNode
+            P2["Feedback & Web Mining<br/>(CRM, Reviews, Drop-offs)"]:::agentNode
+            P3["Grounded Buyer Personas<br/>(Data vs Assumed)"]:::outNode
+            P1 --> P2 --> P3
+        end
+    end
+
+    %% -----------------------------------------------------------
+    %% STAGE 3: STRATEGY & CHANNEL ALLOCATION
+    %% -----------------------------------------------------------
+    subgraph S3 ["STAGE 3 · STRATEGIC SYNTHESIS & PLANNING"]
+        direction LR
+        S_Goal["Goal Decomposition<br/>(Measurable KPI Targets)"]:::agentNode
+        S_Mix["Channel Mix & Budgeting<br/>(Google, LinkedIn, Testing)"]:::agentNode
+        S_Brief["Consolidated Campaign Brief<br/>(Milestones & Dependencies)"]:::outNode
+
+        S_Goal --> S_Mix --> S_Brief
+    end
+
+    %% -----------------------------------------------------------
+    %% STAGE 4: STRATEGY APPROVAL GATEWAY
+    %% -----------------------------------------------------------
+    subgraph S4 ["STAGE 4 · HUMAN REVIEW GATEWAY 1 (STRATEGY)"]
+        direction LR
+        Gate1{"Merchant Checkpoint 1:<br/>Approve Campaign Brief & Spend?"}:::gateNode
+        Rework1["Refine Targets, Channels or Budget Allocation"]:::loopNode
+        Gate1 -- "Changes Requested" --> Rework1
+    end
+
+    %% -----------------------------------------------------------
+    %% STAGE 5: MEDIA PRODUCTION & COMPLIANCE
+    %% -----------------------------------------------------------
+    subgraph S5 ["STAGE 5 · CREATIVE PRODUCTION & POLICY VALIDATION"]
+        direction LR
+        M_Config["Ad Set & Placement Setup<br/>(Google, LinkedIn, Meta)"]:::agentNode
+        M_Content["Platform-Tailored Copy<br/>(Hooks, Creatives, CTAs)"]:::agentNode
+        M_Audit["Automated Policy Check<br/>(Compliance Clearance)"]:::outNode
+
+        M_Config --> M_Content --> M_Audit
+    end
+
+    %% -----------------------------------------------------------
+    %% STAGE 6: CREATIVE APPROVAL GATEWAY
+    %% -----------------------------------------------------------
+    subgraph S6 ["STAGE 6 · HUMAN REVIEW GATEWAY 2 (CREATIVES)"]
+        direction LR
+        Gate2{"Merchant Checkpoint 2:<br/>Approve Creatives & Copy Variants?"}:::gateNode
+        Rework2["Revise Messaging, Imagery or Landing Pages"]:::loopNode
+        Gate2 -- "Changes Requested" --> Rework2
+    end
+
+    %% -----------------------------------------------------------
+    %% STAGE 7: PUBLISHING, SCHEDULING & RESILIENCE
+    %% -----------------------------------------------------------
+    subgraph S7 ["STAGE 7 · SYNCHRONIZED PUBLISHING & RESILIENCE"]
+        direction LR
+        Pub_Queue["Queue & Peak Windowing<br/>(Engagement Analysis)"]:::agentNode
+        Pub_Sync["Synchronized Launch<br/>(Multi-Channel Sequence)"]:::agentNode
+        Pub_Monitor["Runtime Health & Auto-Retry<br/>(Duplicate-Safe Recovery)"]:::outNode
+
+        Pub_Queue --> Pub_Sync --> Pub_Monitor
+    end
+
+    %% -----------------------------------------------------------
+    %% STAGE 8: CONNECTED EXECUTION CHANNELS
+    %% -----------------------------------------------------------
+    subgraph S8 ["STAGE 8 · CONNECTED DISTRIBUTION PLATFORMS"]
+        direction LR
+        Ch1["Google Search Ads"]:::channelNode
+        Ch2["LinkedIn B2B Campaigns"]:::channelNode
+        Ch3["Meta Social Channels"]:::channelNode
+        Ch4["CMS Landing Pages"]:::channelNode
+        Ch5["Direct Email Systems"]:::channelNode
+    end
+
+    %% Clean Stage-to-Stage Pipeline Connections
+    Orchestrator -->|"Dispatch Context"| TrackA
+    Orchestrator -->|"Dispatch Context"| TrackB
+
+    R3 -->|"Market Signals"| S_Goal
+    P3 -->|"Buyer Profiles"| S_Goal
+
+    S_Brief --> Gate1
+    Gate1 -->|"Approved Brief"| M_Config
+    Rework1 -.->|"Adjust Parameters"| S_Goal
+
+    M_Audit --> Gate2
+    Gate2 -->|"Approved Assets"| Pub_Queue
+    Rework2 -.->|"Revise Variants"| M_Content
+
+    Pub_Sync --> Ch1
+    Pub_Sync --> Ch2
+    Pub_Sync --> Ch3
+    Pub_Sync --> Ch4
+    Pub_Sync --> Ch5
+
+    Pub_Monitor -.->|"Runtime Telemetry & Status Logs"| Orchestrator

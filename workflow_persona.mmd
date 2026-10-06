@@ -1,0 +1,126 @@
+flowchart TD
+    %% ============================================================
+    %% CLIENT & INGRESS LAYER
+    %% ============================================================
+    FE["Frontend (Next.js Dashboard)\n• Campaign Objectives & Catalog Input\n• Real-Time Audience Telemetry (SSE)\n• Interactive Persona & ICP Review Board"]
+    API["API Gateway (FastAPI Controller)\n• Auth & Tenant Boundary (merchant_id Context)\n• Sliding Window Rate Limiter (Redis ZSET)\n• BYOK Secret Resolution (OpenAI / Claude / Apollo Keys)"]
+
+    FE -->|"1. POST /api/v1/audience/jobs (Goals + Catalog Ref)"| API
+    FE -->|"POST /api/v1/documents/upload (Upload Catalog/CRM CSV)"| API
+    API -.->|"GET /api/v1/audience/jobs/{id}/stream (SSE Telemetry)"| FE
+
+    %% ============================================================
+    %% DATABASE & STATE SERVICES
+    %% ============================================================
+    subgraph DB_SERVICES["Database & State Services"]
+        REDIS[("Redis Broker & State Cache\n• ZSET: Sliding Window Rate Limiter\n• LPUSH/RPOPLPUSH: Async Worker Queues\n• Pub/Sub: Real-Time SSE Persona Telemetry")]
+        MONGO[("MongoDB (Primary Document Store)\n• Raw Catalog & Unstructured Docs (full_dossier_text)\n• CRM Contacts & Interaction Records\n• Completed ICPs, Personas & Refresh Baselines")]
+    end
+
+    %% ============================================================
+    %% EXTERNAL TOOLS & 3RD-PARTY API SERVICES
+    %% ============================================================
+    subgraph EXT_SERVICES["External API Services & BYOK LLM Layer"]
+        LLM_CAG["BYOK LLM Layer (OpenAI / Anthropic / Groq)\n• System Prompt Pinned KV-Cache (CAG)\n• Structured Output Engine (Pydantic Function Calling)"]
+        SEARCH_TOOL["Discovery Service\n• POST api.tavily.com/search\n• ddgs.text() (Dev Fallback)"]
+        SCRAPE_TOOL["Deep Scraping Service\n• POST api.firecrawl.dev/v1/scrape\n(Extracts G2, Reddit, Capterra Reviews)"]
+        ENRICH_TOOL["3rd-Party B2B Enrichment APIs\n• Apollo API / Clearbit / ZoomInfo\n(POST /v1/mixed_people/search)"]
+    end
+
+    %% ============================================================
+    %% STATE MACHINE & THOUGHT LOOPS (LANGGRAPH)
+    %% ============================================================
+    subgraph ORCHESTRATOR["LangGraph Orchestrator (Audience & Persona Runtime)"]
+        direction TB
+
+        %% Loop 1: Ingestion & Baseline Context
+        subgraph LOOP_1["Loop 1: Requirement & Catalog Grounding (UC-01, UC-02, UC-03)"]
+            T_HYDRATE["Thought: Hydrate business objectives, catalog & CRM docs into RAM"]
+            T_STOCK["Thought: Execute Stock-Led Profiling (map buyer intent per SKU)"]
+            T_BASELINE_ICP["Thought: Induce initial baseline ICP & mark assumptions"]
+            T_HYDRATE --> T_STOCK --> T_BASELINE_ICP
+        end
+
+        %% Loop 2: Market & Competitor Mining
+        subgraph LOOP_2["Loop 2: Conversation & Feedback Mining (UC-04)"]
+            T_SEARCH_MINING["Thought: Query competitor complaints, Reddit, G2 & category forums"]
+            T_SCRAPE_MINING["Thought: Scrape review pages & strip DOM noise to clean Markdown"]
+            T_EXTRACT_SIGNALS["Thought: Extract recurring pain points, objections & buyer language"]
+            T_SEARCH_MINING --> T_SCRAPE_MINING --> T_EXTRACT_SIGNALS
+        end
+
+        %% Loop 3: Filter Synthesis & 3rd-Party Enrichment
+        subgraph LOOP_3["Loop 3: ICP Filter Synthesis & Account Enrichment"]
+            T_SYNTH_FILTER["Thought: Convert validated signals into structured B2B filter schema"]
+            T_QUERY_ENRICH["Thought: Query external enrichment APIs to retrieve real-world accounts"]
+            GATE_VALIDATE{"Decision: Data Confidence >= 75% &\nValid Profiles >= Threshold?"}
+            T_INSUFFICIENT["Thought: Handle Insufficient Data (UC-11)\nMark unbacked traits as 'Assumption-Based'"]
+
+            T_SYNTH_FILTER --> T_QUERY_ENRICH --> GATE_VALIDATE
+            GATE_VALIDATE -- "NO (Low Signal / Missing Data)" --> T_INSUFFICIENT
+        end
+
+        %% Loop 4: Persona Synthesis & Handoff
+        subgraph LOOP_4["Loop 4: Persona Generation & Campaign Handoff (UC-05, UC-07, UC-09, UC-10)"]
+            T_SEGMENT["Thought: Segment verified audience by behavior, value & engagement"]
+            T_GEN_PERSONA["Thought: Generate structured Personas (Pain points, channels, hooks)"]
+            T_REPORT_HANDOFF["Thought: Compile report & dispatch payload to Campaign Strategy Agent"]
+            T_SEGMENT --> T_GEN_PERSONA --> T_REPORT_HANDOFF
+        end
+
+        %% Transitions inside LangGraph
+        T_BASELINE_ICP --> T_SEARCH_MINING
+        T_EXTRACT_SIGNALS --> T_SYNTH_FILTER
+        GATE_VALIDATE -- "YES (Confident Data)" --> T_SEGMENT
+        T_INSUFFICIENT --> T_SEGMENT
+    end
+
+    %% ============================================================
+    %% INGRESS & ORCHESTRATION WIRING
+    %% ============================================================
+    API -->|"Redis LPUSH (Job Queue) / ZREMRANGEBYSCORE (Rate Check)"| REDIS
+    API -->|"Parse Catalog / CRM Document -> INSERT full_dossier_text"| MONGO
+    REDIS -->|"Worker RPOPLPUSH (Task Dispatch)"| T_HYDRATE
+
+    %% Telemetry Stream Lines
+    T_BASELINE_ICP -.->|"Redis PUBLISH (Milestone Telemetry)"| REDIS
+    T_EXTRACT_SIGNALS -.->|"Redis PUBLISH (Discovered Pain Points)"| REDIS
+    GATE_VALIDATE -.->|"Redis PUBLISH (Confidence & Gate Decision)"| REDIS
+    REDIS -.->|"Redis SUBSCRIBE -> SSE Broadcast"| API
+
+    %% Database Lines
+    T_HYDRATE <-->|"db.catalog.find_one({_id: product_id}) (Intact Read)"| MONGO
+    T_REPORT_HANDOFF -->|"DB Driver: INSERT final ICP/Persona Report & Baseline"| MONGO
+
+    %% BYOK LLM (CAG) Lines
+    T_HYDRATE -->|"Seed System Prompt Prefix (cache_control: ephemeral)"| LLM_CAG
+    T_STOCK <-->|"Reasoning over hot KV-Cache (Stock-Led Buyer Types)"| LLM_CAG
+    T_SYNTH_FILTER <-->|"POST /v1/chat/completions (Structured JSON Filter Schema)"| LLM_CAG
+    T_GEN_PERSONA <-->|"Prompt Caching / CAG Read -> Synthesize Personas"| LLM_CAG
+
+    %% External Tool API Lines
+    T_SEARCH_MINING <-->|"POST https://api.tavily.com/search (G2 / Reddit / Reviews)"| SEARCH_TOOL
+    T_SCRAPE_MINING <-->|"POST https://api.firecrawl.dev/v1/scrape (Clean Markdown)"| SCRAPE_TOOL
+    T_QUERY_ENRICH <-->|"POST /v1/mixed_people/search (Apollo / Clearbit API)"| ENRICH_TOOL
+
+    %% Downstream Handoff
+    T_REPORT_HANDOFF ==>|"POST /api/v1/campaign/strategy/handoff"| STRATEGY_AGENT["Downstream: Campaign Strategy Agent"]
+
+    %% ============================================================
+    %% STYLING
+    %% ============================================================
+    classDef feApi fill:#1e293b,stroke:#64748b,stroke-width:1.5px,color:#f8fafc;
+    classDef loopBox fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#f8fafc;
+    classDef decision fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+    classDef warnBox fill:#431407,stroke:#fb923c,stroke-width:1.5px,color:#f8fafc;
+    classDef db fill:#064e3b,stroke:#10b981,stroke-width:1.5px,color:#f8fafc;
+    classDef tool fill:#27272a,stroke:#f59e0b,stroke-width:1.5px,color:#f8fafc;
+    classDef handoff fill:#3b0764,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+
+    class FE,API feApi;
+    class T_HYDRATE,T_STOCK,T_BASELINE_ICP,T_SEARCH_MINING,T_SCRAPE_MINING,T_EXTRACT_SIGNALS,T_SYNTH_FILTER,T_QUERY_ENRICH,T_SEGMENT,T_GEN_PERSONA loopBox;
+    class GATE_VALIDATE decision;
+    class T_INSUFFICIENT warnBox;
+    class REDIS,MONGO db;
+    class LLM_CAG,SEARCH_TOOL,SCRAPE_TOOL,ENRICH_TOOL tool;
+    class T_REPORT_HANDOFF,STRATEGY_AGENT handoff;

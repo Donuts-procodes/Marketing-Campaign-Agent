@@ -1,0 +1,135 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-zinc-50 text-zinc-900 antialiased selection:bg-zinc-200 selection:text-zinc-900;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  }
+}
+
+/* Custom subtle scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(25, 25, 27, 0.15);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(25, 25, 27, 0.3);
+}
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Print / Save-as-PDF
+   `window.print()` otherwise renders the live app: fixed navbar, sidebar,
+   toolbars, dark chrome, scrollbars, and tables whose cells are clipped by
+   `truncate` / `line-clamp`. On paper that is unreadable and leaks the UI
+   into the document, so printing gets its own layout.
+   ────────────────────────────────────────────────────────────────────────── */
+@media print {
+  /* Ink, not screen: light background, full-contrast text, no shadows. */
+  *,
+  *::before,
+  *::after {
+    background: transparent !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+    color: #111 !important;
+  }
+
+  body {
+    background: #fff !important;
+    font-size: 10.5pt;
+  }
+
+  /* App chrome never belongs on the page. */
+  .no-print,
+  nav,
+  aside,
+  button,
+  input,
+  [role="tablist"],
+  [data-no-print] {
+    display: none !important;
+  }
+
+  /* Anything marked print-only is hidden on screen and revealed here. */
+  .print-only {
+    display: block !important;
+  }
+
+  /* Release the fixed/scrolling app shell so content flows across pages. */
+  .min-h-screen {
+    min-height: 0 !important;
+  }
+
+  [class*="overflow-"] {
+    overflow: visible !important;
+    max-height: none !important;
+  }
+
+  main {
+    padding-top: 0 !important;
+  }
+
+  /* The whole point of the report: show the text the UI clips. */
+  .truncate,
+  [class*="line-clamp-"] {
+    overflow: visible !important;
+    white-space: normal !important;
+    display: block !important;
+    -webkit-line-clamp: unset !important;
+    text-overflow: clip !important;
+  }
+
+  /* Keep a card, a table row, or a heading from splitting across a page. */
+  table,
+  figure,
+  .break-inside-avoid,
+  [class*="rounded-"] {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  thead {
+    display: table-header-group; /* repeat headers on every page */
+  }
+
+  h1,
+  h2,
+  h3 {
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+
+  /* Borders survive the background reset above, so tables stay legible. */
+  table,
+  th,
+  td {
+    border-color: #999 !important;
+  }
+
+  /* Spell out link targets, which are otherwise lost on paper. */
+  a[href^="http"]::after {
+    content: " (" attr(href) ")";
+    font-size: 8pt;
+    color: #555 !important;
+    word-break: break-all;
+  }
+
+  @page {
+    margin: 14mm;
+  }
+}
+
+/* Print-only blocks stay out of the way on screen. */
+.print-only {
+  display: none;
+}

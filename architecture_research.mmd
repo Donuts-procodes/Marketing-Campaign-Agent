@@ -1,0 +1,70 @@
+flowchart TD
+    %% ============================================================
+    %% MARKET RESEARCH AGENT & PIPELINE ARCHITECTURE (EXCALIDRAW-OPTIMIZED)
+    %% Zero HTML tags, zero escaped newlines, quoted labels, strict TD layout
+    %% ============================================================
+
+    subgraph L1 ["1. CLIENT & DASHBOARD INTERACTION LAYER"]
+        UI_DASH["Client Dashboard - React, TypeScript, Vite, Tailwind"]
+        UI_ACTIONS["Action Triggers - Re-research, Expand Competitor Search, Filter Matrix"]
+        UI_STREAM["Live Telemetry Stream - SSE EventSource /api/v1/campaigns/:id/stream"]
+        UI_DASH -->|"User Action"| UI_ACTIONS
+        UI_STREAM -.->|"Live DQS, Logs and Deltas"| UI_DASH
+    end
+
+    subgraph L2 ["2. GATEWAY & ORCHESTRATION LAYER"]
+        GW_API["FastAPI Gateway - /api/v1/campaigns"]
+        GW_RERES["POST /:id/re-research - Triggers Full Research Cycle"]
+        GW_MORE["POST /:id/more-competitors - Targeted Rival Discovery"]
+        SVC_CAMP["CampaignService - Execution, Lock Orchestration, Event Publishing"]
+
+        UI_ACTIONS -->|"HTTP POST /re-research"| GW_RERES
+        UI_ACTIONS -->|"HTTP POST /more-competitors"| GW_MORE
+        GW_RERES -->|"rerun_market_research()"| SVC_CAMP
+        GW_MORE -->|"find_more_competitors()"| SVC_CAMP
+        SVC_CAMP -->|"SSE Event Stream"| UI_STREAM
+    end
+
+    subgraph L3 ["3. DYNAMIC TAXONOMY & DISCOVERY LOOP ENGINE"]
+        TAX_ENG["Taxonomy Subagent - 4 to 8 Critical JTBD Drivers, 15 to 25 Minor Attributes"]
+        SRCH_SUB["Search Subagent - Multi-Vector Engine, Tavily, You.com, DuckDuckGo"]
+        CRWL_SUB["Crawl Subagent - Firecrawl JS Rendered, Crawlbase, Tavily Extract Fallback"]
+        AD_INTEL["Ad Intelligence Subagent - Meta Ad Library, LinkedIn, Google Ad Transparency"]
+
+        SVC_CAMP -->|"merchant_context, classification"| TAX_ENG
+        TAX_ENG -->|"Taxonomy Framework"| SRCH_SUB
+        SRCH_SUB -->|"Accumulated Candidates"| CRWL_SUB
+        CRWL_SUB -->|"Extracted Specs & Pages"| AD_INTEL
+    end
+
+    subgraph L4 ["4. DATA QUALITY SCORE GATING & CONVERGENCE LOOP"]
+        GATE_EVAL["DQS Evaluator - 4D Weighted Score: Coverage, Pricing, Weaknesses, Recency"]
+        GATE_COND{"Convergence Check - DQS >= 0.80, Competitors >= 4, Recency >= 0.50?"}
+        LOOP_RETRY["Missing Data Formulator - Targeted Gripe, Pricing, and Peer Alternative Queries"]
+        SYNTH_ENG["Synthesis Subagent - Grounded Spec Matrix, Evidence SWOT, Blue Ocean Positioning"]
+
+        CRWL_SUB -->|"Evidence Dates & Attributes"| GATE_EVAL
+        GATE_EVAL -->|"DQSResult & Density"| GATE_COND
+        GATE_COND -->|"NO (Retries < 3)"| LOOP_RETRY
+        LOOP_RETRY -->|"Targeted Vectors"| SRCH_SUB
+        GATE_COND -->|"YES (or Max Retries Tagged)"| SYNTH_ENG
+        AD_INTEL -->|"Ad Hooks by Competitor"| SYNTH_ENG
+    end
+
+    subgraph L5 ["5. PERSISTENCE & OUTPUT PACKAGING LAYER"]
+        STORE_MONGO[("MongoDB - Finished Runs, Events, SWOTReportDelta")]
+        STORE_REDIS[("Redis - Live In-flight Event Buffer, Sliding Window Rate Limiter")]
+        OUT_CONTRACT["SWOTReportDelta Contract - 4 to 8 Competitors, Spec Matrix, Ad Hooks"]
+
+        SYNTH_ENG -->|"Validated Report"| OUT_CONTRACT
+        OUT_CONTRACT -->|"Save Run"| STORE_MONGO
+        SVC_CAMP -.->|"Mirror Event"| STORE_REDIS
+        OUT_CONTRACT -->|"Emitted Node Delta"| SVC_CAMP
+    end
+
+    %% Styles
+    style L1 fill:#f8fafc,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    style L2 fill:#f8fafc,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    style L3 fill:#f0fdf4,stroke:#86efac,stroke-width:1.5px,color:#14532d
+    style L4 fill:#eff6ff,stroke:#93c5fd,stroke-width:1.5px,color:#1e3a8a
+    style L5 fill:#faf5ff,stroke:#d8b4fe,stroke-width:1.5px,color:#581c87

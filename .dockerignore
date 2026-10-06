@@ -1,0 +1,11 @@
+**/.git
+**/.gitignore
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+# Secrets never go into the build context
+.env
+*.env

@@ -1,0 +1,61 @@
+flowchart TD
+    %% Styling
+    classDef step fill:#ffffff,stroke:#000000,stroke-width:1.5px,color:#000000;
+    classDef tool fill:#f4f4f4,stroke:#000000,stroke-width:1.5px,color:#000000;
+    classDef flag fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
+
+    subgraph Queue ["Phase 1: Validation & Queue Scheduling"]
+        direction LR
+        Start["Receive Approved Assets & Publishing Instructions"]:::step
+        CheckPermissions{"Are Publishing Permissions Granted?"}:::flag
+        FlagPermMissing["Flag Missing Publishing Permissions"]:::flag
+        AddQueue["Add Assets to Publishing Queue"]:::step
+        DetermineTiming["Calculate Optimal Release Windows via Engagement Data"]:::step
+        ScheduleContent["Schedule Posts, Emails & Web Pages"]:::step
+
+        Start --> CheckPermissions
+        CheckPermissions -- "Missing Permissions" --> FlagPermMissing
+        FlagPermMissing -.-> Start
+        CheckPermissions -- "Permissions Valid" --> AddQueue
+        AddQueue --> DetermineTiming --> ScheduleContent
+    end
+
+    subgraph Execution ["Phase 2: Synchronized Cross-Channel Launch"]
+        direction LR
+        CoordinateLaunch["Coordinate Sequence Across All Channels"]:::step
+        PublishLive["Publish Approved Content to Live Platforms"]:::step
+        MonitorStatus["Monitor Real-time Publishing Status"]:::step
+
+        CoordinateLaunch --> PublishLive --> MonitorStatus
+    end
+
+    subgraph Recovery ["Phase 3: Failure Recovery & Status Reporting"]
+        direction LR
+        CheckPublish{"Was Publication Successful?"}:::flag
+        AttemptRetry["Execute Safe Retry Mechanism (Prevent Duplicates)"]:::step
+        CheckRetry{"Did Retry Succeed?"}:::flag
+        EscalateHuman["Alert Human Reviewer for Manual Fix"]:::flag
+        HandleCorrections["Apply Approved Corrections or Rescheduling"]:::step
+        ReportStatus["Report Publishing Completion to Orchestrator"]:::step
+
+        CheckPublish -- "Successful" --> ReportStatus
+        CheckPublish -- "Failed" --> AttemptRetry
+        AttemptRetry --> CheckRetry
+        CheckRetry -- "Yes" --> ReportStatus
+        CheckRetry -- "No" --> EscalateHuman
+        EscalateHuman --> HandleCorrections
+        HandleCorrections -.-> ReportStatus
+    end
+
+    subgraph ToolStack ["Tools & Integrations to Implement"]
+        direction LR
+        SocialAPIs["• Social Media APIs (Mandatory) - Scheduling/publishing social posts"]:::tool
+        EmailAPIs["• Email Marketing APIs (Mandatory) - Sendgrid, Mailchimp, HubSpot"]:::tool
+        CMSAPIs["• Website / CMS APIs (Mandatory) - WordPress, Webflow, custom landing page CMS"]:::tool
+        AnalyticsTool["• Engagement Analytics (Mandatory) - Historical peak engagement time calculator"]:::tool
+        CalTool["• Content Calendar Engine (Mandatory) - Cross-Channel launch sequencer"]:::tool
+    end
+
+    Queue --> Execution
+    Execution --> Recovery
+    Recovery --> ToolStack

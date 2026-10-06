@@ -1,0 +1,127 @@
+services:
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: marketing_client
+    # Bound to localhost: the dev proxy forwards /api (and its API key) to the orchestrator.
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Only the API key is passed to the client container, never the provider keys.
+      - API_ACCESS_KEY=${API_ACCESS_KEY:-}
+
+    volumes:
+      # Mount source code for live development
+      - ./client:/app
+      # Keep node_modules strictly inside named Docker volume (host stays clean)
+      - client_node_modules:/app/node_modules
+    command: npm run dev -- --host 0.0.0.0 --port 3000
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: marketing_orchestrator
+    env_file:
+      - .env
+    environment:
+      - MARKET_RESEARCH_SERVICE_URL=http://agent_market_research:8001
+      - MONGO_URL=mongodb://mongo:27017
+      - REDIS_URL=redis://redis:6379/0
+      # Colorized [TAG] log output even though container stdout is not a TTY
+      - FORCE_COLOR=1
+    # Bound to localhost: every run spends paid API credits, so the API is not exposed to the network.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Mount code for local updates
+      - ./orchestrator:/app/orchestrator
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --log-config log_config.json
+    depends_on:
+      agent_market_research:
+        condition: service_started
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent_market_research:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: marketing_agent_market_research
+    env_file:
+      - .env
+    environment:
+      - FORCE_COLOR=1
+    # Internal only: /execute spends API credits, so it is not published to the host.
+    # Set AGENT_SERVICE_TOKEN in .env to also require a shared token from callers.
+    expose:
+      - "8001"
+    volumes:
+      - ./orchestrator:/app/orchestrator
+    command: uvicorn agents.market_research.service:app --host 0.0.0.0 --port 8001 --reload
+    restart: unless-stopped
+
+  # Finished research runs (reports + event history), collection marketing.campaign_runs
+  mongo:
+    image: mongo:7
+    container_name: marketing_mongo
+    # --quiet drops the "Connection accepted"/"Connection ended" pair mongod logs for every
+    # socket. The healthcheck alone opens several per run, so without this the log is almost
+    # entirely connection churn. Warnings and errors are unaffected.
+    command: ["mongod", "--quiet"]
+    # Localhost only, for inspecting data (e.g. MongoDB Compass at mongodb://localhost:27017).
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      # A bare TCP open against the listener. mongod binds the port only once startup has
+      # finished, so this is a sound readiness signal, and it completes no wire-protocol
+      # handshake -- which is why it logs nothing at all.
+      #
+      # The obvious alternative, `mongosh --eval "db.adminCommand('ping').ok"`, verifies the
+      # server can actually answer a query, but mongosh is a Node shell that opens ~5
+      # connections per invocation and each one logs a client-metadata line, an
+      # authentication line and a first-command line. At any useful interval that single
+      # command produced most of this container's output. Swap it back if you need the
+      # stronger "can serve queries" guarantee and can live with the noise.
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/27017"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    # Without a cap the JSON log grows unbounded on the host.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  # Sliding-window rate limit on research run creation
+  redis:
+    image: redis:7-alpine
+    container_name: marketing_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  client_node_modules:
+  mongo_data:
+  redis_data:
+
+

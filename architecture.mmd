@@ -1,0 +1,311 @@
+flowchart TB
+    %% ============================================================
+    %% 1. CLIENT INGRESS & FASTAPI CONTROLLER
+    %% ============================================================
+    subgraph INGRESS_LAYER["1. Ingress Boundary & FastAPI Gateway Controller"]
+        direction LR
+
+        FE_APP["Next.js 15 App Router
+        • Client Canvas & Telemetry Dashboard
+        • SSE EventSource: /stream/{job_id}
+        • Approval Actions: /approve/{checkpoint_id}"]
+
+        subgraph APIS["FastAPI Gateway Endpoints (v1 Core)"]
+            direction TB
+            EP_POST_JOB["POST /api/v1/campaigns/jobs
+            Body: CampaignInitPayload -> Returns: 202 Accepted {job_id}"]
+            EP_SSE["GET /api/v1/campaigns/{id}/stream
+            Protocol: Server-Sent Events (SSE) via Redis Pub/Sub"]
+            EP_HITL["POST /api/v1/campaigns/{id}/resolve-interrupt
+            Body: {checkpoint_id, action: APPROVED|REVISE, notes}"]
+            EP_UPLOAD["POST /api/v1/assets/upload-references
+            Multipart/form-data: Style guides, product cutouts -> S3"]
+        end
+
+        FE_APP -->|"HTTP/2 POST /jobs"| EP_POST_JOB
+        FE_APP -->|"HTTP/2 POST /resolve-interrupt"| EP_HITL
+        EP_SSE -.->|"Real-Time Event Stream"| FE_APP
+    end
+
+    %% ============================================================
+    %% 2. ROOT GOVERNANCE ORCHESTRATOR
+    %% ============================================================
+    subgraph ROOT_GOVERNANCE["2. Master Governance: Root Orchestrator (LangGraph MasterGraph)"]
+        direction TB
+        ROOT_ENGINE["StateGraph(GlobalCampaignState)
+        • State Checkpointer: MongoDBSaver(checkpoints)
+        • Telemetry Publisher: Redis.publish('stream:telemetry:{job_id}')
+        • Inter-Phase Router: StrategyPhase -> ExecutionPhase -> MetricsPhase"]
+
+        ROOT_ENTRY(("START")) --> ROOT_ENGINE
+        EP_POST_JOB -->|"Initialize Execution Thread"| ROOT_ENGINE
+        EP_HITL -->|"Inject Resume State into Thread"| ROOT_ENGINE
+    end
+
+    %% ============================================================
+    %% 3. COLUMN A: STRATEGY & RESEARCH SUB-ORCHESTRATOR
+    %% ============================================================
+    subgraph SUB_ORCH_STRATEGY["3. Strategy Sub-Orchestrator (StrategyStateGraph)"]
+        direction TB
+        STRAT_COORD["Strategy Pipeline Coordinator Node
+        Receives GlobalCampaignState -> Dispatches Sub-Sub Graph"]
+
+        subgraph AGENT_RESEARCH["Sub-Sub 1: Research Orchestrator (Market & Competitor)"]
+            direction TB
+            RES_HYDRATE["node_hydrate_cag()
+            Pins db.dossiers into LLM KV-Cache
+            Header: cache_control={'type': 'ephemeral'}"]
+
+            RES_DISCOVER["node_tavily_and_firecrawl()
+            tavily.search(category, max_results=15)
+            firecrawl.scrape(competitor_urls)"]
+
+            RES_GATE{"check_dqs()
+            Data Quality Score >= 0.80?"}
+
+            RES_SYNTH["node_synthesize_swot()
+            Generates SWOT & Competitor Benchmark Matrix
+            Writes -> db.swot_reports"]
+
+            RES_HYDRATE --> RES_DISCOVER --> RES_GATE
+            RES_GATE -- "YES" --> RES_SYNTH
+            RES_GATE -- "NO" --> RES_DISCOVER
+        end
+
+        subgraph AGENT_PERSONA["Sub-Sub 2: Persona Orchestrator (Audience & ICPs)"]
+            direction TB
+            PER_PROFILE["node_stock_profiling()
+            Derives value props from cached product catalog"]
+
+            PER_ENRICH["node_apollo_b2b_enrich()
+            POST api.apollo.io/v1/mixed_people/search
+            Filters: job_titles, headcount, revenue"]
+
+            PER_GATE{"check_enrichment_conf()
+            Confidence >= 75%?"}
+
+            PER_SYNTH["node_compile_personas()
+            Generates 3 Persona Archetypes + Objection Tags
+            Writes -> db.personas"]
+
+            PER_PROFILE --> PER_ENRICH --> PER_GATE
+            PER_GATE -- "YES / TAGGED" --> PER_SYNTH
+        end
+
+        subgraph AGENT_CAMPAIGN["Sub-Sub 3: Campaign Strategy Orchestrator"]
+            direction TB
+            CAM_DECOMP["node_derive_channel_and_budget()
+            Computes static/carousel split, KPIs & duration"]
+
+            CAM_HITL{"LangGraph interrupt()
+            Founder Strategic Approval Checkpoint"}
+
+            CAM_COMMIT["node_commit_brief()
+            Writes -> db.campaign_briefs
+            Status: STRATEGY_LOCKED"]
+
+            CAM_DECOMP --> CAM_HITL
+            CAM_HITL -- "APPROVED" --> CAM_COMMIT
+        end
+
+        STRAT_COORD --> AGENT_RESEARCH
+        RES_SYNTH -->|"Edge: swot_report_id"| AGENT_PERSONA
+        PER_SYNTH -->|"Edge: persona_ids"| AGENT_CAMPAIGN
+        CAM_COMMIT -->|"Return Approved Brief"| STRAT_COORD
+    end
+
+    %% ============================================================
+    %% 4. COLUMN B: PUBLISHER & EXECUTION SUB-ORCHESTRATOR
+    %% ============================================================
+    subgraph SUB_ORCH_PUBLISHER["4. Publisher Sub-Orchestrator (ExecutionStateGraph)"]
+        direction TB
+        PUB_COORD["Publisher Phase Coordinator Node
+        Receives Approved Brief -> Dispatches Media & Live Publishing"]
+
+        subgraph AGENT_MEDIA["Sub-Sub 4: Media Orchestrator (Static, Display & Carousels)"]
+            direction TB
+            MED_VISION["node_vision_pattern_mining()
+            GPT-4o Vision: Extracts competitor layout ASTs"]
+
+            MED_DIFFUSION["node_render_static_assets()
+            Flux.1 / SDXL: Background rendering
+            Headless Canvas AST Engine: 1:1, 9:16, 16:9 & PDF Carousels"]
+
+            MED_POLICY{"check_ad_policies()
+            Zero-Shot Text Area (<20%) & Copy Guidelines Pass?"}
+
+            MED_HITL{"LangGraph interrupt()
+            Creative Canvas Review Checkpoint"}
+
+            MED_SETUP["node_create_paused_campaigns()
+            POST graph.facebook.com/v21.0/act_{id}/adcreatives
+            Google Display Ads Mutate API (Status: PAUSED)"]
+
+            MED_VISION --> MED_DIFFUSION --> MED_POLICY
+            MED_POLICY -- "PASS" --> MED_HITL
+            MED_POLICY -- "FAIL" --> MED_DIFFUSION
+            MED_HITL -- "APPROVED" --> MED_SETUP
+        end
+
+        subgraph AGENT_PUBLISHING["Sub-Sub 5: Publishing Orchestrator (Static & Social Dispatch)"]
+            direction TB
+            PUB_OPTIMAL["node_calculate_optimal_slots()
+            Calculates historical engagement release windows"]
+
+            PUB_ENQUEUE["node_enqueue_delay_zset()
+            ZADD queue:publishing:delay {timestamp} {item_id}"]
+
+            PUB_DISPATCH["node_dispatch_channels()
+            Meta Graph API: Organic Image / Carousel
+            LinkedIn API: Posts & PDF Document Carousels
+            Ghost/WP: Blog Launch Posts | SendGrid: Newsletters"]
+
+            PUB_GATE{"Platform HTTP Status == 200 OK?"}
+
+            PUB_CONFIRM["node_record_publication()
+            Writes Live Post IDs -> db.media_assets
+            Sets status: PUBLISHED"]
+
+            PUB_RETRY["node_backoff_or_dlq()
+            Jitter retry (3x) -> Fail to Dead-Letter Queue"]
+
+            PUB_OPTIMAL --> PUB_ENQUEUE --> PUB_DISPATCH --> PUB_GATE
+            PUB_GATE -- "SUCCESS" --> PUB_CONFIRM
+            PUB_GATE -- "ERROR" --> PUB_RETRY
+        end
+
+        subgraph AGENT_FEEDBACK["Sub-Sub 6: Staged Closed-Loop Feedback Engine"]
+            direction TB
+            STAGE_POLL["Worker Daemon: poll_platform_insights()
+            Scheduled Cron (6h): Pull Impressions, CTR, Clicks, CPC"]
+
+            STAGE_BUFFER["node_buffer_to_staging_queue()
+            Writes engagement telemetry -> db.staging_analytics
+            (No direct live feed to active model context)"]
+
+            STAGE_GATE{"check_batch_threshold()
+            Post Age >= 72h OR Impressions >= 5,000?"}
+
+            STAGE_EMIT["node_dispatch_batched_refresh()
+            Emits async refresh events to Strategy Pipeline"]
+
+            STAGE_POLL --> STAGE_BUFFER --> STAGE_GATE
+            STAGE_GATE -- "BATCH_READY" --> STAGE_EMIT
+        end
+
+        PUB_COORD --> AGENT_MEDIA
+        MED_SETUP -->|"Edge: approved_assets + platform_ids"| AGENT_PUBLISHING
+        PUB_CONFIRM -.->|"Triggers Metrics Daemon"| AGENT_FEEDBACK
+        PUB_CONFIRM -->|"Return Deployment Audit Logs"| PUB_COORD
+    end
+
+    %% ============================================================
+    %% 5. DATA, BROKER & CLOUD STORAGE
+    %% ============================================================
+    subgraph SHARED_INFRA["5. Distributed Persistence, Queuing & Tool Layer"]
+        direction LR
+
+        subgraph STORAGE_TIER["Storage & State Services"]
+            direction TB
+            REDIS_CLUSTER[("Redis 7.2 Broker
+            • ZSET: queue:publishing:delay
+            • ZSET: ratelimit:{tenant}:{platform}
+            • LPUSH: queue:tasks:{sub_agent}
+            • PUBSUB: stream:telemetry:{job_id}")]
+
+            MONGO_DB[("MongoDB 7.0 Primary Store
+            • db.checkpoints (LangGraph state)
+            • db.dossiers (Merchant catalog)
+            • db.swot_reports & db.personas
+            • db.campaign_briefs & db.media_assets
+            • db.staging_analytics (Staged loop)")]
+
+            S3_BUCKET[("AWS S3 / Cloudflare R2
+            • s3://bizby-raw/screenshots/
+            • s3://bizby-cdn/renders/ (1:1, 9:16, 16:9)
+            • s3://bizby-cdn/carousels/ (*.pdf, *.webp)")]
+        end
+
+        subgraph EXTERNAL_SDKS["External Model & Platform APIs"]
+            direction TB
+            SDK_LLM["LLM Inference Gateway
+            • Anthropic Messages API (Prompt Caching)
+            • OpenAI API v1/chat/completions (Structured JSON)"]
+
+            SDK_DATA["Discovery & Scraping APIs
+            • Tavily REST API (/search)
+            • Firecrawl API (/v1/scrape)
+            • Apollo.io API (/v1/mixed_people/search)"]
+
+            SDK_ADS["Static Ad & Publishing APIs
+            • Meta Graph API v21.0 (Feed, Stories, Carousels)
+            • Google Ads API v17 (Display Banners)
+            • LinkedIn REST API (/rest/posts, PDF shares)
+            • Ghost CMS Admin API & SendGrid v3 Mail API"]
+        end
+    end
+
+    %% ============================================================
+    %% 6. CROSS-ORCHESTRATOR WIRING & FEEDBACK CHANNELS
+    %% ============================================================
+    ROOT_ENGINE ==>|"1. invoke(StrategyStateGraph)"| STRAT_COORD
+    STRAT_COORD ==>|"2. Brief Output -> invoke(ExecutionStateGraph)"| PUB_COORD
+    PUB_COORD -.->|"3. Execution Complete Summary"| ROOT_ENGINE
+
+    %% State Persist Hooks
+    ROOT_ENGINE <-->|"Read/Write Thread Checkpoints"| MONGO_DB
+    PUB_ENQUEUE <-->|"ZADD Delay Queue"| REDIS_CLUSTER
+    PUB_DISPATCH <-->|"ZPOPMIN Worker Exec"| REDIS_CLUSTER
+    MED_DIFFUSION -->|"Save Rendered Images & PDFs"| S3_BUCKET
+
+    %% Tool & Model Hooks
+    RES_HYDRATE --> SDK_LLM
+    RES_DISCOVER <--> SDK_DATA
+    PER_ENRICH <--> SDK_DATA
+    MED_VISION <--> SDK_LLM
+    MED_SETUP <--> SDK_ADS
+    PUB_DISPATCH <--> SDK_ADS
+    STAGE_POLL <--> SDK_ADS
+
+    %% Closed-Loop Staged Feedback (Batched Queue, No Live Feed)
+    STAGE_EMIT ==>|"POST /api/v1/internal/feedback/persona-drift"| AGENT_PERSONA
+    STAGE_EMIT ==>|"POST /api/v1/internal/feedback/messaging-delta"| AGENT_RESEARCH
+
+    %% ============================================================
+    %% 7. STYLING
+    %% ============================================================
+    style INGRESS_LAYER fill:#f8fafc,stroke:#94a3b8,stroke-width:1.5px,color:#1e293b
+    style ROOT_GOVERNANCE fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#312e81
+    style SUB_ORCH_STRATEGY fill:#f0f9ff,stroke:#7dd3fc,stroke-width:1.5px,color:#0369a1
+    style SUB_ORCH_PUBLISHER fill:#faf5ff,stroke:#d8b4fe,stroke-width:1.5px,color:#6b21a8
+    style SHARED_INFRA fill:#f8fafc,stroke:#cbd5e1,stroke-width:1.5px,color:#334155
+
+    style APIS fill:#ffffff,stroke:#cbd5e1,stroke-width:1px,color:#1e293b
+    style AGENT_RESEARCH fill:#ffffff,stroke:#bae6fd,stroke-width:1px,color:#0369a1
+    style AGENT_PERSONA fill:#ffffff,stroke:#bae6fd,stroke-width:1px,color:#0369a1
+    style AGENT_CAMPAIGN fill:#ffffff,stroke:#bae6fd,stroke-width:1px,color:#0369a1
+    style AGENT_MEDIA fill:#ffffff,stroke:#e9d5ff,stroke-width:1px,color:#6b21a8
+    style AGENT_PUBLISHING fill:#ffffff,stroke:#e9d5ff,stroke-width:1px,color:#6b21a8
+    style AGENT_FEEDBACK fill:#ffffff,stroke:#e9d5ff,stroke-width:1px,color:#6b21a8
+    style STORAGE_TIER fill:#ecfdf5,stroke:#a7f3d0,stroke-width:1px,color:#065f46
+    style EXTERNAL_SDKS fill:#fffbeb,stroke:#fde68a,stroke-width:1px,color:#78350f
+
+    classDef clientNode fill:#ffffff,stroke:#64748b,stroke-width:1px,color:#0f172a;
+    classDef rootNode fill:#4f46e5,stroke:#3730a3,stroke-width:2px,color:#ffffff;
+    classDef stratLead fill:#0284c7,stroke:#0369a1,stroke-width:1.5px,color:#ffffff;
+    classDef pubLead fill:#7c3aed,stroke:#5b21b6,stroke-width:1.5px,color:#ffffff;
+    classDef dbNode fill:#ffffff,stroke:#10b981,stroke-width:1.5px,color:#065f46;
+    classDef stratNode fill:#f0f9ff,stroke:#0284c7,stroke-width:1px,color:#0369a1;
+    classDef pubNode fill:#faf5ff,stroke:#9333ea,stroke-width:1px,color:#581c87;
+    classDef toolNode fill:#ffffff,stroke:#d97706,stroke-width:1px,color:#78350f;
+    classDef gateNode fill:#ffe4e6,stroke:#f43f5e,stroke-width:1.5px,color:#881337;
+
+    class FE_APP,EP_POST_JOB,EP_SSE,EP_HITL,EP_UPLOAD clientNode;
+    class ROOT_ENGINE rootNode;
+    class STRAT_COORD stratLead;
+    class PUB_COORD pubLead;
+    class REDIS_CLUSTER,MONGO_DB,S3_BUCKET dbNode;
+    class RES_HYDRATE,RES_DISCOVER,RES_SYNTH,PER_PROFILE,PER_ENRICH,PER_SYNTH,CAM_DECOMP,CAM_COMMIT stratNode;
+    class MED_VISION,MED_DIFFUSION,MED_SETUP,PUB_OPTIMAL,PUB_ENQUEUE,PUB_DISPATCH,PUB_CONFIRM,PUB_RETRY,STAGE_POLL,STAGE_BUFFER,STAGE_EMIT pubNode;
+    class SDK_LLM,SDK_DATA,SDK_ADS toolNode;
+    class RES_GATE,PER_GATE,CAM_HITL,MED_POLICY,MED_HITL,PUB_GATE,STAGE_GATE gateNode;
