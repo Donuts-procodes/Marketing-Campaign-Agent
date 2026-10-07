@@ -408,9 +408,16 @@ export const CompetitorComparisonBoard: React.FC<CompetitorComparisonBoardProps>
             <div className="space-y-1">
               <span className="text-[11px] font-bold uppercase tracking-wider text-rose-600">Customer Pain Points &amp; Limitations</span>
               <ul className="list-disc list-inside space-y-1 text-rose-900">
-                {(active.weaknesses_mined && active.weaknesses_mined.length > 0 ? active.weaknesses_mined : ["No critical customer complaints verified."]).map((w, wi) => (
-                  <li key={wi} className="leading-relaxed">{w}</li>
-                ))}
+                {(active.weaknesses_mined && active.weaknesses_mined.length > 0 ? active.weaknesses_mined : ["No critical customer complaints verified."]).map((w, wi) => {
+                  const cleaned = w
+                    .replace(/^Title:\s*[^|]+\|\s*/i, "")
+                    .replace(/^#+\s*/, "")
+                    .replace(/\*{2,}/g, "")
+                    .replace(/##\s*Post details\.?\s*##\s*Content\.?\s*##\s*Top Comments\.?/i, "")
+                    .replace(/^(?:written by|by)\s+[A-Za-z0-9 "'.,-]+?(?:—|-|:|\.\s+)/i, "")
+                    .trim();
+                  return <li key={wi} className="leading-relaxed">{cleaned || w}</li>;
+                })}
               </ul>
             </div>
           </div>

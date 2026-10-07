@@ -55,6 +55,15 @@ export interface MerchantContext {
 export interface CampaignInitPayload {
   merchant_context: MerchantContext;
   byok_config?: BYOKConfig;
+  run_mode?: "fresh" | "update";
+}
+
+export interface PriorRunInfo {
+  found: boolean;
+  job_id: string | null;
+  finished_at: string | null;
+  dqs_score: number | null;
+  competitor_count: number | null;
 }
 
 export interface CreateJobResponse {
@@ -110,6 +119,16 @@ export interface SessionListResponse {
   sessions: SessionSummary[];
 }
 
+export interface SessionDetailResponse {
+  job_id: string;
+  status: string;
+  label: string | null;
+  finished_at: string | null;
+  merchant_context: Record<string, unknown>;
+  swot_report: SWOTReportDelta | null;
+  events: Array<Record<string, unknown>>;
+}
+
 export interface ResolveInterruptResponse {
   status: string;
 }
@@ -125,5 +144,3 @@ export interface ReResearchResponse {
   status: string;
   swot_report: SWOTReportDelta;
 }
-
-

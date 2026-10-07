@@ -92,11 +92,16 @@ export function RecentSessions() {
         {sessions.map((s) => (
           <li
             key={s.job_id}
-            className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-2xl bg-[#FAF7EE] border border-[#EDE7D8]"
+            onClick={() => {
+              if (editingId !== s.job_id) {
+                navigate(`/campaigns/${encodeURIComponent(s.job_id)}`);
+              }
+            }}
+            className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-2xl bg-[#FAF7EE] border border-[#EDE7D8] hover:border-zinc-400 hover:bg-[#F5EFE0] transition cursor-pointer group"
           >
             <div className="min-w-0 flex-1">
               {editingId === s.job_id ? (
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
                   <input
                     autoFocus
                     value={draftLabel}
@@ -107,16 +112,16 @@ export function RecentSessions() {
                     }}
                     className="flex-1 px-2.5 py-1 rounded-lg bg-white border border-[#EDE7D8] text-xs text-[#19191B] focus:outline-none focus:border-[#19191B]"
                   />
-                  <button type="button" onClick={() => handleRename(s.job_id)} className="p-1 text-emerald-600 hover:bg-emerald-50 rounded-md">
+                  <button type="button" onClick={() => handleRename(s.job_id)} className="p-1 text-emerald-600 hover:bg-emerald-50 rounded-md cursor-pointer">
                     <Check className="w-4 h-4" />
                   </button>
-                  <button type="button" onClick={() => setEditingId(null)} className="p-1 text-zinc-400 hover:bg-zinc-100 rounded-md">
+                  <button type="button" onClick={() => setEditingId(null)} className="p-1 text-zinc-400 hover:bg-zinc-100 rounded-md cursor-pointer">
                     <X className="w-4 h-4" />
                   </button>
                 </div>
               ) : (
                 <>
-                  <p className="text-xs font-bold text-[#19191B] truncate">
+                  <p className="text-xs font-bold text-[#19191B] group-hover:text-black truncate">
                     {s.label || s.product_name || "Untitled run"}
                   </p>
                   <p className="text-[11px] text-zinc-500 truncate">
@@ -135,12 +140,12 @@ export function RecentSessions() {
               {s.status}
             </span>
 
-            <div className="shrink-0 flex items-center gap-1">
+            <div className="shrink-0 flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
               <button
                 type="button"
-                title="Open"
+                title="Open Dashboard"
                 onClick={() => navigate(`/campaigns/${encodeURIComponent(s.job_id)}`)}
-                className="p-1.5 rounded-lg text-zinc-500 hover:text-black hover:bg-white transition"
+                className="p-1.5 rounded-lg text-zinc-500 group-hover:text-black hover:bg-white transition cursor-pointer"
               >
                 <ArrowRight className="w-4 h-4" />
               </button>
@@ -152,7 +157,7 @@ export function RecentSessions() {
                   setEditingId(s.job_id);
                   setDraftLabel(s.label || s.product_name || "");
                 }}
-                className="px-2 py-1.5 rounded-lg text-[11px] font-bold text-zinc-500 hover:text-black hover:bg-white transition"
+                className="px-2 py-1.5 rounded-lg text-[11px] font-bold text-zinc-500 hover:text-black hover:bg-white transition cursor-pointer"
               >
                 Rename
               </button>
@@ -161,7 +166,7 @@ export function RecentSessions() {
                 title="Delete"
                 disabled={busyId === s.job_id}
                 onClick={() => handleDelete(s.job_id)}
-                className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-600 hover:bg-rose-50 transition"
+                className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer"
               >
                 <Trash2 className="w-4 h-4" />
               </button>

@@ -19,6 +19,60 @@ from orchestrator.schemas.research import DynamicParameterTaxonomy, SWOTReportDe
 
 logger = logging.getLogger(__name__)
 
+# Order the evidence budget is spent in. pricing_scrape and gripe_mining carry the two
+# fields that most often come back empty (pricing_model, weaknesses_mined), so they are
+# served before the discovery results that merely repeat competitor names.
+_VECTOR_PRIORITY = ("pricing_scrape", "gripe_mining", "messaging_claims", "alternative_discovery")
+
+
+def _select_within_budget(
+    results: list[TavilySearchResult], budget_chars: int
+) -> tuple[list[TavilySearchResult], int]:
+    """
+    Picks the search results that fit the prompt budget, round-robin across vectors.
+
+    The research loop appends to one accumulator every retry round, so the head of the list
+    is entirely round-0 discovery and the pricing and complaint results land at the tail.
+    Taking a plain prefix would therefore drop exactly the evidence the report is missing;
+    cycling the vectors keeps each one represented and spends what is left on relevance.
+    """
+    by_vector: dict[str, list[TavilySearchResult]] = {}
+    seen_urls: set[str] = set()
+    for r in results:
+        if r.url and r.url in seen_urls:
+            continue
+        if r.url:
+            seen_urls.add(r.url)
+        by_vector.setdefault(r.vector, []).append(r)
+
+    for bucket in by_vector.values():
+        bucket.sort(key=lambda r: r.score, reverse=True)
+
+    order = [v for v in _VECTOR_PRIORITY if v in by_vector]
+    order += [v for v in by_vector if v not in _VECTOR_PRIORITY]
+
+    selected: list[TavilySearchResult] = []
+    spent = 0
+    cursors = dict.fromkeys(order, 0)
+    while order:
+        for vector in list(order):
+            i = cursors[vector]
+            bucket = by_vector[vector]
+            if i >= len(bucket):
+                order.remove(vector)
+                continue
+            cursors[vector] = i + 1
+            item = bucket[i]
+            cost = len(item.title) + len(item.snippet) + 120  # 120 ~ fence + vector label
+            if spent + cost > budget_chars:
+                order.remove(vector)
+                continue
+            selected.append(item)
+            spent += cost
+
+    return selected, len(results) - len(selected)
+
+
 SYNTHESIS_SYSTEM_PROMPT = """\
 You are a senior competitive intelligence analyst. You MUST strictly prioritize FACTUAL, \
 VERIFIABLE web data over AI-generated or speculative assumptions.
@@ -38,8 +92,12 @@ each competitor's scraped web pages. DO NOT leave core_claims empty if their pag
 pricing_model to null if the page is completely silent on commercial cost.
 5. VERBATIM EVIDENCE: For each competitor, populate 'factual_evidence' with 2-4 direct verbatim excerpts \
 from the scraped pages or search snippets that cite their actual features, pricing, or reviews.
-6. REAL USER COMPLAINTS: Weaknesses MUST be quoted or extracted from actual user complaints, Reddit/G2 reviews, \
-or forum threads in the provided data. NEVER invent speculative or hypothetical flaws.
+6. REAL USER COMPLAINTS & PAIN POINTS: 'weaknesses_mined' MUST contain clear, succinct customer pain points, \
+critiques, limitations, or product grievances extracted from user complaints, Reddit/G2 reviews, or forum threads \
+(e.g., 'Difficult learning curve for beginners', 'Slow support response times', 'High renewal costs', 'Not BBB accredited'). \
+NEVER copy raw webpage titles (e.g. 'Title: ... | BBB Business Profile'), book titles ('# has anyone tried ... book?'), \
+markdown header structures ('## Post details', '## Top Comments'), or irrelevant curriculum/table of contents snippets. \
+Strip page headers and summarize the exact negative sentiment/complaint concisely into a single readable sentence per bullet.
 7. ACTIVE AD HOOKS: Copy ad hooks VERBATIM from the Competitor Ad Intelligence section or the ad-library pages \
 (Meta Ad Library, LinkedIn Ad Library, Google Ads Transparency) in the extracted content, keeping their source label. \
 Never write, rephrase or imagine ad copy; if a competitor has no ad data, leave ad_hooks empty.
@@ -52,6 +110,10 @@ a price, claim or product is current against THAT date, never against your own t
 this run. When a source carries a publication date, prefer the most recent source on a conflict and set as_of to \
 that date (YYYY-MM-DD). Do not describe data as "current" or "latest" when its source is visibly older than the \
 stated date — report what the source says and let as_of carry the age.
+11. FULL TABLE COMPLETION & MINIMUM 5 COMPETITORS: You MUST synthesize profiles for at least 5 distinct direct competitors \
+(or all discovered competitors if 5+ are available). NEVER artificially limit or truncate the list to 3 or 4. Ensure EVERY column \
+in the competitor profile table (brand_name, product_name, pricing_model, core_claims, weaknesses_mined, dynamic_attributes, \
+factual_evidence, sources, as_of) is populated from the provided extracts so the entire competitor matrix is completely filled with latest data.
 
 {untrusted_protocol}
 """
@@ -83,18 +145,40 @@ async def synthesize_swot_with_llm(
 
     # Search snippets and page bodies are third-party text: fenced and neutralised so the
     # model reads them as evidence, not as instructions addressed to it.
+    selected_results, dropped_results = _select_within_budget(
+        list(search_results), settings.max_synthesis_snippet_chars
+    )
     search_context = "\n\n".join(
         fence_untrusted(
             f"[{r.vector}] {r.title}\n{r.snippet}", url=r.url, index=i
         )
-        for i, r in enumerate(search_results)
+        for i, r in enumerate(selected_results)
     )
 
-    page_context = "\n\n".join(
-        fence_untrusted(p["markdown"][:3000], url=p.get("url", ""), index=1000 + i)
-        for i, p in enumerate(extracted_pages)
-        if p.get("markdown")
-    )
+    # Pages are deep-crawled and far denser than snippets, so they get their own budget and
+    # are taken in order — the crawler already prioritised them when choosing what to fetch.
+    page_parts: list[str] = []
+    page_spent = 0
+    dropped_pages = 0
+    for i, p in enumerate(extracted_pages):
+        markdown = p.get("markdown")
+        if not markdown:
+            continue
+        excerpt = markdown[: settings.max_synthesis_page_excerpt_chars]
+        if page_spent + len(excerpt) > settings.max_synthesis_page_chars:
+            dropped_pages += 1
+            continue
+        page_parts.append(fence_untrusted(excerpt, url=p.get("url", ""), index=1000 + i))
+        page_spent += len(excerpt)
+    page_context = "\n\n".join(page_parts)
+
+    if dropped_results or dropped_pages:
+        logger.info(
+            "Synthesis corpus trimmed to prompt budget: %d/%d results, %d pages omitted",
+            len(selected_results),
+            len(search_results),
+            dropped_pages,
+        )
 
     taxonomy_context = ""
     if taxonomy:
@@ -144,8 +228,17 @@ async def synthesize_swot_with_llm(
         f"{ad_context}"
         f"## Web Search Results\n{search_context}\n\n"
         f"## Extracted Page Content\n{page_context}\n\n"
-        f"Produce a complete SWOTReportDelta comparing the merchant's product against "
-        f"the top discovered competitors, with dynamic attributes, active ad hooks, "
+        + (
+            "## Corpus Note\n"
+            "This evidence set was trimmed to fit the context window; it is a sample, not the "
+            "complete crawl. Treat a missing fact as unknown rather than as evidence that the "
+            "fact is absent, and do not infer that a competitor lacks a feature, price or "
+            "complaint merely because it does not appear above.\n\n"
+            if (dropped_results or dropped_pages)
+            else ""
+        )
+        + f"Produce a complete SWOTReportDelta comparing the merchant's product against "
+        f"at least 5 top discovered competitors (include all discovered rivals, do not truncate), with dynamic attributes, active ad hooks, "
         f"factual evidence excerpts, SWOT analysis, positioning gap, and source URLs."
     )
 

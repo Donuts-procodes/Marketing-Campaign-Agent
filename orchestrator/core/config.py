@@ -81,14 +81,30 @@ class Settings(BaseSettings):
     # competitor sites gets roughly one page each -- rarely the one carrying pricing,
     # which is what held P_pricing (and so DQS) down. Each page is one crawl API call.
     deep_search_max_pages: int = 24
+    # Pages fetched in parallel. A measured run spent 155s of its 258s in deep crawl: 19 pages
+    # at 3-at-a-time is 7 sequential waves. These are the two nested limits -- the crawler's own
+    # gate and Firecrawl's process-wide one, whichever is lower binds. Raise to match your
+    # Firecrawl plan's per-minute allowance; 429s are retried (_FIRECRAWL_RETRIES) so an
+    # overshoot degrades into backoff rather than failure.
+    crawl_max_concurrent: int = 10
+    firecrawl_max_concurrent: int = 10
 
-    dqs_threshold: float = 0.80
+    dqs_threshold: float = 0.90
     dqs_max_retries: int = 3
     # Attribute density gate for the research loop. Preliminary search-stage profiles carry
     # few structured attributes, so the default leaves density as a reported metric only.
     research_min_density: float = 0.0
-    research_min_competitors: int = 4
-    research_max_competitors: int = 8
+    research_min_competitors: int = 5
+    # Competitors promoted into the report. The rest stay on the bench: discovered, listed and
+    # saved, but not deep-crawled until the merchant asks for more. 0 means no limit, which also
+    # leaves the bench permanently empty.
+    research_max_competitors: int = 5
+    # Deep crawl is competitor-targeted, not URL-targeted. Spraying one page each across every
+    # host that appeared in search left pricing at 0/48, because a competitor's single scraped
+    # page was almost never their pricing page. These concentrate the same page budget on the
+    # shortlist: 5 competitors x 4 pages fetches each one's home, pricing and feature pages.
+    research_deep_crawl_competitors: int = 5
+    research_pages_per_competitor: int = 4
 
     # Dated evidence older than this counts as stale in the DQS recency dimension.
     # Evidence with no discoverable date is never counted as stale.
@@ -120,6 +136,14 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("api_access_key", "API_ACCESS_KEY"),
     )
+
+    # Synthesis prompt budget. The research loop accumulates results across every retry round,
+    # so an unconverged run reached ~367 results / 30 pages and overflowed the model's context
+    # window, losing the whole SWOT. These cap the evidence corpus; selection is prioritized by
+    # vector rather than truncated, so breadth of coverage survives the cut.
+    max_synthesis_snippet_chars: int = 160_000
+    max_synthesis_page_chars: int = 90_000
+    max_synthesis_page_excerpt_chars: int = 3_000
 
     # Dossier ingestion limits
     max_dossier_bytes: int = 15 * 1024 * 1024

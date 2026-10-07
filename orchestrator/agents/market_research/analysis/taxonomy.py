@@ -18,6 +18,8 @@ from orchestrator.agents.market_research.analysis.archetype import (
 from orchestrator.core.clock import today_iso
 from orchestrator.schemas.research import CompetitorProfile, DynamicParameterTaxonomy
 
+_MAX_MINOR_ATTRIBUTES = 25
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +42,8 @@ async def reason_dynamic_parameters(
     price_model = merchant_context.get("price_model", "")
     customers = merchant_context.get("existing_customer_profiles", [])
     dossier = merchant_context.get("dossier", "")
+    user_intent = merchant_context.get("user_intent", "")
+    capabilities = merchant_context.get("marketing_capabilities", [])
 
     if llm is not None:
         try:
@@ -52,7 +56,9 @@ async def reason_dynamic_parameters(
                 f"Category / Market: {category}\n"
                 f"Primary Value Proposition: {value_prop}\n"
                 f"Campaign Goal: {goal or 'Competitive positioning and market acquisition'}\n"
-                f"Campaign Type: {campaign_type or 'Growth & Performance'}\n"
+                + (f"User Strategic Intent: {user_intent}\n" if user_intent else "")
+                + (f"Target Capabilities: {', '.join(capabilities)}\n" if capabilities else "")
+                + f"Campaign Type: {campaign_type or 'Growth & Performance'}\n"
                 f"Business Model: {business_model or 'Not specified'}\n"
                 f"Target Geography: {target_geography or 'Global / Unrestricted'}\n"
                 f"Pricing Structure: {price_model or 'Standard market rates'}\n"
@@ -250,6 +256,116 @@ async def reason_dynamic_parameters(
     )
 
 
+REVISE_TAXONOMY_PROMPT = """\
+You are auditing a competitive evaluation framework against evidence gathered after it was \
+written. The framework was drafted from the merchant's brief alone, before any competitor had \
+been looked at, so it may name parameters this market does not actually use, and it may be \
+missing the ones every rival competes on.
+
+Rewrite it to match the vocabulary the evidence actually uses.
+
+RULES:
+1. Critical JTBD Drivers are the 4 to 8 dealbreakers that decide who buys. Drop any driver the \
+evidence shows is irrelevant in this market. Promote an attribute the competitors clearly \
+compete on, even if the original framework listed it as minor or not at all.
+2. Minor Attributes are 15 to 25 concrete, comparable specs or commercial terms. Prefer terms \
+that literally appear across competitor pages over abstract categories.
+3. Name parameters as the market names them. If competitors say "SOC 2 compliance" or \
+"dedicated squad", use that, not a generic synonym.
+4. Only include a parameter if the evidence suggests competitors can be compared on it. A \
+parameter no page ever mentions produces an empty column and is worse than no parameter.
+5. Never invent facts. You are choosing what to measure, not recording values.
+
+{untrusted_protocol}
+"""
+
+
+async def revise_taxonomy_from_evidence(
+    taxonomy: DynamicParameterTaxonomy,
+    merchant_context: dict[str, Any],
+    evidence_text: list[str],
+    llm: Any = None,
+    max_evidence_chars: int = 40_000,
+) -> DynamicParameterTaxonomy:
+    """
+    Re-derives the parameter framework once real competitor evidence exists.
+
+    The initial framework is reasoned from the merchant's brief before a single search has
+    run, and `refine_parameters_from_findings` only ever adjusted the minor attributes -- the
+    critical drivers were fixed for the whole run no matter what the evidence said. When those
+    drivers do not match the market's vocabulary, synthesis cannot populate dynamic_attributes
+    against them, which is how attribute density ends up at zero.
+
+    Returns the original taxonomy unchanged on any failure: a worse framework is a real risk,
+    so this only ever replaces one when the call succeeds and returns a usable result.
+    """
+    if llm is None or not evidence_text:
+        return taxonomy
+
+    from orchestrator.agents.market_research.analysis.untrusted import (
+        UNTRUSTED_CONTENT_PROTOCOL,
+        fence_untrusted,
+    )
+
+    corpus: list[str] = []
+    spent = 0
+    for i, chunk in enumerate(evidence_text):
+        if not chunk:
+            continue
+        excerpt = chunk[:2000]
+        if spent + len(excerpt) > max_evidence_chars:
+            break
+        corpus.append(fence_untrusted(excerpt, url="", index=i))
+        spent += len(excerpt)
+    if not corpus:
+        return taxonomy
+
+    try:
+        structured_llm = llm.with_structured_output(DynamicParameterTaxonomy)
+        prompt = (
+            f"## Market\n"
+            f"{merchant_context.get('product_name', 'Product')} in "
+            f"{merchant_context.get('category', 'General')}\n\n"
+            f"## Current Framework (drafted before any evidence)\n"
+            f"Critical JTBD Drivers: {', '.join(taxonomy.critical_jtbd_drivers)}\n"
+            f"Minor Attributes: {', '.join(taxonomy.minor_attributes)}\n\n"
+            f"## Evidence Gathered From Competitors\n" + "\n\n".join(corpus) + "\n\n"
+            f"Return the corrected framework."
+        )
+        revised = await structured_llm.ainvoke([
+            {
+                "role": "system",
+                "content": REVISE_TAXONOMY_PROMPT.format(
+                    untrusted_protocol=UNTRUSTED_CONTENT_PROTOCOL
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ])
+        validated = (
+            revised
+            if isinstance(revised, DynamicParameterTaxonomy)
+            else DynamicParameterTaxonomy.model_validate(revised)
+        )
+
+        drivers = [d.strip() for d in validated.critical_jtbd_drivers if d and d.strip()]
+        minors = [m.strip() for m in validated.minor_attributes if m and m.strip()]
+        # Too thin to be an improvement: keep what we had rather than degrade the framework.
+        if len(drivers) < 4 or len(minors) < 5:
+            logger.warning(
+                "Taxonomy revision returned %d drivers / %d attributes; keeping the original",
+                len(drivers),
+                len(minors),
+            )
+            return taxonomy
+
+        validated.critical_jtbd_drivers = drivers[:8]
+        validated.minor_attributes = minors[:_MAX_MINOR_ATTRIBUTES]
+        return validated
+    except Exception as exc:
+        logger.warning("Taxonomy revision failed, keeping the original framework: %s", exc)
+        return taxonomy
+
+
 def refine_parameters_from_findings(
     taxonomy: DynamicParameterTaxonomy,
     extracted_text: list[str],
@@ -261,27 +377,43 @@ def refine_parameters_from_findings(
     import re
 
     combined = "\n".join(extracted_text)
-    updated_minor = list(taxonomy.minor_attributes)
+    original_minor = list(taxonomy.minor_attributes)
+    existing_keys = {_param_key(a) for a in original_minor}
+    observed: list[str] = []
+
+    def _consider(raw: str, stopwords: tuple[str, ...]) -> None:
+        cleaned = re.sub(r"\s+", "_", raw.strip().lower())
+        if not cleaned or len(cleaned) < 4 or cleaned in stopwords:
+            return
+        key = _param_key(cleaned)
+        if key in existing_keys:
+            return
+        existing_keys.add(key)
+        observed.append(cleaned)
 
     # 1. Dynamic regex extraction for specification table rows: | Spec Name | Value |
-    table_specs = re.findall(r"\|\s*([A-Za-z0-9\s]{3,24})\s*\|\s*[^\|\n]{2,50}\s*\|", combined)
-    for raw_spec in table_specs:
-        cleaned = re.sub(r"\s+", "_", raw_spec.strip().lower())
-        if cleaned and cleaned not in ("parameter", "specification", "attribute", "feature", "name", "metric"):
-            if cleaned not in updated_minor and len(cleaned) >= 4:
-                updated_minor.append(cleaned)
+    for raw_spec in re.findall(r"\|\s*([A-Za-z0-9\s]{3,24})\s*\|\s*[^\|\n]{2,50}\s*\|", combined):
+        _consider(raw_spec, ("parameter", "specification", "attribute", "feature", "name", "metric"))
 
     # 2. Dynamic regex extraction for spec key-value bullet points: - Battery: 500mAh
-    bullet_specs = re.findall(r"(?:^|\n)[\-\*•]\s*([A-Za-z0-9\s]{3,20}):\s*([^\n]{2,50})", combined)
-    for raw_spec, _ in bullet_specs:
-        cleaned = re.sub(r"\s+", "_", raw_spec.strip().lower())
-        if cleaned and cleaned not in ("note", "warning", "tip", "source", "http", "https"):
-            if cleaned not in updated_minor and len(cleaned) >= 4:
-                updated_minor.append(cleaned)
+    for raw_spec, _ in re.findall(
+        r"(?:^|\n)[\-\*•]\s*([A-Za-z0-9\s]{3,20}):\s*([^\n]{2,50})", combined
+    ):
+        _consider(raw_spec, ("note", "warning", "tip", "source", "http", "https"))
+
+    # Attributes observed in the market outrank the ones the LLM guessed from the brief alone,
+    # so they are placed first and the guesses fill what is left. Appending them instead made
+    # this function a no-op whenever the initial taxonomy already filled the cap, which is the
+    # normal case: the guesses survived every round and nothing observed ever got in.
+    merged = observed[:_MAX_MINOR_ATTRIBUTES]
+    for attr in original_minor:
+        if len(merged) >= _MAX_MINOR_ATTRIBUTES:
+            break
+        merged.append(attr)
 
     return DynamicParameterTaxonomy(
         critical_jtbd_drivers=taxonomy.critical_jtbd_drivers,
-        minor_attributes=updated_minor[:25],
+        minor_attributes=merged,
     )
 
 

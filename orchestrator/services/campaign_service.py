@@ -88,6 +88,7 @@ class CampaignJob:
         self.report_lock: asyncio.Lock = asyncio.Lock()
         self.created_at: float = time.monotonic()
         self.finished_at: float | None = None
+        self.bench_competitors: list[CompetitorProfile] = []
 
 
 class CampaignService:
@@ -130,6 +131,8 @@ class CampaignService:
         # Full 128-bit id: the job id is the only thing guarding access to a run.
         job_id = f"job-{uuid.uuid4().hex}"
         merchant_ctx = payload.merchant_context.model_dump()
+        # Carry run_mode into merchant_context so _run_market_research_node can read it
+        merchant_ctx["run_mode"] = payload.run_mode or "fresh"
 
         job = CampaignJob(
             job_id=job_id,
@@ -162,6 +165,9 @@ class CampaignService:
         raw_report = doc.get("report")
         if raw_report:
             restored.last_swot_report = SWOTReportDelta(**raw_report)
+        restored.bench_competitors = [
+            CompetitorProfile(**c) for c in doc.get("bench_competitors") or []
+        ]
         restored.history_events = list(doc.get("events", []))
         self._jobs[job_id] = restored
         return restored
@@ -403,6 +409,8 @@ class CampaignService:
             "merchant_context": context,
             "dossier_chars": len(job.dossier_text or ""),
             "report": job.last_swot_report.model_dump() if job.last_swot_report else None,
+            # Kept so "find more competitors" can still serve the next in line after a restart.
+            "bench_competitors": [c.model_dump() for c in job.bench_competitors],
             "events": job.history_events,
         }
 
@@ -468,11 +476,46 @@ class CampaignService:
         """Runs the market research agent in-process, forwarding its progress to the stream."""
         from orchestrator.agents.market_research.agent import execute_market_research
 
+        # Cross-run memory: for update runs, load the prior report for the same product
+        # so the agent can seed known competitors, use time-bounded queries, and merge.
+        prior_report = None
+        prior_run_at = None
+        run_mode = job.merchant_context.get("run_mode") or "fresh"
+        if run_mode == "update":
+            product_name = job.merchant_context.get("product_name", "")
+            category = job.merchant_context.get("category", "")
+            prior_doc = await get_storage().find_latest_run_by_product(product_name, category)
+            if prior_doc and prior_doc.get("report"):
+                try:
+                    prior_report = SWOTReportDelta(**prior_doc["report"])
+                    prior_run_at = str(prior_doc.get("finished_at", ""))
+                    await self._log(
+                        job,
+                        f"[NODE] Prior run found ({prior_run_at[:10] if prior_run_at else 'unknown date'}) "
+                        f"— running incremental update with {len(prior_report.competitors)} baseline competitors",
+                    )
+                except Exception as exc:
+                    await self._log(
+                        job,
+                        f"[NODE] Could not load prior run report ({exc}); running as fresh scan",
+                        level="WARN",
+                    )
+                    run_mode = "fresh"
+            else:
+                await self._log(
+                    job,
+                    "[NODE] No prior run found for this product — running as fresh scan",
+                )
+                run_mode = "fresh"
+
         state: StrategyState = {
             "merchant_context": job.merchant_context,
             "swot_report": None,
             "dqs_retries": 0,
             "errors": [],
+            "run_mode": run_mode,
+            "prior_report": prior_report,
+            "prior_run_at": prior_run_at,
         }
 
         async def on_progress(message: str, level: str = "INFO") -> None:
@@ -486,6 +529,12 @@ class CampaignService:
         if not isinstance(report, SWOTReportDelta):
             raise RuntimeError("Market research agent returned no report")
         report.sample_data = False
+
+        # Competitors discovered but not promoted into the report. "Find more" serves these
+        # before spending a search call.
+        job.bench_competitors = [
+            c for c in delta.get("bench_competitors", []) if isinstance(c, CompetitorProfile)
+        ]
 
         for err in delta.get("errors", []):
             logger.warning("Job %s research error: %s", job.job_id, err)
@@ -521,53 +570,114 @@ class CampaignService:
             _norm(f"{c.brand_name} {c.product_name}") for c in current_report.competitors
         } | {_norm(c.product_name) for c in current_report.competitors}
 
-        await self._log(
-            job,
-            f"[FIND_MORE_COMPETITORS] Searching for competitors beyond: {', '.join(existing_names[:4])}",
-        )
-
         category = job.merchant_context.get("category", "General")
 
-        missing = self._missing_keys(job)
-        if missing:
-            raise ResearchKeysMissingError(
-                f"Finding competitors needs {' and '.join(missing)}; no sample data is substituted."
+        from orchestrator.agents.market_research.ads.ad_intelligence import search_competitor_ad_hooks
+
+        # The research loop already discovered more competitors than the top-N cut-off let
+        # through. Serve the next in line from that bench before paying for a new search.
+        bench_ready = [
+            c for c in job.bench_competitors if _norm(c.brand_name) not in existing_keys
+        ]
+        new_competitors: list[CompetitorProfile] = bench_ready[:2]
+
+        if new_competitors:
+            served = {_norm(c.brand_name) for c in new_competitors}
+            job.bench_competitors = [
+                c for c in job.bench_competitors if _norm(c.brand_name) not in served
+            ]
+            await self._log(
+                job,
+                f"[FIND_MORE_COMPETITORS] Promoting {len(new_competitors)} from the discovery "
+                f"bench ({len(job.bench_competitors)} still in reserve) — no new search needed: "
+                f"{', '.join(c.brand_name for c in new_competitors)}",
+            )
+        else:
+            await self._log(
+                job,
+                f"[FIND_MORE_COMPETITORS] Discovery bench empty — searching for competitors "
+                f"beyond: {', '.join(existing_names[:4])}",
             )
 
-        from orchestrator.agents.market_research.ads.ad_intelligence import search_competitor_ad_hooks
-        from orchestrator.agents.market_research.pipeline.loop import extract_preliminary_competitors
-        from orchestrator.agents.market_research.discovery.search import (
-            SearchQuery,
-            build_search_queries,
-            derive_scale_signals,
-            execute_tavily_search,
-            filter_out_of_scale_results,
-        )
+            missing = self._missing_keys(job)
+            if missing:
+                raise ResearchKeysMissingError(
+                    f"Finding competitors needs {' and '.join(missing)}; no sample data is substituted."
+                )
 
-        # Reuse the real generator so this path gets the same peer-scale anchoring, recency
-        # window and incumbent exclusions as the research loop — then additionally exclude the
-        # competitors already on the board.
-        scale = derive_scale_signals(job.merchant_context)
-        base_discovery = next(
-            (
-                q for q in build_search_queries(job.merchant_context)
-                if q.vector == "alternative_discovery"
-            ),
-            None,
-        )
-        already_found = " ".join(f'-"{b}"' for b in existing_names[:5])
-        query = SearchQuery(
-            vector="alternative_discovery",
-            query=f"{base_discovery.query} {already_found}".strip()
-            if base_discovery
-            else f'"best {category}" alternatives OR competitors {already_found}',
-            time_range=base_discovery.time_range if base_discovery else "year",
-        )
-        batch_results = filter_out_of_scale_results(await execute_tavily_search([query]), scale)
-        extracted = extract_preliminary_competitors(batch_results)
-        new_competitors: list[CompetitorProfile] = [
-            c for c in extracted if _norm(c.brand_name) not in existing_keys
-        ][:2]
+            from orchestrator.agents.market_research.pipeline.loop import extract_preliminary_competitors
+            from orchestrator.agents.market_research.discovery.search import (
+                SearchQuery,
+                build_search_queries,
+                derive_scale_signals,
+                execute_tavily_search,
+                filter_out_of_scale_results,
+            )
+
+            # Reuse the real generator so this path gets the same peer-scale anchoring, recency
+            # window and incumbent exclusions as the research loop — then additionally exclude the
+            # competitors already on the board.
+            scale = derive_scale_signals(job.merchant_context)
+            base_discovery = next(
+                (
+                    q for q in build_search_queries(job.merchant_context)
+                    if q.vector == "alternative_discovery"
+                ),
+                None,
+            )
+            already_found = " ".join(f'-"{b}"' for b in existing_names[:5])
+            query = SearchQuery(
+                vector="alternative_discovery",
+                query=f"{base_discovery.query} {already_found}".strip()
+                if base_discovery
+                else f'"best {category}" alternatives OR competitors {already_found}',
+                time_range=base_discovery.time_range if base_discovery else "year",
+            )
+            batch_results = filter_out_of_scale_results(await execute_tavily_search([query]), scale)
+            extracted = extract_preliminary_competitors(batch_results)
+            fresh = [c for c in extracted if _norm(c.brand_name) not in existing_keys]
+            new_competitors = fresh[:2]
+            # Anything the search turned up beyond this batch refills the bench for next time.
+            job.bench_competitors.extend(fresh[2:])
+
+        # Bench competitors were discovered but never deep-crawled -- that budget went to the
+        # shortlist. Now that the merchant has asked for them, crawl their own pages so they
+        # arrive with the same pricing and evidence depth as the originals.
+        if new_competitors:
+            from orchestrator.agents.market_research.discovery.crawler import (
+                extract_competitor_target_urls,
+                extract_pages,
+            )
+            from orchestrator.agents.market_research.pipeline.loop import (
+                enrich_competitors_from_pages,
+            )
+
+            settings = get_settings()
+            crawl_urls = extract_competitor_target_urls(
+                new_competitors,
+                [],
+                pages_per_competitor=settings.research_pages_per_competitor,
+                max_urls=settings.research_pages_per_competitor * len(new_competitors),
+            )
+            if crawl_urls:
+                await self._log(
+                    job,
+                    f"[DEEP_SEARCH] Deep-crawling {len(crawl_urls)} page(s) for "
+                    f"{len(new_competitors)} promoted competitor(s)",
+                )
+                try:
+                    pages = await extract_pages(crawl_urls)
+                    enrich_competitors_from_pages(
+                        new_competitors,
+                        [{"url": p.url, "markdown": p.markdown} for p in pages],
+                    )
+                except Exception as exc:
+                    await self._log(
+                        job,
+                        f"[DEEP_SEARCH] Crawl failed for promoted competitors ({type(exc).__name__}); "
+                        f"they are returned with search-stage data only.",
+                        level="WARN",
+                    )
 
         ad_intel = await search_competitor_ad_hooks(
             new_competitors, category, target_geography=job.merchant_context.get("target_geography")
@@ -602,6 +712,10 @@ class CampaignService:
                 "timestamp": _now_ms(),
             },
         )
+
+        # Persist the extended report and the drained bench; otherwise a restart would
+        # re-serve competitors that are already on the board.
+        await get_storage().save_run(self._run_document(job))
 
         return current_report, new_competitors
 

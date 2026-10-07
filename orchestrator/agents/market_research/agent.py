@@ -25,7 +25,10 @@ from orchestrator.agents.market_research.pipeline.loop import ResearchLoopResult
 from orchestrator.agents.market_research.progress import ProgressFn, _report
 from orchestrator.agents.market_research.analysis.scoring import calculate_dqs
 from orchestrator.agents.market_research.pipeline.subagents import ResearchCrew
-from orchestrator.agents.market_research.analysis.taxonomy import calculate_attribute_density
+from orchestrator.agents.market_research.analysis.taxonomy import (
+    calculate_attribute_density,
+    revise_taxonomy_from_evidence,
+)
 from orchestrator.core.config import get_settings
 from orchestrator.core.llm import LLMConfigurationError, build_chat_model
 from orchestrator.schemas.research import (
@@ -38,6 +41,11 @@ if TYPE_CHECKING:
     from orchestrator.schemas.api import BYOKConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_brand(name: str) -> str:
+    return " ".join((name or "").lower().split())
+
 
 async def execute_market_research(
     state: StrategyState,
@@ -67,6 +75,10 @@ async def execute_market_research(
     merchant_context = state.get("merchant_context", {})
     dqs_retries = state.get("dqs_retries", 0)
     errors: list[str] = list(state.get("errors", []))
+    prior_report: SWOTReportDelta | None = state.get("prior_report")
+    prior_run_at: str | None = state.get("prior_run_at")
+    run_mode: str | None = state.get("run_mode")
+    is_update = run_mode == "update" and prior_report is not None
 
     llm_error: str | None = None
     if llm is None:
@@ -99,11 +111,57 @@ async def execute_market_research(
             f"price_model={merchant_context.get('price_model') or 'n/a'}"
             + (f" ({classification.rationale})" if classification.rationale else ""),
         )
+    if classification.user_intent or classification.marketing_capabilities:
+        caps_str = ", ".join(classification.marketing_capabilities) if classification.marketing_capabilities else "general"
+        await _report(
+            on_progress,
+            f"[INTENT_UNDERSTOOD] Goal: \"{classification.user_intent or 'Market Strategy'}\" | Capabilities: [{caps_str}]",
+        )
 
     # Phase 1: Taxonomy subagent builds the dynamic parameter framework
     taxonomy = await crew.taxonomy.run(merchant_context)
 
     # Phase 2: Execute dedicated multi-iteration convergence loop
+    # For update runs, seed known competitors from the prior report so the search
+    # targets those brands directly and uses time-bounded queries for recency.
+    if is_update and prior_report:
+        prior_known = [c.brand_name for c in prior_report.competitors if c.brand_name]
+        existing_known = merchant_context.get("known_competitors") or []
+        merchant_context = {
+            **merchant_context,
+            "known_competitors": list(dict.fromkeys(prior_known + existing_known)),
+        }
+        await _report(
+            on_progress,
+            f"[NODE] Update mode: seeding {len(prior_known)} competitors from prior run, "
+            f"using time-bounded queries",
+        )
+
+    # Ad intelligence needs only competitor names, so it starts as soon as the first round
+    # produces them and runs alongside the remaining rounds. Measured sequentially it was 67s
+    # of a 258s run; overlapped, it hides behind crawl time already being spent.
+    category_for_ads = merchant_context.get("category", "")
+    ad_intel_task: asyncio.Task[Any] | None = None
+
+    async def _start_ad_intel_early(early: list[Any]) -> None:
+        nonlocal ad_intel_task
+        cap = settings.research_max_competitors
+        shortlist = early[:cap] if cap and cap > 0 else early
+        if not shortlist:
+            return
+        ad_intel_task = asyncio.create_task(
+            crew.ad_intel.run(
+                shortlist,
+                category_for_ads,
+                target_geography=merchant_context.get("target_geography"),
+            )
+        )
+
+    async def _revise_taxonomy(current: Any, evidence: list[str]) -> Any:
+        return await revise_taxonomy_from_evidence(
+            current, merchant_context, evidence, llm=llm
+        )
+
     loop_result: ResearchLoopResult = await execute_research_loop(
         merchant_context=merchant_context,
         initial_taxonomy=taxonomy,
@@ -111,18 +169,62 @@ async def execute_market_research(
         on_progress=on_progress,
         search_agent=crew.search,
         crawl_agent=crew.crawl,
+        is_update=is_update,
+        prior_run_at=prior_run_at,
+        on_first_competitors=_start_ad_intel_early,
+        revise_taxonomy=_revise_taxonomy if llm is not None else None,
     )
     taxonomy = loop_result.taxonomy
 
-    # Phase 3: Curate top competitor list (up to configured max, 4-8 range)
-    top_competitors = loop_result.preliminary_competitors[: settings.research_max_competitors]
-
-    # Phase 4: Ad intelligence subagent mines hooks across discovered rivals
-    ad_intel = await crew.ad_intel.run(
-        top_competitors,
-        merchant_context.get("category", ""),
-        target_geography=merchant_context.get("target_geography"),
+    # Phase 3: Curate competitor list (minimum 5, no max limit when <= 0)
+    limit = settings.research_max_competitors
+    use_limit = bool(limit and limit > 0)
+    top_competitors = (
+        loop_result.preliminary_competitors[:limit]
+        if use_limit
+        else loop_result.preliminary_competitors
     )
+    # Everyone the loop discovered but the cut-off excluded. Kept as the bench so
+    # "find more competitors" can serve the next in line instead of re-searching.
+    bench_competitors = loop_result.preliminary_competitors[limit:] if use_limit else []
+    if bench_competitors:
+        await _report(
+            on_progress,
+            f"[COMPETITOR_BENCH] {len(top_competitors)} selected for deep analysis; "
+            f"{len(bench_competitors)} held in reserve for 'find more'",
+        )
+
+    # Phase 4: Ad intelligence. The early task covers whoever was known after round 1; only
+    # competitors discovered in later rounds still need a lookup, so the overlapped work is
+    # kept and topped up rather than repeated.
+    ad_intel = None
+    if ad_intel_task is not None:
+        try:
+            ad_intel = await ad_intel_task
+        except Exception as exc:
+            logger.warning("Early ad intelligence failed, falling back to a full pass: %s", exc)
+            errors.append(f"Ad intelligence error: {exc}")
+
+    if ad_intel is None:
+        ad_intel = await crew.ad_intel.run(
+            top_competitors, category_for_ads,
+            target_geography=merchant_context.get("target_geography"),
+        )
+    else:
+        uncovered = [c for c in top_competitors if c.product_name not in ad_intel.hooks_by_competitor]
+        if uncovered:
+            await _report(
+                on_progress,
+                f"[AD_INTELLIGENCE] Topping up {len(uncovered)} competitor(s) found after the first round",
+            )
+            top_up = await crew.ad_intel.run(
+                uncovered, category_for_ads,
+                target_geography=merchant_context.get("target_geography"),
+            )
+            ad_intel.hooks_by_competitor.update(top_up.hooks_by_competitor)
+            ad_intel.documents.extend(top_up.documents)
+            ad_intel.skipped.extend(s for s in top_up.skipped if s not in ad_intel.skipped)
+
     ad_hooks_by_comp = ad_intel.hooks_by_competitor
     # Ad-library pages are evidence like any other crawled page.
     evidence_pages = loop_result.extracted_pages + ad_intel.documents
@@ -159,6 +261,17 @@ async def execute_market_research(
         # Phase 7: LLM Relevance Filter — curate which data is most useful for the merchant dashboard
         if llm is not None:
             report_delta = await crew.relevance.run(report_delta, merchant_context)
+
+        # Phase 8 (update runs only): merge prior run's findings into the new report.
+        # Competitors not re-found in recent data are carried forward so the report
+        # stays complete; enriched competitors get the union of old + new evidence.
+        if is_update and prior_report:
+            from orchestrator.agents.market_research.analysis.merge import merge_reports
+            report_delta = merge_reports(report_delta, prior_report, prior_run_at)
+            await _report(
+                on_progress,
+                f"[NODE] Merged prior run data: {len(report_delta.competitors)} total competitors",
+            )
 
         final_dqs = calculate_dqs(
             competitors=report_delta.competitors,
@@ -235,10 +348,18 @@ async def execute_market_research(
     errors.extend(crew.errors)
     logger.info("Research crew usage: %s", crew.usage_summary())
 
+    # The bench may contain brands the merge or grounding step promoted into the report;
+    # drop those so "find more" never re-serves a competitor already on the board.
+    on_board = {_norm_brand(c.brand_name) for c in report_delta.competitors}
+    bench_competitors = [
+        c for c in bench_competitors if _norm_brand(c.brand_name) not in on_board
+    ]
+
     return {
         "swot_report": report_delta,
         "dqs_retries": loop_result.retries_used,
         "errors": errors,
+        "bench_competitors": bench_competitors,
     }
 
 

@@ -88,6 +88,34 @@ class Storage:
             logger.warning("Could not load run %s from MongoDB: %s", job_id, type(exc).__name__)
             return None
 
+    async def find_latest_run_by_product(
+        self, product_name: str, category: str = ""
+    ) -> dict[str, Any] | None:
+        """
+        Returns the most recent completed run for a given product (and optionally category),
+        or None when no matching run exists. Used to seed an update run with prior findings.
+        """
+        if self.runs is None:
+            return None
+        name_lower = product_name.strip().lower()
+        if not name_lower:
+            return None
+        try:
+            cursor = self.runs.find(
+                {"status": "complete"},
+                {"_id": 0},
+            ).sort("finished_at", -1).limit(50)
+            async for doc in cursor:
+                ctx = doc.get("merchant_context", {})
+                stored_name = (ctx.get("product_name") or "").strip().lower()
+                stored_cat = (ctx.get("category") or "").strip().lower()
+                if stored_name == name_lower:
+                    if not category or not stored_cat or stored_cat == category.strip().lower():
+                        return doc
+        except Exception as exc:
+            logger.warning("Could not query prior run for %r: %s", product_name, type(exc).__name__)
+        return None
+
     async def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         """Recent runs, newest first, as lightweight summaries (no events / report body)."""
         if self.runs is None:

@@ -15,6 +15,7 @@ from typing import Any
 
 from orchestrator.agents.market_research.discovery.crawlapi import CrawlAPIClient
 from orchestrator.agents.market_research.discovery.search import TavilySearchResult
+from orchestrator.agents.market_research.discovery.url_guard import filter_crawl_urls
 from orchestrator.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ async def extract_pages(
     urls: list[str],
     crawl_client: Any = None,
     tavily_client: Any = None,
-    max_concurrent: int = 5,
+    max_concurrent: int | None = None,
 ) -> list[ExtractedPage]:
     """
     Deep-scrapes target URLs into markdown: CrawlAPI first, then Tavily Extract for any URL
@@ -109,6 +110,10 @@ async def extract_pages(
     unique_urls = list(dict.fromkeys(u for u in urls if u))
     if not unique_urls:
         return []
+
+    if max_concurrent is None:
+        max_concurrent = get_settings().crawl_max_concurrent
+    max_concurrent = max(max_concurrent, 1)
 
     if crawl_client is None:
         crawl_client = CrawlAPIClient()
@@ -127,6 +132,85 @@ async def extract_pages(
             pages.extend(await _tavily_extract_pages(remaining, tavily_client))
 
     return pages
+
+
+# Paths worth guessing when search never surfaced a competitor's commercial pages. Pricing
+# leads because P_pricing is the DQS dimension that most often sits at zero.
+_GUESSED_PATHS = ("/pricing", "/plans", "/features")
+
+# Path segments that mark a page as commercially informative rather than incidental.
+_COMMERCIAL_SEGMENTS = (
+    "", "pricing", "plans", "price", "features", "product", "solutions", "compare", "services",
+)
+
+
+def extract_competitor_target_urls(
+    competitors: list[Any],
+    search_results: list[TavilySearchResult],
+    pages_per_competitor: int = 4,
+    max_urls: int = 24,
+    guess_missing_paths: bool = True,
+) -> list[str]:
+    """
+    Picks crawl targets per competitor rather than per URL.
+
+    Selecting by URL score alone spread the page budget across every host that appeared in
+    search -- listicles, forums and directories included -- so each real competitor got about
+    one page, and that page was rarely the one carrying their pricing. Budgeting per
+    competitor instead fetches several pages from each shortlisted rival's own domain, which
+    is where pricing, plans and feature claims actually live.
+
+    When search surfaced fewer than `pages_per_competitor` pages on a competitor's domain, the
+    remainder is topped up with guessed commercial paths. A guess that 404s costs one fetch and
+    is dropped by the crawler's minimum-word filter; the alternative is leaving the budget unspent.
+    """
+    by_host: dict[str, list[str]] = {}
+    for r in search_results:
+        if not r.url:
+            continue
+        host = (urlparse(r.url).hostname or "").removeprefix("www.").lower()
+        if host:
+            by_host.setdefault(host, []).append(r.url)
+
+    def _commercial_rank(url: str) -> int:
+        path = (urlparse(url).path or "/").lower().strip("/")
+        return _COMMERCIAL_SEGMENTS.index(path) if path in _COMMERCIAL_SEGMENTS else 99
+
+    targets: list[str] = []
+    seen: set[str] = set()
+
+    for comp in competitors:
+        sources = list(getattr(comp, "sources", []) or [])
+        host = ""
+        for s in sources:
+            host = (urlparse(s).hostname or "").removeprefix("www.").lower()
+            if host:
+                break
+        if not host:
+            continue
+
+        # Everything search already found on this competitor's own domain, commercial first.
+        candidates = list(dict.fromkeys(sources + by_host.get(host, [])))
+        candidates = [u for u in candidates if (urlparse(u).hostname or "").removeprefix("www.").lower() == host]
+        candidates.sort(key=_commercial_rank)
+
+        if guess_missing_paths and len(candidates) < pages_per_competitor:
+            scheme = urlparse(candidates[0]).scheme if candidates else "https"
+            root = f"{scheme or 'https'}://{host}"
+            have = {(urlparse(u).path or "/").lower().rstrip("/") for u in candidates}
+            for path in _GUESSED_PATHS:
+                if len(candidates) >= pages_per_competitor:
+                    break
+                if path not in have:
+                    candidates.append(root + path)
+
+        for url in candidates[:pages_per_competitor]:
+            if url not in seen:
+                seen.add(url)
+                targets.append(url)
+
+    pairs = [(u, "alternative_discovery") for u in targets]
+    return [u for u, _ in filter_crawl_urls(pairs)][:max_urls]
 
 
 def extract_target_urls(
@@ -152,6 +236,11 @@ def extract_target_urls(
             if r.url not in seen:
                 seen.add(r.url)
                 priority_bonus = (len(priority_order) - priority_order.index(vector)) * 0.1
+                # Boost commercial pages (pricing, plans, features, root)
+                parsed = urlparse(r.url)
+                path_lower = (parsed.path or "/").lower().strip("/")
+                if path_lower in ("", "pricing", "plans", "price", "features", "product", "solutions", "compare"):
+                    priority_bonus += 0.35
                 scored.append((r.score + priority_bonus, r.url))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -173,4 +262,9 @@ def extract_target_urls(
             balanced.append(by_host[host].pop(0))
             if not by_host[host]:
                 del by_host[host]
-    return balanced
+
+    # Build (url, vector) pairs so the guard can apply domain-to-vector checks,
+    # then return only the URLs that pass HTTPS enforcement + path/relevance checks.
+    url_to_vector = {r.url: r.vector for r in search_results}
+    pairs = [(u, url_to_vector.get(u, "")) for u in balanced]
+    return [u for u, _ in filter_crawl_urls(pairs)]

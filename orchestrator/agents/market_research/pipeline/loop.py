@@ -14,12 +14,16 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse, urlunparse
 
-from orchestrator.agents.market_research.discovery.crawler import extract_target_urls
+from orchestrator.agents.market_research.discovery.crawler import (
+    extract_competitor_target_urls,
+    extract_target_urls,
+)
 from orchestrator.agents.market_research.progress import ProgressFn, _report
 from orchestrator.agents.market_research.analysis.scoring import (
     PLACEHOLDER_PRICING,
@@ -49,6 +53,36 @@ if TYPE_CHECKING:
     from orchestrator.agents.market_research.pipeline.subagents import CrawlSubagent, SearchSubagent
 
 logger = logging.getLogger(__name__)
+
+# A DQS move smaller than this is noise, not progress.
+_PLATEAU_DQS_EPSILON = 0.005
+
+# Density below this once pages are in hand means the framework names parameters the market
+# does not use, so nothing can be scored against it. Worth one LLM call to rewrite.
+_TAXONOMY_REVISION_DENSITY_FLOOR = 0.10
+
+
+def _time_range_since(prior_run_at: str | None) -> str:
+    """
+    Returns the Tavily time_range string that covers everything since prior_run_at.
+    Tavily supports: "day", "week", "month", "year".
+    Falls back to "month" when the date cannot be parsed.
+    """
+    if not prior_run_at:
+        return "month"
+    try:
+        from datetime import datetime, timezone as tz
+        prior_dt = datetime.fromisoformat(str(prior_run_at).replace("Z", "+00:00"))
+        days_ago = (datetime.now(tz.utc) - prior_dt).days
+        if days_ago <= 1:
+            return "day"
+        if days_ago <= 7:
+            return "week"
+        if days_ago <= 31:
+            return "month"
+        return "year"
+    except (ValueError, TypeError):
+        return "month"
 
 # Review sites, forums, social networks and ad libraries: useful evidence, never competitors.
 NON_COMPETITOR_DOMAINS = frozenset({
@@ -111,15 +145,30 @@ _PRICE_AMOUNT_RE = re.compile(
 )
 
 
+# _PRICE_AMOUNT_RE only has to prove an amount is present, so its symbol branch stops after a
+# single digit. Reusing it to read the amount truncated "$49/month" to "$4" -- a wrong price
+# reads as a finding, which is worse than no price at all. Extraction takes the whole figure
+# and any rate suffix.
+# Longest alternatives first, so "/month" is not captured as the shorter "/mo".
+_PRICE_UNIT = r"(?:\s?(?:/|per\s)\s?(?:month|mo|year|yr|user|seat|licence|license))?"
+_PRICE_EXTRACT_RE = re.compile(
+    r"[$€£¥₹]\s?\d[\d,.]*" + _PRICE_UNIT
+    + r"|\b\d[\d,.]*\s?(?:usd|eur|gbp|inr|dollars?)" + _PRICE_UNIT
+    + r"|\b\d[\d,.]*\s?(?:/|per\s)(?:month|mo|year|yr|user|seat)\b",
+    re.IGNORECASE,
+)
+
+
 def _has_price(text: str) -> bool:
     return bool(_PRICE_AMOUNT_RE.search(text))
 
 
 def _extract_price(text: str) -> str | None:
-    match = _PRICE_AMOUNT_RE.search(text)
-    if match:
-        return match.group(0).strip()
-    return None
+    match = _PRICE_EXTRACT_RE.search(text)
+    if not match:
+        return None
+    # Trailing separators get swept up by the digit class ("$49." at a sentence end).
+    return match.group(0).strip().rstrip(".,;:") or None
 
 _WEAKNESS_KEYWORDS = (
     "issue", "complaint", "wish it had", "problem", "disappointed",
@@ -260,13 +309,18 @@ def extract_preliminary_competitors(
         if not candidates:
             continue
         best = max(candidates, key=lambda p: len(_tokens(p.product_name) & text_tokens))
+
         complaint = r.snippet[:200].strip()
-        # Clean journalistic or review byline boilerplate: e.g. 'Written by John Doe ...'
+        complaint = re.sub(r"^Title:\s*[^|]+\|\s*", "", complaint, flags=re.IGNORECASE).strip()
         complaint = re.sub(r"^(?:written by|by)\s+[A-Za-z0-9 \"'.,-]+?(?:—|-|:|\.\s+)", "", complaint, flags=re.IGNORECASE).strip()
-        if complaint and complaint not in best.weaknesses_mined:
+        complaint = re.sub(r"#{1,6}\s*", "", complaint).strip()
+        complaint = re.sub(r"\*{2,}", "", complaint).strip()
+        complaint = re.sub(r"##\s*Post details\.?\s*##\s*Content\.?\s*##\s*Top Comments\.?", "", complaint, flags=re.IGNORECASE).strip()
+        if len(complaint) > 15 and complaint not in best.weaknesses_mined:
             best.weaknesses_mined.append(complaint)
         if r.url not in best.sources:
             best.sources.append(r.url)
+
 
     discovered = list(profiles.values())
     if not known_competitors:
@@ -276,6 +330,175 @@ def extract_preliminary_competitors(
     known_keys = {"".join(c for c in k.brand_name.lower() if c.isalnum()) for k in known}
     rest = [p for p in discovered if "".join(c for c in p.brand_name.lower() if c.isalnum()) not in known_keys]
     return known + rest
+
+
+def rank_competitors(
+    competitors: list[CompetitorProfile],
+    search_results: list[TavilySearchResult],
+    known_competitors: list[str] | None = None,
+) -> list[CompetitorProfile]:
+    """
+    Orders discovered competitors strongest-first so deep crawl can spend its page budget on
+    the few that matter instead of one page each across every host that appeared in search.
+
+    Purely heuristic, so it costs nothing and is deterministic. The signals, in order of
+    weight: the merchant naming someone outranks everything; appearing under several search
+    vectors means the brand surfaced as a rival, as a priced product and as a source of
+    complaints rather than in one lucky result; search relevance and corroborating source
+    count break the remaining ties.
+    """
+    competitors = merge_duplicate_competitors(competitors)
+    known_keys = {_norm_key(n) for n in (known_competitors or []) if n.strip()}
+
+    vectors_by_host: dict[str, set[str]] = {}
+    best_score_by_host: dict[str, float] = {}
+    for r in search_results:
+        if not r.url:
+            continue
+        host = _host_of(r.url)
+        if not host:
+            continue
+        vectors_by_host.setdefault(host, set()).add(r.vector)
+        best_score_by_host[host] = max(best_score_by_host.get(host, 0.0), r.score)
+
+    def _score(c: CompetitorProfile) -> tuple[int, float]:
+        if _norm_key(c.brand_name) in known_keys:
+            return (1, 999.0)
+
+        host = _host_of(c.sources[0]) if c.sources else ""
+        vectors = vectors_by_host.get(host, set())
+
+        score = 0.0
+        # Surfacing under several vectors is the strongest organic signal of a real rival.
+        score += len(vectors) * 2.0
+        # Evidence we already hold on them: these fields are what the report is graded on.
+        score += 1.5 if c.pricing_model else 0.0
+        score += min(len(c.weaknesses_mined), 3) * 0.75
+        score += min(len(c.sources), 4) * 0.5
+        score += best_score_by_host.get(host, 0.0)
+        return (0, score)
+
+    return sorted(competitors, key=_score, reverse=True)
+
+
+def merge_duplicate_competitors(
+    competitors: list[CompetitorProfile],
+) -> list[CompetitorProfile]:
+    """
+    Collapses profiles that describe the same company into one.
+
+    `extract_preliminary_competitors` keys profiles by normalised URL, so a vendor whose home
+    page, pricing page and blog all appear in search becomes three entries. That inflates the
+    competitor count, lets one company occupy several shortlist slots, and understates the
+    evidence held on each. Grouping by registrable host (brand name when a host is missing)
+    unions what each duplicate knew, preferring a real price over the placeholder.
+    """
+    merged: dict[str, CompetitorProfile] = {}
+
+    for c in competitors:
+        host = next((h for h in (_host_of(s) for s in c.sources) if h), "")
+        key = host or _norm_key(c.brand_name)
+        if not key:
+            continue
+
+        primary = merged.get(key)
+        if primary is None:
+            merged[key] = c
+            continue
+
+        if not primary.pricing_model or primary.pricing_model == PLACEHOLDER_PRICING:
+            if c.pricing_model and c.pricing_model != PLACEHOLDER_PRICING:
+                primary.pricing_model = c.pricing_model
+            elif not primary.pricing_model:
+                primary.pricing_model = c.pricing_model
+
+        for claim in c.core_claims:
+            if claim and claim not in primary.core_claims:
+                primary.core_claims.append(claim)
+        for weakness in c.weaknesses_mined:
+            if weakness and weakness not in primary.weaknesses_mined:
+                primary.weaknesses_mined.append(weakness)
+        for evidence in c.factual_evidence:
+            if evidence and evidence not in primary.factual_evidence:
+                primary.factual_evidence.append(evidence)
+        for source in c.sources:
+            if source and source not in primary.sources:
+                primary.sources.append(source)
+        for hook in c.ad_hooks:
+            if hook and hook not in primary.ad_hooks:
+                primary.ad_hooks.append(hook)
+        for attr_key, attr_value in (c.dynamic_attributes or {}).items():
+            primary.dynamic_attributes.setdefault(attr_key, attr_value)
+
+        # The home page usually carries the cleanest product name; "Product" is the fallback
+        # the extractor uses when a title yielded nothing.
+        if primary.product_name in ("", "Product") and c.product_name not in ("", "Product"):
+            primary.product_name = c.product_name
+
+    return list(merged.values())
+
+
+def enrich_competitors_from_pages(
+    competitors: list[CompetitorProfile],
+    extracted_pages: list[dict[str, Any]],
+) -> list[CompetitorProfile]:
+    """
+    Folds deep-crawled page text back into the competitor profiles it belongs to.
+
+    Search snippets rarely state a price, so profiles built from them alone carry at most the
+    "detected" placeholder -- which `calculate_dqs` deliberately refuses to count. The crawled
+    pricing page usually does state one, and attaching it here is what moves P_pricing off
+    zero. Pages are matched to a competitor by host, so a page can only ever enrich the rival
+    whose own domain served it.
+    """
+    if not extracted_pages:
+        return competitors
+
+    by_host: dict[str, CompetitorProfile] = {}
+    for c in competitors:
+        for s in c.sources:
+            host = _host_of(s)
+            if host:
+                by_host.setdefault(host, c)
+                break
+
+    for page in extracted_pages:
+        markdown = page.get("markdown") or ""
+        url = page.get("url") or ""
+        if not markdown or not url:
+            continue
+        comp = by_host.get(_host_of(url))
+        if comp is None:
+            continue
+
+        # A real amount replaces the placeholder; an existing real price is left alone.
+        if not comp.pricing_model or comp.pricing_model == PLACEHOLDER_PRICING:
+            price = _extract_price(markdown)
+            if price:
+                comp.pricing_model = price
+
+        if url not in comp.sources:
+            comp.sources.append(url)
+
+        if len(comp.factual_evidence) < 4:
+            excerpt = " ".join(markdown[:400].split()).strip()
+            if excerpt:
+                quoted = f'"{excerpt[:200]}..."'
+                if quoted not in comp.factual_evidence:
+                    comp.factual_evidence.append(quoted)
+
+    return competitors
+
+
+def _norm_key(name: str) -> str:
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").removeprefix("www.").lower()
+    except Exception:
+        return ""
 
 
 def _extract_brand_from_url(url: str) -> str:
@@ -346,6 +569,13 @@ async def execute_research_loop(
     on_progress: ProgressFn | None = None,
     search_agent: SearchSubagent | None = None,
     crawl_agent: CrawlSubagent | None = None,
+    is_update: bool = False,
+    prior_run_at: str | None = None,
+    on_first_competitors: Callable[[list[CompetitorProfile]], Awaitable[None]] | None = None,
+    revise_taxonomy: Callable[
+        [DynamicParameterTaxonomy, list[str]], Awaitable[DynamicParameterTaxonomy]
+    ]
+    | None = None,
 ) -> ResearchLoopResult:
     """
     Executes the multi-iteration research loop with dynamic parameter refinement,
@@ -359,7 +589,15 @@ async def execute_research_loop(
     search_agent = search_agent or SearchSubagent(tavily_client, on_progress)
     crawl_agent = crawl_agent or CrawlSubagent(crawl_client, on_progress, tavily_client=tavily_client)
 
-    queries: list[SearchQuery] = build_search_queries(merchant_context, taxonomy=initial_taxonomy)
+    # Update runs use a time window anchored to the prior run's finish date so we only
+    # fetch what has changed since then. Tavily supports: "day", "week", "month", "year".
+    update_time_range: str | None = None
+    if is_update:
+        update_time_range = _time_range_since(prior_run_at)
+
+    queries: list[SearchQuery] = build_search_queries(
+        merchant_context, taxonomy=initial_taxonomy, time_range_override=update_time_range
+    )
     taxonomy = initial_taxonomy
 
     # Scale guard: giants slip past the query's soft "-name" exclusions (semantic engines
@@ -375,27 +613,91 @@ async def execute_research_loop(
     converged = False
 
     current_retries = initial_retries
+    # Previous round's yield, for the plateau check below.
+    last_competitor_count = -1
+    last_dqs_score = -1.0
 
     while True:
         # Step A: Search subagent executes the query batch (incumbents filtered out by scale)
         round_results = await search_agent.run(queries, round_number=current_retries)
         accumulated_search_results.extend(filter_out_of_scale_results(round_results, scale_signals))
 
-        # Step B: Crawl subagent extracts high-signal pages it has not scraped yet
-        target_urls = extract_target_urls(accumulated_search_results, max_urls=settings.deep_search_max_pages)
-        accumulated_source_urls = list({r.url for r in accumulated_search_results} | set(target_urls))
-        accumulated_extracted_pages.extend(await crawl_agent.run(target_urls))
-
-        # Step C: Extract and aggregate preliminary competitor profiles
+        # Step B: Identify who the competitors are. This precedes the crawl so the page budget
+        # can be aimed at the shortlist; selecting crawl targets from raw search results spread
+        # it across every host that appeared and left each real rival with a single page.
         preliminary_competitors = extract_preliminary_competitors(
             accumulated_search_results, merchant_context.get("known_competitors") or []
         )
+        preliminary_competitors = rank_competitors(
+            preliminary_competitors,
+            accumulated_search_results,
+            merchant_context.get("known_competitors") or [],
+        )
+
+        # Step C: Deep-crawl the shortlist's own domains, several pages each.
+        shortlist = preliminary_competitors[: settings.research_deep_crawl_competitors]
+        target_urls = extract_competitor_target_urls(
+            shortlist,
+            accumulated_search_results,
+            pages_per_competitor=settings.research_pages_per_competitor,
+            max_urls=settings.deep_search_max_pages,
+        )
+        if shortlist:
+            await _report(
+                on_progress,
+                f"[DEEP_TARGETS] Round {current_retries}: {len(target_urls)} page(s) across "
+                f"{len(shortlist)} shortlisted competitor(s) "
+                f"({', '.join(c.brand_name for c in shortlist[:5])})",
+            )
+        accumulated_source_urls = list({r.url for r in accumulated_search_results} | set(target_urls))
+        accumulated_extracted_pages.extend(await crawl_agent.run(target_urls))
+
+        # Crawled pages carry the pricing and claims the snippets lacked, so profiles are
+        # rebuilt from the enlarged evidence set before they are scored.
+        preliminary_competitors = enrich_competitors_from_pages(
+            preliminary_competitors, accumulated_extracted_pages
+        )
+
+        # Ad-library lookups need only competitor names, which exist from the first round.
+        # Handing them over now lets the caller run that work alongside the remaining rounds
+        # instead of after them; a failure there must not abort the research loop.
+        if on_first_competitors is not None and preliminary_competitors:
+            try:
+                await on_first_competitors(list(preliminary_competitors))
+            except Exception as exc:
+                logger.warning("on_first_competitors hook failed: %s", exc)
+            on_first_competitors = None
 
         # Step D: Dynamically update parameter taxonomy from crawled text
         raw_corpus = [r.snippet for r in accumulated_search_results] + [
             p["markdown"] for p in accumulated_extracted_pages if p.get("markdown")
         ]
         taxonomy = refine_parameters_from_findings(taxonomy, raw_corpus)
+
+        # The framework was drafted from the merchant's brief before any competitor had been
+        # looked at, and the regex refinement above can only adjust the minor attributes --
+        # the critical drivers are whatever the opening guess made them. Once real pages are
+        # in hand, a framework that nothing can be scored against is evidence the guess missed
+        # this market's vocabulary, so it gets one chance to be rewritten against what was
+        # actually found. Gated on density so a framework that is working costs no LLM call.
+        if (
+            revise_taxonomy is not None
+            and accumulated_extracted_pages
+            and calculate_attribute_density(preliminary_competitors, taxonomy)
+            < _TAXONOMY_REVISION_DENSITY_FLOOR
+        ):
+            before = list(taxonomy.critical_jtbd_drivers)
+            try:
+                taxonomy = await revise_taxonomy(taxonomy, raw_corpus)
+            except Exception as exc:
+                logger.warning("Taxonomy revision hook failed: %s", exc)
+            if taxonomy.critical_jtbd_drivers != before:
+                await _report(
+                    on_progress,
+                    "[TAXONOMY_REVISED] Framework did not fit the evidence; critical drivers "
+                    f"rewritten to: {', '.join(taxonomy.critical_jtbd_drivers)}",
+                )
+            revise_taxonomy = None
 
         # Step E: Evaluate Data Quality Score (DQS), recency and Attribute Density
         evidence_dates = collect_evidence_dates(
@@ -445,6 +747,26 @@ async def execute_research_loop(
                 current_retries,
             )
             break
+
+        # Plateau stop: a round that finds no new competitor and does not improve DQS will not
+        # be rescued by running the same play again, and each extra round costs a search plus a
+        # crawl and enlarges the synthesis corpus. Observed going 32 -> 44 -> 48 -> 48 with DQS
+        # 0.77 -> 0.77 -> 0.76 -> 0.76: the last round was pure cost.
+        if (
+            len(preliminary_competitors) <= last_competitor_count
+            and dqs_result.score <= last_dqs_score + _PLATEAU_DQS_EPSILON
+            and len(preliminary_competitors) >= settings.research_min_competitors
+        ):
+            await _report(
+                on_progress,
+                f"[PLATEAU_STOP] Round {current_retries} added no competitors and did not improve "
+                f"DQS ({dqs_result.score:.2f}); stopping early instead of spending "
+                f"{settings.dqs_max_retries - current_retries} more round(s)",
+            )
+            logger.info("Research loop plateaued at cycle %d — stopping early", current_retries)
+            break
+        last_competitor_count = len(preliminary_competitors)
+        last_dqs_score = dqs_result.score
 
         # Step G: Formulate targeted 'more data' search queries for next cycle
         current_retries += 1

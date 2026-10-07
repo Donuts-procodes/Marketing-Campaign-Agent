@@ -100,6 +100,18 @@ class SearchSubagent(ToolSubagent):
 
     async def run(self, queries: list[SearchQuery], round_number: int = 0) -> list[TavilySearchResult]:
         started = self._start()
+
+        # Emit each query before dispatching so the live console shows exactly
+        # what is being searched and which sites are targeted.
+        for i, q in enumerate(queries, 1):
+            domain_hint = (
+                " → " + ", ".join(q.include_domains[:3]) if q.include_domains else ""
+            )
+            time_hint = f" [{q.time_range}]" if q.time_range else ""
+            await self.log(
+                f"Round {round_number} query {i}/{len(queries)} [{q.vector}]{time_hint}{domain_hint}: {q.query}"
+            )
+
         try:
             results = await execute_tavily_search(queries, tavily_client=self.tavily_client)
         except Exception as exc:
@@ -140,6 +152,10 @@ class CrawlSubagent(ToolSubagent):
         if not new_urls:
             await self.log("No new pages to scrape")
             return []
+
+        # Emit the list of URLs queued for deep extraction.
+        for i, url in enumerate(new_urls, 1):
+            await self.log(f"Queue {i}/{len(new_urls)}: {url}")
 
         started = self._start()
         try:

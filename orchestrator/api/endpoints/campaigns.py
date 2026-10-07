@@ -17,11 +17,14 @@ from orchestrator.schemas.api import (
     CampaignCreate,
     CampaignCreateResponse,
     DossierUploadResponse,
+    InterpretQueryInput,
     MoreCompetitorsResponse,
+    PriorRunInfo,
     ReResearchResponse,
     RenameSessionInput,
     ResolveInterruptInput,
     ResolveInterruptResponse,
+    SessionDetailResponse,
     SessionListResponse,
     SessionSummary,
     UploadedFileInfo,
@@ -106,6 +109,32 @@ async def list_agents() -> AgentListResponse:
             output_contract="CampaignBriefDelta (channel_budgets, kpis, schedule)",
             status="not_implemented",
         ),
+        AgentDescriptor(
+            agent_id="media_generation",
+            name="Media & Creative Generation Agent",
+            description="Planned. Generates multi-format ad creative variants, copy variants, and visual layouts.",
+            service_endpoint="",
+            port=8004,
+            models=[],
+            tools=[],
+            capabilities=[],
+            input_contract="StrategyState (campaign_brief, persona_profiles)",
+            output_contract="MediaAssetDelta (ad_creatives, copy_variants, visual_layouts)",
+            status="not_implemented",
+        ),
+        AgentDescriptor(
+            agent_id="publishing",
+            name="Publishing & Distribution Agent",
+            description="Planned. Coordinates multi-platform scheduling, CMS dispatch, and live ad network synchronization.",
+            service_endpoint="",
+            port=8005,
+            models=[],
+            tools=[],
+            capabilities=[],
+            input_contract="StrategyState (media_assets, schedule)",
+            output_contract="PublishingDelta (dispatch_jobs, live_urls, status)",
+            status="not_implemented",
+        ),
     ]
     return AgentListResponse(agents=agents)
 
@@ -175,6 +204,62 @@ async def autofill_campaign_form(
         fields=fields,
         filled=filled_field_names(fields),
         files=[UploadedFileInfo(filename=n, characters=c) for n, c in info],
+    )
+
+
+@router.post(
+    "/interpret",
+    response_model=AutofillResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Interpret a free-form user query into structured merchant context fields",
+    description=(
+        "Unlike /autofill (which reads uploaded documents), this endpoint takes raw user "
+        "text — even vague goal statements — and uses an LLM to infer the most likely "
+        "product_name, category, value_prop and goal. The result can be used to pre-fill "
+        "the campaign brief form so the user can confirm rather than type from scratch."
+    ),
+)
+async def interpret_user_query(
+    request: Request,
+    payload: InterpretQueryInput,
+) -> AutofillResponse:
+    client_id = request.client.host if request.client else "unknown"
+    if not await get_storage().allow_job_creation(f"interpret:{client_id}"):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Interpret rate limit reached.")
+    try:
+        from orchestrator.services.query_interpreter import interpret_query
+        fields = await interpret_query(payload.text)
+    except AutofillUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return AutofillResponse(fields=fields, filled=filled_field_names(fields), files=[])
+
+
+@router.get(
+    "/prior-run",
+    response_model=PriorRunInfo,
+    status_code=status.HTTP_200_OK,
+    summary="Check whether a completed run already exists for this product",
+    description=(
+        "Returns metadata about the most recent successful run for the given product_name "
+        "and optional category. The frontend uses this to show an 'Update / Fresh scan' "
+        "mode selector before launching a new run."
+    ),
+)
+async def get_prior_run(
+    product_name: str = Query(..., min_length=1, max_length=300),
+    category: str = Query(default="", max_length=300),
+) -> PriorRunInfo:
+    doc = await get_storage().find_latest_run_by_product(product_name, category)
+    if not doc or not doc.get("report"):
+        return PriorRunInfo(found=False)
+    report = doc["report"]
+    finished_at = doc.get("finished_at")
+    return PriorRunInfo(
+        found=True,
+        job_id=doc.get("job_id"),
+        finished_at=str(finished_at) if finished_at else None,
+        dqs_score=report.get("dqs_score"),
+        competitor_count=len(report.get("competitors") or []),
     )
 
 
@@ -281,6 +366,35 @@ async def list_sessions(
     return SessionListResponse(sessions=[SessionSummary(**r) for r in rows])
 
 
+@router.get(
+    "/{job_id}",
+    response_model=SessionDetailResponse,
+    summary="Fetch full details, report, and events for a session",
+)
+async def get_session(
+    job_id: str,
+    service: CampaignService = Depends(get_campaign_service),
+) -> SessionDetailResponse:
+    try:
+        job = await service.get_or_restore_job(job_id)
+        storage = get_storage()
+        doc = await storage.load_run(job_id)
+        report = job.last_swot_report
+        events = job.history_events or (doc.get("events", []) if doc else [])
+        finished_at = doc.get("finished_at") if doc else None
+        return SessionDetailResponse(
+            job_id=job.job_id,
+            status="complete" if job.is_finished else ("running" if job.is_started else "pending"),
+            label=job.label,
+            finished_at=finished_at.isoformat() if hasattr(finished_at, "isoformat") else (str(finished_at) if finished_at else None),
+            merchant_context=job.merchant_context,
+            swot_report=report,
+            events=events,
+        )
+    except CampaignJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
 @router.patch(
     "/{job_id}",
     response_model=SessionSummary,
@@ -363,5 +477,3 @@ async def rerun_research(
         status="SUCCESS",
         swot_report=report,
     )
-
-

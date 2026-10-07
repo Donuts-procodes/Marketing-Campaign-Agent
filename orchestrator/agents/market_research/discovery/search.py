@@ -131,13 +131,16 @@ _PRICING_TERMS: dict[str, str] = {
 }
 
 #: Where this archetype's customers actually complain.
+# Listed from most-signal to least: the primary query targets the first 3; the
+# category-level fallback query (used when competitor-specific search returns nothing)
+# targets the full tuple so there's always somewhere to look.
 _GRIPE_DOMAINS: dict[str, tuple[str, ...]] = {
-    ARCH_SERVICE: ("reddit.com", "trustpilot.com", "yelp.com", "bbb.org"),
-    ARCH_LOCAL: ("reddit.com", "trustpilot.com", "yelp.com", "bbb.org"),
-    ARCH_ECOMMERCE: ("reddit.com", "trustpilot.com", "sitejabber.com"),
-    ARCH_CREATOR: ("reddit.com", "trustpilot.com", "quora.com"),
-    ARCH_SAAS: ("reddit.com", "g2.com", "capterra.com"),
-    ARCH_OTHER: ("reddit.com", "g2.com", "capterra.com"),
+    ARCH_SERVICE: ("reddit.com", "trustpilot.com", "yelp.com", "bbb.org", "sitejabber.com", "quora.com"),
+    ARCH_LOCAL: ("reddit.com", "trustpilot.com", "yelp.com", "bbb.org", "sitejabber.com"),
+    ARCH_ECOMMERCE: ("reddit.com", "trustpilot.com", "sitejabber.com", "g2.com", "quora.com"),
+    ARCH_CREATOR: ("reddit.com", "trustpilot.com", "quora.com", "sitejabber.com", "g2.com"),
+    ARCH_SAAS: ("reddit.com", "g2.com", "capterra.com", "trustpilot.com", "trustradius.com", "getapp.com"),
+    ARCH_OTHER: ("reddit.com", "g2.com", "capterra.com", "trustpilot.com", "trustradius.com"),
 }
 
 
@@ -275,9 +278,56 @@ def filter_out_of_scale_results(
     return kept
 
 
+_ARCHETYPE_CATEGORY_FALLBACKS: dict[str, str] = {
+    ARCH_SAAS: "B2B SaaS Software",
+    ARCH_SERVICE: "Professional Services Agency",
+    ARCH_LOCAL: "Local Services",
+    ARCH_ECOMMERCE: "E-commerce Retail",
+    ARCH_CREATOR: "Creator & Online Training",
+    ARCH_OTHER: "B2B Services",
+}
+
+_CONVERSATIONAL_STOPWORDS = {
+    "i", "want", "to", "my", "we", "our", "me", "us", "more", "how", "help", "need",
+    "and", "the", "a", "an", "for", "in", "of", "with", "so", "can", "am", "is", "are",
+}
+
+
+def _clean_search_category(category: str, archetype: str) -> str:
+    """
+    Sanitizes category token for search queries so conversational phrases
+    are never quoted verbatim in search engines.
+    """
+    clean = str(category or "").strip()
+    if not clean:
+        return _ARCHETYPE_CATEGORY_FALLBACKS.get(archetype, "B2B Services")
+    from orchestrator.agents.market_research.analysis.classification import is_conversational_statement
+
+    if is_conversational_statement(clean):
+        words = clean.split()
+        filtered = [w for w in words if w.lower().strip(".,!?;:") not in _CONVERSATIONAL_STOPWORDS]
+        if len(filtered) >= 2:
+            return " ".join(filtered[:4])
+        return _ARCHETYPE_CATEGORY_FALLBACKS.get(archetype, "Professional Services Agency")
+    return clean
+
+
+def _clean_search_product(product_name: str, fallback_category: str) -> str:
+    """Sanitizes product name so sentences are not quoted verbatim."""
+    prod = str(product_name or "").strip()
+    if not prod:
+        return fallback_category
+    from orchestrator.agents.market_research.analysis.classification import is_conversational_statement
+
+    if is_conversational_statement(prod):
+        return fallback_category
+    return prod
+
+
 def build_search_queries(
     merchant_context: dict[str, Any],
     taxonomy: DynamicParameterTaxonomy | None = None,
+    time_range_override: str | None = None,
 ) -> list[SearchQuery]:
     """
     Decomposes merchant context and dynamic parameters into taxonomy-scoped search queries.
@@ -285,16 +335,19 @@ def build_search_queries(
     for any campaign archetype (B2B SaaS, D2C eCommerce, Local Services, Creators, etc.).
     """
     current_year = _current_year()
-    category = merchant_context.get("category", "")
-    product_name = merchant_context.get("product_name", "")
+    raw_category = merchant_context.get("category", "")
+    raw_product_name = merchant_context.get("product_name", "")
     known_competitors = merchant_context.get("known_competitors", [])
     business_model = merchant_context.get("business_model", "")
     target_geography = merchant_context.get("target_geography", "")
     price_model = merchant_context.get("price_model", "")
 
     competitor_names = " OR ".join(f'"{c}"' for c in known_competitors) if known_competitors else ""
-    context_str = f"{category} {business_model}".lower()
+    context_str = f"{raw_category} {business_model}".lower()
     archetype = resolve_archetype(merchant_context, context_str)
+
+    category = _clean_search_category(raw_category, archetype)
+    product_name = _clean_search_product(raw_product_name, category)
 
     pricing_terms = _PRICING_TERMS[archetype]
     if price_model:
@@ -321,15 +374,18 @@ def build_search_queries(
     else:
         pricing_query = f'"{product_name}" {pricing_terms} "{category}"'
 
+    # Build site: filter from the first 4 gripe domains so the query covers more
+    # platforms without going over the engine's operator budget.
+    gripe_site_filter = " OR ".join(f"site:{d}" for d in gripe_domains[:4])
     if competitor_names:
         gripe_query = (
-            f'site:reddit.com OR site:g2.com OR site:capterra.com '
-            f'("{category}" OR ({competitor_names})) (complaint OR issue OR "wish it had" OR problem)'
+            f'({gripe_site_filter}) '
+            f'("{category}" OR ({competitor_names})) (complaint OR issue OR "wish it had" OR problem OR negative)'
         )
     else:
         gripe_query = (
-            f'site:reddit.com OR site:g2.com OR site:capterra.com '
-            f'"{category}" (complaint OR issue OR problem OR limitation)'
+            f'({gripe_site_filter}) '
+            f'"{category}" (complaint OR issue OR problem OR limitation OR negative review)'
         )
 
     if competitor_names:
@@ -338,17 +394,23 @@ def build_search_queries(
         claims_target = f'"{product_name}"'
     claims_query = f'{claims_target} "{category}" (tagline OR slogan OR "value proposition" OR "why choose")'
 
+    # Update runs override time_range to "month" so only recent changes are fetched.
+    # Gripe mining keeps no override (complaints don't expire).
+    tr_discovery = time_range_override or "year"
+    tr_pricing = time_range_override or "year"
+    tr_claims = time_range_override or "year"
+
     queries = [
         # Broadened discovery vector capturing alternatives, rivals, and top category picks
-        SearchQuery(vector="alternative_discovery", query=discovery_query, time_range="year"),
-        SearchQuery(vector="pricing_scrape", query=pricing_query, time_range="year"),
+        SearchQuery(vector="alternative_discovery", query=discovery_query, time_range=tr_discovery),
+        SearchQuery(vector="pricing_scrape", query=pricing_query, time_range=tr_pricing),
         # Complaints age well — an older thread is still valid evidence of a weakness.
         SearchQuery(
             vector="gripe_mining",
             query=gripe_query,
             include_domains=gripe_domains,
         ),
-        SearchQuery(vector="messaging_claims", query=claims_query, time_range="year"),
+        SearchQuery(vector="messaging_claims", query=claims_query, time_range=tr_claims),
     ]
     return queries
 
@@ -364,13 +426,14 @@ def build_missing_data_queries(
     pricing models, or unverified claims across any business category.
     """
     current_year = _current_year()
-    category = merchant_context.get("category", "")
+    raw_category = merchant_context.get("category", "")
     business_model = merchant_context.get("business_model", "")
-    context_str = f"{category} {business_model}".lower()
+    context_str = f"{raw_category} {business_model}".lower()
 
     # Same resolver as the first round. These used to be a separate, shorter keyword list,
     # so a vet clinic asked for rates in round 1 and for its MSRP in round 2.
     archetype = resolve_archetype(merchant_context, context_str)
+    category = _clean_search_category(raw_category, archetype)
     price_keywords = _PRICING_TERMS[archetype]
     review_domains = _GRIPE_DOMAINS[archetype]
 
@@ -388,21 +451,47 @@ def build_missing_data_queries(
             )
         )
 
-    # 2. Target rivals missing real user complaints/weaknesses
+    # 2. Target rivals missing real user complaints/weaknesses.
+    # Two passes: brand-specific first, then a broader category-level search across the
+    # full gripe domain list so lesser-known competitors that have no reviews by name
+    # still surface category-wide friction points the synthesis can attribute.
     missing_gripes = [c.brand_name for c in competitors if not c.weaknesses_mined]
     if missing_gripes:
         brand_terms = " OR ".join(f'"{b}"' for b in missing_gripes[:3])
+        # Use all gripe domains in this retry, not just the primary 3.
+        all_gripe_site_filter = " OR ".join(f"site:{d}" for d in review_domains)
         queries.append(
             SearchQuery(
                 vector="gripe_mining",
-                query=f'site:reddit.com OR site:g2.com ({brand_terms}) (complaint OR issue OR downside OR problem)',
+                query=f'({all_gripe_site_filter}) ({brand_terms}) (complaint OR issue OR downside OR problem OR "not worth" OR "bad experience")',
+                include_domains=review_domains,
+            )
+        )
+        # Category-level fallback: when brand has no reviews at all, look for what
+        # customers dislike about the category in general — still useful signal.
+        queries.append(
+            SearchQuery(
+                vector="gripe_mining",
+                query=f'({all_gripe_site_filter}) "{category}" (worst OR limitation OR problem OR "switching from" OR "alternative to")',
                 include_domains=review_domains,
             )
         )
 
-    # 3. If under 4 competitors, discover additional market alternatives — kept peer-scoped
+    # 3. Target rivals missing core claims or specs
+    missing_specs = [c.brand_name for c in competitors if not c.core_claims or not c.factual_evidence]
+    if missing_specs:
+        brand_terms = " OR ".join(f'"{b}"' for b in missing_specs[:4])
+        queries.append(
+            SearchQuery(
+                vector="messaging_claims",
+                query=f'({brand_terms}) "{category}" (features OR capabilities OR specifications OR "what is" OR overview)',
+                time_range="year",
+            )
+        )
+
+    # 4. If under 5 competitors, discover additional market alternatives — kept peer-scoped
     #    so a thin result set isn't backfilled with out-of-scale incumbents.
-    if len(competitors) < 4:
+    if len(competitors) < 5:
         scale = derive_scale_signals(merchant_context, context_str)
         discovery = _apply_scale_to_discovery(
             f'"best {category}" alternatives OR competitors comparison', scale
@@ -429,9 +518,14 @@ def refine_queries_for_retry(
     Broadens/adjusts search operators on DQS retry to improve data coverage.
     """
     current_year = _current_year()
-    category = merchant_context.get("category", "")
-    product_name = merchant_context.get("product_name", "")
+    raw_category = merchant_context.get("category", "")
+    raw_product_name = merchant_context.get("product_name", "")
     known_competitors = merchant_context.get("known_competitors", [])
+
+    context_str = f"{raw_category} {merchant_context.get('business_model', '')}".lower()
+    archetype = resolve_archetype(merchant_context, context_str)
+    category = _clean_search_category(raw_category, archetype)
+    product_name = _clean_search_product(raw_product_name, category)
 
     refined: list[SearchQuery] = []
 
@@ -634,15 +728,35 @@ async def execute_duckduckgo_search(
 
 
 def _merge(*result_lists: list[TavilySearchResult]) -> list[TavilySearchResult]:
-    """Deduplicates per vector and URL, keeping the first (highest-priority engine) result."""
+    """
+    Deduplicates per vector and URL, keeping the first (highest-priority engine) result.
+    Plain-HTTP URLs are upgraded to HTTPS at this point so every downstream consumer
+    (crawler, grounding, synthesis) only ever sees secure URLs.
+    """
+    from orchestrator.agents.market_research.discovery.url_guard import enforce_https
+
     merged: list[TavilySearchResult] = []
     seen: set[tuple[str, str]] = set()
     for results in result_lists:
         for r in results:
-            key = (r.vector, r.url)
-            if r.url and key not in seen:
+            if not r.url:
+                continue
+            secure = enforce_https(r.url)
+            if secure is None:
+                logger.debug("_merge: dropped non-HTTPS result: %s", r.url)
+                continue
+            key = (r.vector, secure)
+            if key not in seen:
                 seen.add(key)
-                merged.append(r)
+                merged.append(r if secure == r.url else TavilySearchResult(
+                    vector=r.vector,
+                    title=r.title,
+                    url=secure,
+                    snippet=r.snippet,
+                    score=r.score,
+                    provider=r.provider,
+                    published_date=r.published_date,
+                ))
     return merged
 
 

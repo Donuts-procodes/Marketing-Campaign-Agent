@@ -110,3 +110,23 @@ class TestRealGeneratedQueries:
         for query in build_search_queries(self.CTX):
             result = validate_search_query(query.query)
             assert result.ok is True, f"{query.vector}: {result.summary}"
+
+    def test_conversational_category_is_sanitized_in_generated_queries(self):
+        conv_ctx = {
+            "category": "i want to increase my connections to attract more customers",
+            "product_name": "i want to increase my connections to attract more customers",
+            "business_model": "professional_services",
+        }
+        queries = build_search_queries(conv_ctx)
+        assert len(queries) >= 4
+        for q in queries:
+            result = validate_search_query(q.query)
+            assert result.ok is True, f"{q.vector}: {result.summary}"
+            assert '"i want to increase my connections to attract more customers"' not in q.query
+
+    def test_unquotes_conversational_sentence_directly(self):
+        query = '"i want to increase my connections to attract more customers" alternative 2026'
+        result = validate_search_query(query)
+        assert result.ok is True
+        assert result.repaired is True
+        assert '"i want to increase my connections to attract more customers"' not in result.query

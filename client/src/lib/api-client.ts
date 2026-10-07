@@ -7,9 +7,11 @@ import {
   CampaignInitPayload,
   CreateJobResponse,
   MoreCompetitorsResponse,
+  PriorRunInfo,
   ReResearchResponse,
   ResolveInterruptPayload,
   ResolveInterruptResponse,
+  SessionDetailResponse,
   SessionListResponse,
   SessionSummary,
   UploadDossierResponse,
@@ -74,6 +76,35 @@ export async function createCampaignJob(
   });
 
   return handleResponse<CreateJobResponse>(response);
+}
+
+/**
+ * Checks whether a completed run already exists for the given product and category.
+ * Used to show the Update / Fresh scan mode selector before launching.
+ */
+export async function checkPriorRun(
+  productName: string,
+  category: string = ""
+): Promise<PriorRunInfo> {
+  const params = new URLSearchParams({ product_name: productName });
+  if (category) params.set("category", category);
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/campaigns/prior-run?${params.toString()}`
+  );
+  return handleResponse<PriorRunInfo>(response);
+}
+
+/**
+ * Interprets free-form user text (even vague goal statements) into structured merchant
+ * context fields. Unlike autofillFromFiles, this actively infers missing context via LLM.
+ */
+export async function interpretQuery(text: string): Promise<AutofillResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/campaigns/interpret`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  return handleResponse<AutofillResponse>(response);
 }
 
 /**
@@ -150,6 +181,14 @@ export async function listSessions(limit = 50): Promise<SessionListResponse> {
 }
 
 /**
+ * Fetches full details, report, and events for a session.
+ */
+export async function getSession(jobId: string): Promise<SessionDetailResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}`);
+  return handleResponse<SessionDetailResponse>(response);
+}
+
+/**
  * Renames a session.
  */
 export async function renameSession(jobId: string, label: string): Promise<SessionSummary> {
@@ -217,5 +256,3 @@ export async function reResearchCampaign(
 
   return handleResponse<ReResearchResponse>(response);
 }
-
-

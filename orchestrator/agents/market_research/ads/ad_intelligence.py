@@ -269,24 +269,40 @@ async def _google_ads(
 async def _web_mentions(
     competitors: list[CompetitorProfile], tavily_client: Any, category: str = ""
 ) -> dict[str, list[str]]:
-    queries = [
-        SearchQuery(
+    # Two queries per competitor: a specific ad-copy search, and a broader brand
+    # messaging search so something always surfaces even without ad library access.
+    queries = []
+    for comp in competitors:
+        brand = comp.brand_name
+        queries.append(SearchQuery(
             vector="ad_intelligence",
-            query=f'"{comp.brand_name}" {category} ("sponsored ad" OR "ad copy" OR "campaign tagline" OR "new campaign" OR slogan)',
-        )
-        for comp in competitors
-    ]
+            query=f'"{brand}" {category} ("sponsored ad" OR "ad copy" OR "campaign tagline" OR "new campaign" OR slogan)',
+        ))
+        queries.append(SearchQuery(
+            vector="ad_intelligence",
+            query=f'"{brand}" (marketing OR "value proposition" OR "why choose" OR "how it works" OR tagline OR headline)',
+        ))
+
     results = await execute_tavily_search(queries, tavily_client=tavily_client)
     mentions: dict[str, list[str]] = {}
     for comp in competitors:
         found: list[str] = []
         for r in results:
-            if len(r.snippet) < _MIN_HOOK_CHARS:
+            snippet = r.snippet or ""
+            if len(snippet) < _MIN_HOOK_CHARS:
                 continue
-            # The snippet itself must name the brand and talk about its advertising.
-            if not _brand_matches(comp.brand_name, r.snippet) or not _AD_CONTEXT_RE.search(r.snippet):
+            if not _brand_matches(comp.brand_name, snippet):
                 continue
-            hook = _hook(WEB_LABEL, r.snippet)
+            # Accept ad-context snippets OR messaging snippets (broader net for
+            # brands that don't appear in ad libraries).
+            is_ad_context = _AD_CONTEXT_RE.search(snippet)
+            is_messaging = re.search(
+                r"\b(tagline|headline|slogan|value prop|why choose|how it works|mission|vision)\b",
+                snippet, re.IGNORECASE,
+            )
+            if not (is_ad_context or is_messaging):
+                continue
+            hook = _hook(WEB_LABEL, snippet)
             if hook not in found:
                 found.append(hook)
         mentions[comp.product_name] = found

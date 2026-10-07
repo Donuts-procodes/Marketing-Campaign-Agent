@@ -28,6 +28,51 @@ const TAG_STYLES: Record<string, { chip: string; dot: string; label: string }> =
   LLM_CONFIG: { chip: "bg-rose-500/20 text-rose-300 border-rose-500/50", dot: "bg-rose-400", label: "LLM config" },
   NODE: { chip: "bg-indigo-500/15 text-indigo-300 border-indigo-500/40", dot: "bg-indigo-400", label: "Pipeline" },
 };
+
+// Matches "Round N query M/T [vector][time] → domain: query text"
+const QUERY_LINE_RE = /^Round \d+ query \d+\/\d+ \[([^\]]+)\]/;
+// Matches "Queue N/T: https://..."
+const CRAWL_QUEUE_RE = /^Queue \d+\/\d+: (https?:\/\/\S+)/;
+
+/** Renders search query lines with vector badge + optional clickable URL for crawl queues. */
+function renderQueryLine(rest: string) {
+  const crawlMatch = rest.match(CRAWL_QUEUE_RE);
+  if (crawlMatch) {
+    const url = crawlMatch[1];
+    const prefix = rest.slice(0, rest.indexOf(url));
+    return (
+      <span>
+        <span className="text-cyan-300">{prefix}</span>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-cyan-400 underline underline-offset-2 hover:text-cyan-200 break-all"
+        >
+          {url}
+        </a>
+      </span>
+    );
+  }
+
+  const qMatch = rest.match(QUERY_LINE_RE);
+  if (qMatch) {
+    const vector = qMatch[1];
+    // Colour the vector name and make the query text stand out.
+    const afterVector = rest.slice(rest.indexOf(`[${vector}]`) + vector.length + 2).trim();
+    return (
+      <span>
+        <span className="text-slate-400">{rest.slice(0, rest.indexOf(`[${vector}]`))}</span>
+        <span className="px-1 py-0.5 rounded text-[10px] font-bold bg-sky-900/50 text-sky-300 border border-sky-700/40">
+          {vector}
+        </span>
+        <span className="text-slate-300"> {afterVector}</span>
+      </span>
+    );
+  }
+
+  return <span className="text-slate-200">{rest}</span>;
+}
 const DEFAULT_TAG_STYLE = { chip: "bg-slate-800 text-slate-300 border-slate-700", dot: "bg-slate-400", label: "Other" };
 
 const LEVEL_BADGES: Record<TelemetryLogItem["level"], string> = {
@@ -104,6 +149,8 @@ export function LiveConsole({
       return <span className="text-slate-200">{message}</span>;
     }
     const style = tagStyle(tag);
+    const isQueryOrCrawl = (tag === "TAVILY_SEARCH" || tag === "DEEP_SEARCH")
+      && (QUERY_LINE_RE.test(rest) || CRAWL_QUEUE_RE.test(rest));
     return (
       <span className="inline-flex items-baseline gap-1.5 flex-wrap">
         <span
@@ -116,7 +163,7 @@ export function LiveConsole({
           <span className={cn("w-1.5 h-1.5 rounded-full", style.dot)} />
           {tag}
         </span>
-        <span className="text-slate-200">{rest}</span>
+        {isQueryOrCrawl ? renderQueryLine(rest) : <span className="text-slate-200">{rest}</span>}
       </span>
     );
   };

@@ -133,6 +133,37 @@ class TestCampaignClassification:
         result = classify_heuristically({"category": "Branding", "price_usd": 40000})
         assert result.price_model == "fixed_project"
 
+    @pytest.mark.asyncio
+    async def test_heuristic_extracts_user_intent_and_capabilities(self):
+        ctx = {
+            "product_name": "LeadEngine",
+            "category": "B2B SaaS",
+            "goal": "I want to increase connections to attract more customer leads",
+        }
+        enriched, classification, _ = await classify_campaign_context(ctx)
+        assert classification.user_intent != ""
+        assert "lead_generation" in classification.marketing_capabilities
+        assert enriched["user_intent"] == classification.user_intent
+        assert enriched["marketing_capabilities"] == classification.marketing_capabilities
+
+    @pytest.mark.asyncio
+    async def test_llm_classification_sets_user_intent_and_capabilities(self):
+        llm = _StubLLM(
+            CampaignClassification(
+                business_model="b2b_saas",
+                campaign_type="lead_gen",
+                price_model="monthly_subscription",
+                user_intent="Analyze competitor ad copy to drive demo bookings",
+                marketing_capabilities=["competitor_intelligence", "ad_copywriting"],
+            )
+        )
+        ctx = {"product_name": "DemoFlow", "category": "SaaS"}
+        enriched, classification, _ = await classify_campaign_context(ctx, llm=llm)
+        assert classification.user_intent == "Analyze competitor ad copy to drive demo bookings"
+        assert classification.marketing_capabilities == ["competitor_intelligence", "ad_copywriting"]
+        assert enriched["user_intent"] == classification.user_intent
+        assert enriched["marketing_capabilities"] == classification.marketing_capabilities
+
 
 # ── Freshness / Recency ───────────────────────────────────────────────────────
 
@@ -235,3 +266,48 @@ class TestDQSRecencyIntegration:
         undated = calculate_dqs(self._full_competitors(), sources, evidence_dates=[])
         assert undated.r_recency == 1.0
         assert is_research_converged(undated, density=1.0, competitors_count=3, min_recency=0.5) is True
+
+
+class TestConversationalGoalDisambiguation:
+    @pytest.mark.asyncio
+    async def test_conversational_goal_statement_is_disambiguated(self):
+        prompt_input = {
+            "product_name": "i want to increase my connections to attract more customers",
+            "category": "i want to increase my connections to attract more customers",
+            "primary_value_prop": "i want to increase my connections to attract more customers",
+        }
+        enriched, classification, filled = await classify_campaign_context(prompt_input)
+
+        assert enriched["category"] == "B2B Lead Generation & Networking Agency"
+        assert enriched["goal"] == "i want to increase my connections to attract more customers"
+        assert enriched["product_name"] == "Client Acquisition Service"
+        assert classification.business_model == "professional_services"
+        assert classification.campaign_type == "lead_gen"
+        assert "category" in filled
+        assert "product_name" in filled
+
+    @pytest.mark.asyncio
+    async def test_standard_business_context_is_not_disambiguated(self):
+        clean_input = {
+            "product_name": "DevFlow Studio",
+            "category": "Web & Mobile App Development Agency",
+            "primary_value_prop": "Custom apps",
+            "goal": "Scale to 10 clients",
+        }
+        enriched, classification, filled = await classify_campaign_context(clean_input)
+
+        assert enriched["category"] == "Web & Mobile App Development Agency"
+        assert enriched["product_name"] == "DevFlow Studio"
+        assert enriched["goal"] == "Scale to 10 clients"
+
+    def test_conversational_detection_function(self):
+        from orchestrator.agents.market_research.analysis.classification import is_conversational_statement
+
+        assert is_conversational_statement("i want to increase my connections to attract more customers") is True
+        assert is_conversational_statement("how to grow my online store sales") is True
+        assert is_conversational_statement("we need to find new B2B clients") is True
+        assert is_conversational_statement("looking to scale our outreach") is True
+        assert is_conversational_statement("Web & Mobile App Development Agency") is False
+        assert is_conversational_statement("SaaS Project Management Tool") is False
+        assert is_conversational_statement("Local Dental Clinic") is False
+

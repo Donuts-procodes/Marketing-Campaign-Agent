@@ -76,7 +76,7 @@ async def test_search_subagent_logs_tagged_progress():
     results = await search.run([SearchQuery(vector="pricing_scrape", query="q")], round_number=2)
 
     assert len(results) == 1
-    assert recorder.lines[0][1].startswith("[TAVILY_SEARCH] Round 2: 1 queries (pricing_scrape) returned 1 results")
+    assert any(line[1].startswith("[TAVILY_SEARCH] Round 2: 1 queries (pricing_scrape) returned 1 results") for line in recorder.lines)
     assert search.calls == 1
 
 

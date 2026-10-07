@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getCampaignStreamUrl, resolveInterrupt } from "@/lib/api-client";
+import { getCampaignStreamUrl, getSession, resolveInterrupt } from "@/lib/api-client";
 import {
   AgentPhase,
   NodeCompleteEvent,
@@ -244,7 +244,7 @@ export function useCampaignStream(jobId: string | null | undefined) {
       setState((prev) => {
         if (prev.connectionStatus === "COMPLETED" || (prev.swotReport && prev.swotReport.competitors.length > 0)) {
           finishedRef.current = true;
-          return { ...prev, connectionStatus: "COMPLETED" };
+          return { ...prev, connectionStatus: "COMPLETED", activePhase: null };
         }
         if (reconnectAttemptsRef.current < 4) {
           reconnectAttemptsRef.current += 1;
@@ -321,15 +321,70 @@ export function useCampaignStream(jobId: string | null | undefined) {
   );
 
   useEffect(() => {
-    // New job: start from the beginning of its event history.
+    if (!jobId) {
+      setState({ ...INITIAL_STATE, jobId: null });
+      return;
+    }
+
+    // Reset state for new jobId
     lastSeqRef.current = -1;
     finishedRef.current = false;
     reconnectAttemptsRef.current = 0;
-    connect();
+    setState({
+      ...INITIAL_STATE,
+      jobId,
+      connectionStatus: "CONNECTING",
+    });
+
+    let isMounted = true;
+
+    // Direct REST fetch to instantly hydrate finished/saved runs or pre-populate data
+    getSession(jobId)
+      .then((detail) => {
+        if (!isMounted) return;
+        if (detail.swot_report) {
+          const logs: TelemetryLogItem[] = (detail.events || [])
+            .filter((e) => e.type === "TELEMETRY_LOG" || e.type === "NODE_STARTED" || e.type === "NODE_COMPLETE")
+            .map((e, idx) => ({
+              id: `rest-${idx}-${Date.now()}`,
+              level: (e.level as "INFO" | "WARN" | "ERROR") || "INFO",
+              message: (e.message as string) || (e.node ? `${e.type}: ${e.node}` : ""),
+              timestamp: (e.timestamp as number) || Date.now(),
+            }));
+
+          const completedPhases: AgentPhase[] = [];
+          if (detail.swot_report) completedPhases.push("MARKET_RESEARCH");
+          if (detail.status === "complete") {
+            completedPhases.push("AUDIENCE_PERSONA", "CAMPAIGN_STRATEGY");
+          }
+
+          setState((s) => ({
+            ...s,
+            jobId,
+            swotReport: detail.swot_report,
+            connectionStatus: detail.status === "complete" ? "COMPLETED" : (s.connectionStatus === "CONNECTING" ? "STREAMING" : s.connectionStatus),
+            completedPhases: Array.from(new Set([...s.completedPhases, ...completedPhases])),
+            telemetryLogs: logs.length > 0 ? logs : s.telemetryLogs,
+            activePhase: detail.status === "complete" ? null : s.activePhase,
+          }));
+
+          if (detail.status === "complete") {
+            finishedRef.current = true;
+            return;
+          }
+        }
+        connect();
+      })
+      .catch(() => {
+        if (!isMounted) return;
+        connect();
+      });
+
     return () => {
+      isMounted = false;
       closeStream();
     };
-  }, [connect, closeStream]);
+  }, [jobId, connect, closeStream]);
 
   /** Applies a report returned directly by an API call (e.g. find-more-competitors). */
   const applyReport = useCallback((report: SWOTReportDelta) => {

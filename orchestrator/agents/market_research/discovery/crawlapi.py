@@ -27,17 +27,18 @@ CRAWLBASE_ENDPOINT = "https://api.crawlbase.com/"
 _OK_STATUSES = {200, 201, 203, 204}
 
 # Firecrawl plans are rate limited per minute: cap concurrency process-wide and retry on 429.
-_FIRECRAWL_MAX_CONCURRENT = 3
 _FIRECRAWL_RETRIES = 3
-_firecrawl_semaphores: dict[int, asyncio.Semaphore] = {}
+# Keyed by (loop id, limit) so a settings change takes effect without a restart.
+_firecrawl_semaphores: dict[tuple[int, int], asyncio.Semaphore] = {}
 
 
 def _firecrawl_semaphore() -> asyncio.Semaphore:
-    loop_id = id(asyncio.get_running_loop())
-    sem = _firecrawl_semaphores.get(loop_id)
+    limit = max(get_settings().firecrawl_max_concurrent, 1)
+    key = (id(asyncio.get_running_loop()), limit)
+    sem = _firecrawl_semaphores.get(key)
     if sem is None:
         _firecrawl_semaphores.clear()
-        sem = _firecrawl_semaphores[loop_id] = asyncio.Semaphore(_FIRECRAWL_MAX_CONCURRENT)
+        sem = _firecrawl_semaphores[key] = asyncio.Semaphore(limit)
     return sem
 
 

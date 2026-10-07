@@ -124,6 +124,12 @@ def _balance_parens(query: str) -> str:
     return "(" * (closes - opens) + query
 
 
+_CONVERSATIONAL_PREFIX_RE = re.compile(
+    r"^(i\s+(want|need|am|wish)|we\s+(want|need|are|wish)|how\s+to|looking\s+to|help\s+me|try(ing)?\s+to|increase|grow|attract)\b",
+    re.IGNORECASE,
+)
+
+
 def _strip_placeholders(query: str) -> str:
     """
     Removes unfilled tokens, then collapses the whitespace and dangling operators they
@@ -137,6 +143,28 @@ def _strip_placeholders(query: str) -> str:
     cleaned = re.sub(r"\b(OR|AND)\b(\s+\b(OR|AND)\b)+", r"\1", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^\s*\b(OR|AND)\b\s*|\s*\b(OR|AND)\b\s*$", " ", cleaned, flags=re.IGNORECASE)
     return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def _unquote_conversational_phrases(query: str) -> str:
+    """
+    Unquotes conversational goals/sentences trapped inside exact-match quotes
+    (e.g., '"i want to increase connections to attract customers"') so exact phrase matching
+    does not destroy search engine recall.
+    """
+    from orchestrator.agents.market_research.analysis.classification import is_conversational_statement
+
+    def _rep(m: re.Match[str]) -> str:
+        token = m.group(0)[1:-1].strip()
+        if is_conversational_statement(token):
+            words = token.split()
+            clean_words = [
+                w for w in words
+                if w.lower() not in {"i", "want", "to", "my", "we", "our", "me", "us", "more", "how"}
+            ]
+            return " ".join(clean_words[:4])
+        return m.group(0)
+
+    return _QUOTED_RE.sub(_rep, query)
 
 
 def _trim_exclusions(query: str, keep: int) -> str:
@@ -181,6 +209,12 @@ def validate_search_query(query: str) -> QueryValidation:
     if working.count('"') % 2:
         issues.append("unbalanced quote")
         working = _balance_quotes(working)
+
+    if _QUOTED_RE.search(working):
+        unquoted = _unquote_conversational_phrases(working)
+        if unquoted != working:
+            issues.append("unquoted conversational phrase inside exact quotes")
+            working = unquoted
 
     if working.count("(") != working.count(")"):
         issues.append("unbalanced parenthesis")

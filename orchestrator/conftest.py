@@ -13,6 +13,7 @@ _API_KEY_FIELDS = (
     "crawlapi_token",
     "crawlapi_js_token",
     "meta_access_token",
+    "api_access_key",
 )
 
 

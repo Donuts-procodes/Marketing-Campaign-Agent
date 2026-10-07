@@ -228,6 +228,9 @@ declare module "lucide-react" {
   export const Users2: any;
   export const Bell: any;
   export const User: any;
+  export const Mail: any;
+  export const Share: any;
+  export const Share2: any;
   const icons: Record<string, any>;
   export default icons;
 }

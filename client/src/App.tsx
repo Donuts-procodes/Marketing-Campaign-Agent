@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { OrchestratorPage } from "@/pages/OrchestratorPage";
 import { NewCampaignPage } from "@/pages/NewCampaignPage";
 import { CampaignLivePage } from "@/pages/CampaignLivePage";
 import { Terminal } from "lucide-react";
@@ -10,7 +11,7 @@ export function App() {
         {/* Dynamic Route View */}
         <main className="flex-1 py-4 sm:py-6 px-2 sm:px-4 lg:px-6 flex flex-col items-center justify-center">
           <Routes>
-            <Route path="/" element={<NewCampaignPage />} />
+            <Route path="/" element={<OrchestratorPage />} />
             <Route path="/campaigns/new" element={<NewCampaignPage />} />
             <Route path="/campaigns/:jobId" element={<CampaignLivePage />} />
           </Routes>

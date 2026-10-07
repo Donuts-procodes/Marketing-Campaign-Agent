@@ -48,6 +48,22 @@ class CampaignClassification(BaseModel):
         default="",
         description="One sentence citing the context that drove this classification",
     )
+    normalized_category: str = Field(
+        default="",
+        description="Clean, concise 2-5 word industry/market category if original category was conversational or a goal statement",
+    )
+    normalized_product_name: str = Field(
+        default="",
+        description="Clean brand or product name if original was conversational or identical to the goal",
+    )
+    user_intent: str = Field(
+        default="",
+        description="Concise 1-2 sentence understanding of what the user specifically wants the AI engine to accomplish based on their prompt/goal",
+    )
+    marketing_capabilities: list[str] = Field(
+        default_factory=list,
+        description="Specific marketing capabilities requested by the user, e.g. ['competitor_intelligence', 'pricing_analysis', 'lead_generation', 'ad_copywriting', 'positioning_strategy', 'audience_personas']",
+    )
 
 
 class CompetitorProfile(BaseModel):

@@ -51,9 +51,20 @@ class MerchantContextInput(BaseModel):
     )
 
 
+class PriorRunInfo(BaseModel):
+    """Returned by GET /campaigns/prior-run when a completed run exists for the same product."""
+
+    found: bool
+    job_id: str | None = None
+    finished_at: str | None = None
+    dqs_score: float | None = None
+    competitor_count: int | None = None
+
+
 class CampaignCreate(BaseModel):
     merchant_context: MerchantContextInput
     byok_config: BYOKConfig | None = None
+    run_mode: Literal["fresh", "update"] = "fresh"
 
 
 class CampaignCreateResponse(BaseModel):
@@ -108,6 +119,24 @@ class SessionListResponse(BaseModel):
     sessions: list[SessionSummary]
 
 
+class SessionDetailResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    job_id: str
+    status: str
+    label: str | None = None
+    finished_at: str | None = None
+    merchant_context: dict = Field(default_factory=dict)
+    swot_report: SWOTReportDelta | None = None
+    events: list[dict] = Field(default_factory=list)
+
+
+class InterpretQueryInput(BaseModel):
+    """Free-form user text to interpret into structured merchant context fields."""
+
+    text: Annotated[str, Field(max_length=4000)]
+
+
 class RenameSessionInput(BaseModel):
     label: ShortText
 
@@ -160,4 +189,3 @@ class AgentListResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     agents: list[AgentDescriptor]
-
