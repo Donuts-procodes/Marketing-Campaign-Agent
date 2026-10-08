@@ -17,8 +17,9 @@ from typing import Any
 from orchestrator.core.config import get_settings
 from orchestrator.core.llm import has_llm_credentials
 from orchestrator.core.storage import get_storage
-from orchestrator.schemas.api import BYOKConfig, CampaignCreate
+from orchestrator.schemas.api import BYOKConfig, CampaignCreate, ReportEdit
 from orchestrator.schemas.research import CompetitorProfile, SWOTReportDelta
+from orchestrator.services.report_edits import ReportEditError, apply_report_edits
 from orchestrator.schemas.state import StrategyState
 from orchestrator.services.dossier import combine_documents
 
@@ -549,7 +550,7 @@ class CampaignService:
     # ── On-demand competitor discovery ───────────────────────────────────────
 
     async def find_more_competitors(
-        self, job_id: str
+        self, job_id: str, names: list[str] | None = None
     ) -> tuple[SWOTReportDelta, list[CompetitorProfile]]:
         job = await self.get_or_restore_job(job_id)
 
@@ -558,10 +559,10 @@ class CampaignService:
 
         # Serialize concurrent requests: each one reads and extends the same report.
         async with job.report_lock:
-            return await self._find_more_competitors_locked(job)
+            return await self._find_more_competitors_locked(job, [n.strip() for n in names or [] if n.strip()])
 
     async def _find_more_competitors_locked(
-        self, job: CampaignJob
+        self, job: CampaignJob, names: list[str] | None = None
     ) -> tuple[SWOTReportDelta, list[CompetitorProfile]]:
         current_report = job.last_swot_report
         assert current_report is not None
@@ -573,6 +574,19 @@ class CampaignService:
         category = job.merchant_context.get("category", "General")
 
         from orchestrator.agents.market_research.ads.ad_intelligence import search_competitor_ad_hooks
+        from orchestrator.agents.market_research.discovery.search import (
+            SearchQuery,
+            build_missing_data_queries,
+            build_search_queries,
+            derive_scale_signals,
+            execute_tavily_search,
+            filter_out_of_scale_results,
+        )
+        from orchestrator.agents.market_research.pipeline.loop import extract_preliminary_competitors
+
+        # Every branch below feeds the same follow-up searches, which need these; they used to
+        # be defined only on the fresh-search branch, so promoting from the bench crashed.
+        scale = derive_scale_signals(job.merchant_context)
 
         # The research loop already discovered more competitors than the top-N cut-off let
         # through. Serve the next in line from that bench before paying for a new search.
@@ -581,7 +595,27 @@ class CampaignService:
         ]
         new_competitors: list[CompetitorProfile] = bench_ready[:2]
 
-        if new_competitors:
+        if names:
+            # The merchant named who to research: use the bench's profile when it has one,
+            # otherwise start from the name alone and let the targeted searches below fill it.
+            missing = self._missing_keys(job)
+            if missing:
+                raise ResearchKeysMissingError(
+                    f"Researching competitors needs {' and '.join(missing)}; no sample data is substituted."
+                )
+            requested = [n for n in dict.fromkeys(names) if _norm(n) not in existing_keys]
+            bench_by_name = {_norm(c.brand_name): c for c in job.bench_competitors}
+            new_competitors = [
+                bench_by_name.get(_norm(n)) or CompetitorProfile(brand_name=n, product_name=n) for n in requested
+            ]
+            job.bench_competitors = [c for c in job.bench_competitors if _norm(c.brand_name) not in {_norm(n) for n in requested}]
+            await self._log(
+                job,
+                f"[FIND_MORE_COMPETITORS] Researching named competitor(s): {', '.join(requested)}"
+                if requested
+                else "[FIND_MORE_COMPETITORS] Every named competitor is already in the report.",
+            )
+        elif new_competitors:
             served = {_norm(c.brand_name) for c in new_competitors}
             job.bench_competitors = [
                 c for c in job.bench_competitors if _norm(c.brand_name) not in served
@@ -605,19 +639,9 @@ class CampaignService:
                     f"Finding competitors needs {' and '.join(missing)}; no sample data is substituted."
                 )
 
-            from orchestrator.agents.market_research.pipeline.loop import extract_preliminary_competitors
-            from orchestrator.agents.market_research.discovery.search import (
-                SearchQuery,
-                build_search_queries,
-                derive_scale_signals,
-                execute_tavily_search,
-                filter_out_of_scale_results,
-            )
-
             # Reuse the real generator so this path gets the same peer-scale anchoring, recency
             # window and incumbent exclusions as the research loop — then additionally exclude the
             # competitors already on the board.
-            scale = derive_scale_signals(job.merchant_context)
             base_discovery = next(
                 (
                     q for q in build_search_queries(job.merchant_context)
@@ -650,7 +674,33 @@ class CampaignService:
             )
             from orchestrator.agents.market_research.pipeline.loop import (
                 enrich_competitors_from_pages,
+                merge_duplicate_competitors,
             )
+
+            # Start a mini-loop for just the new data to ensure it meets quality standards
+            for iteration in range(1, 3):
+                missing_queries = build_missing_data_queries(
+                    job.merchant_context, new_competitors, current_report.dynamic_taxonomy, iteration=iteration
+                )
+                if not missing_queries:
+                    break
+                await self._log(job, f"[MORE_COMPETITORS] Iteration {iteration}: Fetching missing data for new competitors...")
+                batch_results = filter_out_of_scale_results(await execute_tavily_search(missing_queries), scale)
+                enriched_fresh = extract_preliminary_competitors(batch_results, [c.brand_name for c in new_competitors])
+                
+                # Keys taken before merging: computed after, they matched every profile the
+                # follow-up searches turned up and let unrelated companies onto the report.
+                target_keys = {_norm(c.brand_name) for c in new_competitors}
+                new_competitors = merge_duplicate_competitors(new_competitors + enriched_fresh)
+                new_competitors = [c for c in new_competitors if _norm(c.brand_name) in target_keys]
+                # A competitor added by name starts without a website, so its seed and the profile
+                # the search found are keyed apart; keep the one that has sources.
+                by_name: dict[str, CompetitorProfile] = {}
+                for c in new_competitors:
+                    kept = by_name.get(_norm(c.brand_name))
+                    if kept is None or (not kept.sources and c.sources):
+                        by_name[_norm(c.brand_name)] = c
+                new_competitors = list(by_name.values())
 
             settings = get_settings()
             crawl_urls = extract_competitor_target_urls(
@@ -718,6 +768,45 @@ class CampaignService:
         await get_storage().save_run(self._run_document(job))
 
         return current_report, new_competitors
+
+    async def edit_report(self, job_id: str, edits: list[ReportEdit]) -> tuple[SWOTReportDelta, list[str]]:
+        """
+        Applies merchant corrections to the report: remove a quote, correct or clear a price,
+        remove a competitor. All edits are checked first and applied together, or none are.
+        A corrected price is recorded in the competitor's change history as the merchant's,
+        so the report never presents it as something the research found.
+        """
+        job = await self.get_or_restore_job(job_id)
+        if not job.last_swot_report:
+            raise CampaignJobConflictError(f"Job {job_id} does not have a research report yet.")
+
+        async with job.report_lock:
+            report, applied = apply_report_edits(job.last_swot_report.model_copy(deep=True), edits)
+
+            from orchestrator.agents.market_research.analysis.scoring import calculate_dqs
+            from orchestrator.agents.market_research.analysis.taxonomy import calculate_attribute_density
+
+            settings = get_settings()
+            report.dqs_score = calculate_dqs(
+                competitors=report.competitors, source_urls=report.source_urls, threshold=settings.dqs_threshold
+            ).score
+            report.attribute_density = calculate_attribute_density(report.competitors, report.dynamic_taxonomy)
+            report.validation_diagnostics = report.validation_diagnostics + [f"[MERCHANT_EDIT] {a}" for a in applied]
+            job.last_swot_report = report
+
+            for a in applied:
+                await self._log(job, f"[MERCHANT_EDIT] {a}")
+            await self._emit_event(
+                job,
+                {
+                    "type": "NODE_COMPLETE",
+                    "node": "market_research",
+                    "delta": {"swot_report": report.model_dump()},
+                    "timestamp": _now_ms(),
+                },
+            )
+            await get_storage().save_run(self._run_document(job))
+            return report, applied
 
     async def rerun_market_research(self, job_id: str) -> SWOTReportDelta:
         job = await self.get_or_restore_job(job_id)

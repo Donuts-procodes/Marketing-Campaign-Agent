@@ -191,8 +191,8 @@ class Storage:
 
     # ── Redis: sliding-window rate limit on run creation ────────────────────
 
-    async def allow_job_creation(self, client_id: str) -> bool:
-        """True when `client_id` created fewer than max_jobs_per_hour runs in the last hour."""
+    async def allow_job_creation(self, client_id: str, limit: int | None = None) -> bool:
+        """True when `client_id` made fewer than `limit` (default max_jobs_per_hour) calls in the last hour."""
         if self.redis is None:
             return True
         key = f"ratelimit:jobs:{client_id}"
@@ -202,7 +202,7 @@ class Storage:
             pipe.zremrangebyscore(key, 0, now - _RATE_WINDOW_SECONDS)
             pipe.zcard(key)
             _, count = await asyncio.wait_for(pipe.execute(), timeout=_REDIS_OP_TIMEOUT)
-            if count >= get_settings().max_jobs_per_hour:
+            if count >= (limit if limit is not None else get_settings().max_jobs_per_hour):
                 return False
             pipe = self.redis.pipeline()
             pipe.zadd(key, {f"{now}:{uuid.uuid4().hex}": now})

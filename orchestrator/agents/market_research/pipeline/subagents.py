@@ -24,6 +24,7 @@ from typing import Any, ClassVar
 from orchestrator.agents.market_research.ads.ad_intelligence import AdIntelResult, search_competitor_ad_hooks
 from orchestrator.agents.market_research.discovery.crawler import extract_pages
 from orchestrator.agents.market_research.analysis.grounding import validate_information_grounding
+from orchestrator.agents.market_research.analysis.validator import ValidatorVerdict, validate_report
 from orchestrator.agents.market_research.progress import ProgressFn, _report
 from orchestrator.agents.market_research.discovery.search import (
     SearchQuery,
@@ -282,6 +283,33 @@ class GroundingSubagent(ToolSubagent):
         return report, diagnostics
 
 
+class ValidatorSubagent(ToolSubagent):
+    """Adversarial critic: rejects items their own source passage does not support."""
+
+    tag = "VALIDATOR"
+
+    def __init__(self, llm: Any, on_progress: ProgressFn | None = None) -> None:
+        super().__init__(on_progress)
+        self.llm = llm
+
+    async def run(
+        self, report: SWOTReportDelta, corpus: list[str], round_number: int = 0
+    ) -> tuple[SWOTReportDelta, ValidatorVerdict, list[str]]:
+        if self.llm is None:
+            return report, ValidatorVerdict(), []
+        started = self._start()
+        report, verdict, diagnostics = await validate_report(report, corpus, self.llm)
+        elapsed = self._stop(started)
+        gaps = ", ".join(f"{g.field.replace('_mined', '').replace('_model', '')} for {g.competitor}" for g in verdict.gaps)
+        await self.log(
+            f"Round {round_number}: rejected {len(diagnostics)} item(s)"
+            + (f"; asked for more evidence: {gaps}" if gaps else "; no gaps worth another search")
+            + f" ({elapsed:.1f}s)",
+            level="WARN" if diagnostics else "INFO",
+        )
+        return report, verdict, diagnostics
+
+
 class RelevanceSubagent(ToolSubagent):
     tag = "RELEVANCE_FILTER"
 
@@ -325,13 +353,14 @@ class ResearchCrew:
     ad_intel: AdIntelSubagent
     synthesis: SynthesisSubagent
     grounding: GroundingSubagent
+    validator: ValidatorSubagent
     relevance: RelevanceSubagent
     members: list[ToolSubagent] = field(init=False)
 
     def __post_init__(self) -> None:
         self.members = [
             self.taxonomy, self.search, self.crawl, self.ad_intel,
-            self.synthesis, self.grounding, self.relevance,
+            self.synthesis, self.grounding, self.validator, self.relevance,
         ]
 
     @classmethod
@@ -341,16 +370,20 @@ class ResearchCrew:
         tavily_client: Any = None,
         crawl_client: Any = None,
         llm: Any = None,
+        fast_llm: Any = None,
         on_progress: ProgressFn | None = None,
     ) -> ResearchCrew:
+        """`fast_llm` (defaults to `llm`) runs the light steps; synthesis and the validator keep `llm`."""
+        fast_llm = fast_llm if fast_llm is not None else llm
         return cls(
-            taxonomy=TaxonomySubagent(llm, on_progress),
+            taxonomy=TaxonomySubagent(fast_llm, on_progress),
             search=SearchSubagent(tavily_client, on_progress),
             crawl=CrawlSubagent(crawl_client, on_progress, tavily_client=tavily_client),
             ad_intel=AdIntelSubagent(tavily_client, on_progress, crawl_client=crawl_client),
             synthesis=SynthesisSubagent(llm, on_progress),
             grounding=GroundingSubagent(on_progress),
-            relevance=RelevanceSubagent(llm, on_progress),
+            validator=ValidatorSubagent(llm, on_progress),
+            relevance=RelevanceSubagent(fast_llm, on_progress),
         )
 
     @property

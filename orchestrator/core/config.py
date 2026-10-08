@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # Smaller OpenAI model retried when the main model call fails (errors, rate limits, outages).
     # Empty disables the fallback.
     llm_fallback_model: str = "gpt-4o-mini"
+    # Lighter model for classification, taxonomy, category fit and dashboard curation. Report
+    # synthesis, the validator and the chat stay on llm_model. Empty uses llm_model everywhere.
+    llm_fast_model: str = "gpt-4o-mini"
 
     tavily_search_depth: str = "advanced"
     tavily_max_results: int = 15
@@ -87,10 +90,15 @@ class Settings(BaseSettings):
     # Firecrawl plan's per-minute allowance; 429s are retried (_FIRECRAWL_RETRIES) so an
     # overshoot degrades into backoff rather than failure.
     crawl_max_concurrent: int = 10
+    # Per-page limit for competitor page crawls (ad-library fetches keep crawlapi_timeout_seconds).
+    crawl_page_timeout_seconds: float = 30.0
     firecrawl_max_concurrent: int = 10
 
     dqs_threshold: float = 0.90
     dqs_max_retries: int = 3
+    # Targeted research rounds the validator may send back for the gaps it names. Each costs a
+    # search, a short crawl and one more validator call; 0 keeps the validator review-only.
+    validator_max_rounds: int = 1
     # Attribute density gate for the research loop. Preliminary search-stage profiles carry
     # few structured attributes, so the default leaves density as a reported metric only.
     research_min_density: float = 0.0
@@ -104,6 +112,9 @@ class Settings(BaseSettings):
     # page was almost never their pricing page. These concentrate the same page budget on the
     # shortlist: 5 competitors x 4 pages fetches each one's home, pricing and feature pages.
     research_deep_crawl_competitors: int = 5
+    # Max "alternatives to the leaders" search passes before the shortlist is locked; stops
+    # earlier once a pass adds no new name to the top 10.
+    research_discovery_iterations: int = 3
     research_pages_per_competitor: int = 4
 
     # Dated evidence older than this counts as stale in the DQS recency dimension.
@@ -130,6 +141,9 @@ class Settings(BaseSettings):
     # Redis rate-limits run creation (sliding window, shared by all workers); empty disables it.
     redis_url: str = Field(default="", validation_alias=AliasChoices("redis_url", "REDIS_URL"))
     max_jobs_per_hour: int = 20
+    # Report chat: messages per client per hour, and how much of the report goes into its prompt.
+    max_chat_messages_per_hour: int = 120
+    max_chat_context_chars: int = 60_000
 
     # When set, every /api request must send it in the X-API-Key header (the dev proxy injects it).
     api_access_key: str = Field(

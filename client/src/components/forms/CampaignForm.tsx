@@ -104,8 +104,18 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
   const handleAutofill = async () => {
     setIsAutofilling(true);
     setAutofillNotice(null);
+
+    let byok_config: BYOKConfig | undefined = undefined;
+    if (enableByok && apiKey.trim()) {
+      byok_config = {
+        provider: selectedProvider,
+        model: selectedModel,
+        api_key: apiKey.trim(),
+      };
+    }
+
     try {
-      const { fields } = await autofillFromFiles(dossierFiles);
+      const { fields } = await autofillFromFiles(dossierFiles, byok_config);
       const filled: string[] = [];
       const fill = (label: string, current: string, value: string | null | undefined, set: (v: string) => void) => {
         if (value && !current.trim()) {

@@ -38,10 +38,10 @@ PLACEHOLDER_PRICING = "detected"
 
 # ── Thresholds for full credit within each dimension ──────────────────────────
 
-MIN_COMPETITORS_FULL = 3
-MIN_PRICING_FULL = 2
-MIN_WEAKNESSES_FULL = 3
-MIN_SOURCES_FULL = 5
+MIN_COMPETITORS_FULL = 5
+MIN_PRICING_FULL = 4
+MIN_WEAKNESSES_FULL = 6
+MIN_SOURCES_FULL = 6
 
 
 @dataclass

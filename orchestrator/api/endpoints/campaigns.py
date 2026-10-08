@@ -5,7 +5,9 @@ Handles HTTP status codes, headers, parameter extraction, and DI only.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile, status
+import json
+
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from orchestrator.core.config import get_settings
@@ -14,12 +16,17 @@ from orchestrator.schemas.api import (
     AgentDescriptor,
     AgentListResponse,
     AutofillResponse,
+    BYOKConfig,
     CampaignCreate,
     CampaignCreateResponse,
     DossierUploadResponse,
     InterpretQueryInput,
+    MoreCompetitorsInput,
     MoreCompetitorsResponse,
     PriorRunInfo,
+    ReportChatInput,
+    ReportEditInput,
+    ReportEditResponse,
     ReResearchResponse,
     RenameSessionInput,
     ResolveInterruptInput,
@@ -35,6 +42,7 @@ from orchestrator.services.campaign_service import (
     CampaignJobNotFoundError,
     CampaignService,
     DossierTooLargeError,
+    ReportEditError,
     ResearchKeysMissingError,
     check_upload_limits,
     get_campaign_service,
@@ -185,15 +193,24 @@ async def _read_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
 async def autofill_campaign_form(
     request: Request,
     files: list[UploadFile] = File(...),
+    byok_config: str | None = Form(default=None, description="JSON serialized BYOKConfig"),
 ) -> AutofillResponse:
     client_id = request.client.host if request.client else "unknown"
     if not await get_storage().allow_job_creation(f"autofill:{client_id}"):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Autofill rate limit reached.")
     uploads = await _read_uploads(files)
+    
+    parsed_byok: BYOKConfig | None = None
+    if byok_config:
+        try:
+            parsed_byok = BYOKConfig.model_validate(json.loads(byok_config))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid BYOKConfig: {exc}")
+            
     try:
         check_upload_limits(uploads)
         text, info = combine_documents(uploads)
-        fields = await autofill_from_text(text)
+        fields = await autofill_from_text(text, byok_config=parsed_byok)
     except DossierTooLargeError as exc:
         raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)) from exc
     except DossierFormatError as exc:
@@ -437,10 +454,11 @@ async def delete_session(
 )
 async def find_more_competitors(
     job_id: str,
+    payload: MoreCompetitorsInput | None = None,
     service: CampaignService = Depends(get_campaign_service),
 ) -> MoreCompetitorsResponse:
     try:
-        report, added = await service.find_more_competitors(job_id)
+        report, added = await service.find_more_competitors(job_id, payload.names if payload else None)
     except CampaignJobNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except CampaignJobConflictError as exc:
@@ -476,4 +494,68 @@ async def rerun_research(
     return ReResearchResponse(
         status="SUCCESS",
         swot_report=report,
+    )
+
+
+@router.post(
+    "/{job_id}/report/edits",
+    response_model=ReportEditResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Apply merchant corrections to the report (remove an item, correct a price, remove a competitor)",
+)
+async def edit_report(
+    job_id: str,
+    payload: ReportEditInput,
+    service: CampaignService = Depends(get_campaign_service),
+) -> ReportEditResponse:
+    try:
+        report, applied = await service.edit_report(job_id, payload.edits)
+    except CampaignJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CampaignJobConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ReportEditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ReportEditResponse(applied=applied, swot_report=report)
+
+
+@router.post(
+    "/{job_id}/chat",
+    status_code=status.HTTP_200_OK,
+    summary="Ask a question about this run's report; the answer streams as server-sent events",
+    description=(
+        "Answers only from this run's report and the merchant's brief. Frames are "
+        '`data: {"delta": "..."}`, then `data: {"done": true}` or `data: {"error": "..."}`.'
+    ),
+)
+async def chat_about_report(
+    job_id: str,
+    payload: ReportChatInput,
+    request: Request,
+    service: CampaignService = Depends(get_campaign_service),
+) -> StreamingResponse:
+    if payload.messages[-1].role != "user":
+        raise HTTPException(status_code=422, detail="The last message must be the user's question.")
+    client_id = request.client.host if request.client else "unknown"
+    if not await get_storage().allow_job_creation(f"chat:{client_id}", limit=get_settings().max_chat_messages_per_hour):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Chat limit reached — try again in a few minutes.")
+    try:
+        job = await service.get_or_restore_job(job_id)
+    except CampaignJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    if job.last_swot_report is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The report is not ready yet.")
+
+    from orchestrator.core.llm import LLMConfigurationError, build_chat_model
+    from orchestrator.services.report_chat import stream_report_chat
+
+    try:
+        llm = build_chat_model(job.byok_config)
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        stream_report_chat(llm, job.last_swot_report, job.merchant_context, payload.messages, job.bench_competitors),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

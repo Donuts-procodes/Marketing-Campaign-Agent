@@ -5,6 +5,7 @@ Dynamic Parameter Taxonomy reasoning, parameter refinement, and density evaluati
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from orchestrator.agents.market_research.analysis.archetype import (
@@ -374,32 +375,50 @@ def refine_parameters_from_findings(
     Dynamically refines parameters based on observations mined from crawled web pages.
     Parses specification tables, technical bullet points, and key-value pairs without hardcoded product lists.
     """
-    import re
-
-    combined = "\n".join(extracted_text)
     original_minor = list(taxonomy.minor_attributes)
     existing_keys = {_param_key(a) for a in original_minor}
-    observed: list[str] = []
+    stopwords = {
+        "parameter", "specification", "attribute", "feature", "name", "metric",
+        "note", "warning", "tip", "source", "http", "https",
+    }
 
-    def _consider(raw: str, stopwords: tuple[str, ...]) -> None:
+    def _candidate(raw: str) -> str | None:
         cleaned = re.sub(r"\s+", "_", raw.strip().lower())
-        if not cleaned or len(cleaned) < 4 or cleaned in stopwords:
-            return
-        key = _param_key(cleaned)
-        if key in existing_keys:
-            return
-        existing_keys.add(key)
-        observed.append(cleaned)
+        if len(cleaned) < 4 or cleaned in stopwords:
+            return None
+        # Page furniture, not product attributes: opening-hours tables, comment bylines
+        # ("tungnt620 9 months ago"), dated rows. Real attribute names carry no digits.
+        if any(ch.isdigit() for ch in cleaned) or _CALENDAR_RE.search(cleaned):
+            return None
+        return cleaned
 
-    # 1. Dynamic regex extraction for specification table rows: | Spec Name | Value |
-    for raw_spec in re.findall(r"\|\s*([A-Za-z0-9\s]{3,24})\s*\|\s*[^\|\n]{2,50}\s*\|", combined):
-        _consider(raw_spec, ("parameter", "specification", "attribute", "feature", "name", "metric"))
+    # Document frequency: an attribute is kept only when at least two separate pages use it.
+    # A single page's table rows are that page's layout; a label several sites share is how
+    # the market describes the product.
+    doc_freq: dict[str, int] = {}
+    display: dict[str, str] = {}
+    for text in extracted_text:
+        found: set[str] = set()
+        # 1. Specification table rows: | Spec Name | Value |
+        for raw in re.findall(r"\|\s*([A-Za-z0-9\s]{3,24})\s*\|\s*[^\|\n]{2,50}\s*\|", text):
+            if (c := _candidate(raw)) is not None:
+                found.add(c)
+        # 2. Key-value bullets: - Battery: 500mAh
+        for raw, _ in re.findall(r"(?:^|\n)[\-\*•]\s*([A-Za-z0-9\s]{3,20}):\s*([^\n]{2,50})", text):
+            if (c := _candidate(raw)) is not None:
+                found.add(c)
+        for c in found:
+            key = _param_key(c)
+            if key in existing_keys:
+                continue
+            display.setdefault(key, c)
+            doc_freq[key] = doc_freq.get(key, 0) + 1
 
-    # 2. Dynamic regex extraction for spec key-value bullet points: - Battery: 500mAh
-    for raw_spec, _ in re.findall(
-        r"(?:^|\n)[\-\*•]\s*([A-Za-z0-9\s]{3,20}):\s*([^\n]{2,50})", combined
-    ):
-        _consider(raw_spec, ("note", "warning", "tip", "source", "http", "https"))
+    observed = [
+        display[k]
+        for k, n in sorted(doc_freq.items(), key=lambda kv: -kv[1])
+        if n >= _MIN_ATTRIBUTE_DOC_FREQ
+    ]
 
     # Attributes observed in the market outrank the ones the LLM guessed from the brief alone,
     # so they are placed first and the guesses fill what is left. Appending them instead made
@@ -415,6 +434,15 @@ def refine_parameters_from_findings(
         critical_jtbd_drivers=taxonomy.critical_jtbd_drivers,
         minor_attributes=merged,
     )
+
+
+_MIN_ATTRIBUTE_DOC_FREQ = 2
+
+# Substring match on purpose: scraped tables glue cells into tokens like "ttuesday".
+_CALENDAR_RE = re.compile(
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april"
+    r"|june|july|august|september|october|november|december|_ago$|^ago_|yesterday|today"
+)
 
 
 def _param_key(name: str) -> str:

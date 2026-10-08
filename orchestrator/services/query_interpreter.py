@@ -69,7 +69,7 @@ async def interpret_query(text: str, llm: Any = None) -> AutofillFields:
         from orchestrator.core.llm import LLMConfigurationError, build_chat_model
 
         try:
-            llm = build_chat_model()
+            llm = build_chat_model(fast=True)
         except LLMConfigurationError as exc:
             raise AutofillUnavailableError(str(exc)) from exc
 

@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,7 @@ if str(_ROOT) not in sys.path:
 from orchestrator.agents.market_research.analysis.classification import classify_campaign_context
 from orchestrator.agents.market_research.pipeline.loop import ResearchLoopResult, execute_research_loop
 from orchestrator.agents.market_research.progress import ProgressFn, _report
+from orchestrator.agents.market_research.analysis.relevance_filter import rank_by_category_fit
 from orchestrator.agents.market_research.analysis.scoring import calculate_dqs
 from orchestrator.agents.market_research.pipeline.subagents import ResearchCrew
 from orchestrator.agents.market_research.analysis.taxonomy import (
@@ -45,6 +47,82 @@ logger = logging.getLogger(__name__)
 
 def _norm_brand(name: str) -> str:
     return " ".join((name or "").lower().split())
+
+
+def _compact(name: str) -> str:
+    return "".join(ch for ch in re.sub(r"\(.*?\)", "", (name or "").lower()) if ch.isalnum())
+
+
+async def _fill_validator_gaps(
+    crew: Any,
+    report: Any,
+    gaps: list[Any],
+    merchant_context: dict[str, Any],
+    taxonomy: Any,
+    round_number: int,
+) -> tuple[list[str], list[str]]:
+    """
+    One targeted research round for the competitors the validator found incomplete: missing-data
+    searches, a short crawl of their own pages, and the findings folded into their profiles.
+    Returns the new evidence texts and URLs, which the grounding gate must see before anything
+    from them is kept.
+    """
+    from orchestrator.agents.market_research.discovery.crawler import extract_competitor_target_urls
+    from orchestrator.agents.market_research.discovery.search import build_missing_data_queries
+    from orchestrator.agents.market_research.pipeline.loop import (
+        _extract_price,
+        enrich_competitors_from_pages,
+        extract_preliminary_competitors,
+        merge_duplicate_competitors,
+    )
+
+    wanted = {g.competitor for g in gaps}
+    targets = [c for c in report.competitors if c.brand_name in wanted]
+    queries = build_missing_data_queries(merchant_context, targets, taxonomy, iteration=round_number)
+    if not targets or not queries:
+        return [], []
+
+    results = await crew.search.run(queries, round_number=round_number)
+    urls = extract_competitor_target_urls(targets, results, pages_per_competitor=2, max_urls=2 * len(targets))
+    pages = await crew.crawl.run(urls) if urls else []
+    enrich_competitors_from_pages(targets, pages)
+
+    found = merge_duplicate_competitors(extract_preliminary_competitors(results, [c.brand_name for c in targets]))
+    for comp in targets:
+        for f in (f for f in found if _compact(f.brand_name) == _compact(comp.brand_name)):
+            for field in ("weaknesses_mined", "strengths_mined", "core_claims"):
+                setattr(comp, field, list(dict.fromkeys([*getattr(comp, field), *getattr(f, field)])))
+            if (not comp.pricing_model or comp.pricing_model == "detected") and f.pricing_model and f.pricing_model != "detected":
+                comp.pricing_model = f.pricing_model
+            comp.sources = list(dict.fromkeys([*comp.sources, *f.sources]))
+        # Search-stage extraction only marks pricing as "mentioned"; when the crawl added
+        # nothing, read the amount from a snippet that names this rival. Grounding re-checks it.
+        if not comp.pricing_model or comp.pricing_model == "detected":
+            brand = comp.brand_name.lower()
+            for r in results:
+                if brand in f"{r.title} {r.snippet}".lower() and (price := _extract_price(r.snippet or "")):
+                    comp.pricing_model = price
+                    comp.sources = list(dict.fromkeys([*comp.sources, r.url]))
+                    break
+
+    texts = [r.snippet for r in results if r.snippet] + [p["markdown"] for p in pages if p.get("markdown")]
+    new_urls = [r.url for r in results if r.url] + [p["url"] for p in pages if p.get("url")]
+    return texts, new_urls
+
+
+def attach_ad_hooks(competitors: list[Any], hooks_by_comp: dict[str, list[str]]) -> None:
+    """
+    Merges collected ad hooks into the final profiles, matched by brand rather than exact
+    product name. Hooks are filed under the product name the competitor had when ad lookups
+    ran; synthesis rewrites it ("Praxent" -> "Praxent Services"), and exact matching then
+    silently discarded every hook that ad intelligence had found.
+    """
+    keyed = [(_compact(k), hooks) for k, hooks in hooks_by_comp.items() if hooks and len(_compact(k)) >= 3]
+    for comp in competitors:
+        names = {n for n in (_compact(comp.brand_name), _compact(comp.product_name)) if len(n) >= 3}
+        for key, hooks in keyed:
+            if any(key == n or n.startswith(key) or key.startswith(n) for n in names):
+                comp.ad_hooks = list(dict.fromkeys([*comp.ad_hooks, *hooks]))
 
 
 async def execute_market_research(
@@ -81,9 +159,12 @@ async def execute_market_research(
     is_update = run_mode == "update" and prior_report is not None
 
     llm_error: str | None = None
+    # An injected model (tests, callers) serves every step; otherwise light steps get the fast one.
+    fast_llm = llm
     if llm is None:
         try:
             llm = build_chat_model(llm_config)
+            fast_llm = build_chat_model(llm_config, fast=True)
         except LLMConfigurationError as exc:
             llm_error = str(exc)
             errors.append(f"LLM configuration error: {exc}")
@@ -93,6 +174,7 @@ async def execute_market_research(
         tavily_client=tavily_client,
         crawl_client=crawl_client,
         llm=llm,
+        fast_llm=fast_llm,
         on_progress=on_progress,
     )
 
@@ -100,7 +182,7 @@ async def execute_market_research(
     # so business model, campaign type, price model and geography are inferred here from the
     # merchant's own context. Anything the caller did supply is left untouched.
     merchant_context, classification, filled_fields = await classify_campaign_context(
-        merchant_context, llm=llm
+        merchant_context, llm=fast_llm
     )
     if filled_fields:
         await _report(
@@ -142,6 +224,9 @@ async def execute_market_research(
     # of a 258s run; overlapped, it hides behind crawl time already being spent.
     category_for_ads = merchant_context.get("category", "")
     ad_intel_task: asyncio.Task[Any] | None = None
+    # Who the early pass looked up, whether or not they run ads. Keying the top-up on "has
+    # hooks" re-ran every competitor without ads: 24s of duplicate lookups per run.
+    ad_looked_up: set[str] = set()
 
     async def _start_ad_intel_early(early: list[Any]) -> None:
         nonlocal ad_intel_task
@@ -149,6 +234,7 @@ async def execute_market_research(
         shortlist = early[:cap] if cap and cap > 0 else early
         if not shortlist:
             return
+        ad_looked_up.update(c.product_name for c in shortlist)
         ad_intel_task = asyncio.create_task(
             crew.ad_intel.run(
                 shortlist,
@@ -159,7 +245,7 @@ async def execute_market_research(
 
     async def _revise_taxonomy(current: Any, evidence: list[str]) -> Any:
         return await revise_taxonomy_from_evidence(
-            current, merchant_context, evidence, llm=llm
+            current, merchant_context, evidence, llm=fast_llm
         )
 
     loop_result: ResearchLoopResult = await execute_research_loop(
@@ -173,6 +259,9 @@ async def execute_market_research(
         prior_run_at=prior_run_at,
         on_first_competitors=_start_ad_intel_early,
         revise_taxonomy=_revise_taxonomy if llm is not None else None,
+        judge_category_fit=(
+            (lambda cands: rank_by_category_fit(cands, merchant_context, fast_llm)) if fast_llm is not None else None
+        ),
     )
     taxonomy = loop_result.taxonomy
 
@@ -211,7 +300,10 @@ async def execute_market_research(
             target_geography=merchant_context.get("target_geography"),
         )
     else:
-        uncovered = [c for c in top_competitors if c.product_name not in ad_intel.hooks_by_competitor]
+        uncovered = [
+            c for c in top_competitors
+            if c.product_name not in ad_intel.hooks_by_competitor and c.product_name not in ad_looked_up
+        ]
         if uncovered:
             await _report(
                 on_progress,
@@ -248,15 +340,38 @@ async def execute_market_research(
             ad_hooks_by_comp=ad_hooks_by_comp,
         )
 
-        # Attach ad hooks if not already assigned
-        for comp in report_delta.competitors:
-            if not comp.ad_hooks and comp.product_name in ad_hooks_by_comp:
-                comp.ad_hooks = ad_hooks_by_comp[comp.product_name]
+        attach_ad_hooks(report_delta.competitors, ad_hooks_by_comp)
 
         # Phase 6: Factual Grounding & Anti-Hallucination Gate
-        report_delta, _ = await crew.grounding.run(
+        report_delta, grounding_notes = await crew.grounding.run(
             report_delta, raw_text_corpus, set(all_source_urls)
         )
+
+        # Phase 6b: Adversarial validator. Grounding proves the words exist in some page; the
+        # validator checks each item against that passage (right company, real customer voice,
+        # meaning intact) and may send the research back once for the gaps it names.
+        report_delta, verdict, validator_notes = await crew.validator.run(report_delta, raw_text_corpus)
+        for round_number in range(1, settings.validator_max_rounds + 1):
+            if not verdict.gaps:
+                break
+            await _report(
+                on_progress,
+                f"[VALIDATOR] Sending the research back for: "
+                + ", ".join(f"{g.competitor} ({g.field.replace('_mined', '').replace('_model', '')})" for g in verdict.gaps),
+            )
+            new_texts, new_urls = await _fill_validator_gaps(
+                crew, report_delta, verdict.gaps, merchant_context, taxonomy, round_number
+            )
+            if not new_texts:
+                break
+            raw_text_corpus.extend(new_texts)
+            all_source_urls = list(dict.fromkeys(all_source_urls + new_urls))
+            report_delta, grounding_notes = await crew.grounding.run(
+                report_delta, raw_text_corpus, set(all_source_urls)
+            )
+            report_delta, verdict, notes = await crew.validator.run(report_delta, raw_text_corpus, round_number)
+            validator_notes.extend(notes)
+        report_delta.validation_diagnostics = grounding_notes + validator_notes
 
         # Phase 7: LLM Relevance Filter — curate which data is most useful for the merchant dashboard
         if llm is not None:
@@ -291,8 +406,7 @@ async def execute_market_research(
         await _report(
             on_progress, "[LLM_SYNTH] Synthesis failed; returning search-stage findings only", "ERROR"
         )
-        for comp in top_competitors:
-            comp.ad_hooks = ad_hooks_by_comp.get(comp.product_name, [])
+        attach_ad_hooks(top_competitors, ad_hooks_by_comp)
 
         # Synthesis is the step that turns evidence into analysis. Without it we report only
         # what was actually observed and leave the rest empty — a templated SWOT reads like a

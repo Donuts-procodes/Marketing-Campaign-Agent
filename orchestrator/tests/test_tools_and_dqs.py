@@ -35,12 +35,12 @@ class TestDQSFormula:
                 brand_name=f"Brand{i}",
                 product_name=f"Product{i}",
                 pricing_model=f"${i}9/mo",
-                weaknesses_mined=["issue_a"],
+                weaknesses_mined=["issue_a", "issue_b"],
                 sources=[f"https://example.com/{i}"],
             )
-            for i in range(3)
+            for i in range(5)
         ]
-        sources = [f"https://source{i}.com" for i in range(5)]
+        sources = [f"https://source{i}.com" for i in range(6)]
 
         result = calculate_dqs(competitors, sources)
 
@@ -62,17 +62,17 @@ class TestDQSFormula:
         assert len(result.diagnostics) == 5
 
     def test_missing_pricing_docks_points(self):
-        """3 competitors but none with pricing → P_pricing = 0.0."""
+        """5 competitors but none with pricing → P_pricing = 0.0."""
         competitors = [
             CompetitorProfile(
                 brand_name=f"B{i}",
                 product_name=f"P{i}",
-                weaknesses_mined=["gripe"],
+                weaknesses_mined=["gripe_1", "gripe_2"],
                 sources=[f"https://s{i}.com"],
             )
-            for i in range(3)
+            for i in range(5)
         ]
-        sources = [f"https://src{i}.com" for i in range(5)]
+        sources = [f"https://src{i}.com" for i in range(6)]
 
         result = calculate_dqs(competitors, sources)
 
@@ -90,28 +90,28 @@ class TestDQSFormula:
         assert any("P_pricing" in d for d in result.diagnostics)
 
     def test_low_competitor_count_reduces_c_comp(self):
-        """1 competitor out of 3 required → C_comp ≈ 0.3333."""
+        """1 competitor out of 5 required → C_comp = 0.2."""
         competitors = [
             CompetitorProfile(
                 brand_name="Solo",
                 product_name="OnlyOne",
                 pricing_model="$50",
-                weaknesses_mined=["a", "b", "c"],
+                weaknesses_mined=["a", "b", "c", "d", "e", "f"],
                 sources=["https://a.com"],
             )
         ]
-        sources = [f"https://s{i}.com" for i in range(5)]
+        sources = [f"https://s{i}.com" for i in range(6)]
 
         result = calculate_dqs(competitors, sources)
 
-        assert result.c_comp == pytest.approx(1 / 3, abs=0.001)
-        assert result.p_pricing == 0.5
+        assert result.c_comp == 0.2
+        assert result.p_pricing == 0.25
         assert result.v_vuln == 1.0
         assert result.s_sources == 1.0
         assert any("C_comp" in d for d in result.diagnostics)
 
     def test_low_sources_reduces_s_sources(self):
-        """Only 2 unique sources out of 5 required → S_sources = 0.4."""
+        """Only 3 unique sources out of 6 required → S_sources = 0.5."""
         competitors = [
             CompetitorProfile(
                 brand_name=f"B{i}",
@@ -119,13 +119,13 @@ class TestDQSFormula:
                 pricing_model=f"${i}0",
                 weaknesses_mined=["x"],
             )
-            for i in range(3)
+            for i in range(5)
         ]
-        sources = ["https://a.com", "https://b.com"]
+        sources = ["https://a.com", "https://b.com", "https://c.com"]
 
         result = calculate_dqs(competitors, sources)
 
-        assert result.s_sources == 0.4
+        assert result.s_sources == 0.5
         assert any("S_sources" in d for d in result.diagnostics)
 
     def test_duplicate_sources_counted_once(self):
@@ -137,13 +137,13 @@ class TestDQSFormula:
                 pricing_model=f"${i}0",
                 weaknesses_mined=["x"],
             )
-            for i in range(3)
+            for i in range(5)
         ]
         sources = ["https://a.com", "https://a.com", "https://a.com"]
 
         result = calculate_dqs(competitors, sources)
 
-        assert result.s_sources == 0.2  # 1/5
+        assert result.s_sources == round(1 / 6, 4)
 
     def test_over_threshold_passes(self):
         """Score above threshold → passed = True."""
@@ -173,7 +173,7 @@ class TestDQSFormula:
             CompetitorProfile(brand_name="B1", product_name="P1", factual_evidence=['"B1 ships in 2 days"'])
         ]
         result_strict = calculate_dqs(competitors, [], threshold=0.80)
-        result_lenient = calculate_dqs(competitors, [], threshold=0.10)
+        result_lenient = calculate_dqs(competitors, [], threshold=0.05)
 
         assert result_strict.passed is False
         assert result_lenient.passed is True

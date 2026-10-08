@@ -7,8 +7,10 @@ import {
   ChevronDown,
   ChevronUp,
   RefreshCw,
+  LayoutDashboard,
 } from "lucide-react";
 import { pricingLabel, safeHref, cn } from "@/lib/utils";
+import { CompetitorCard } from "@/components/dashboard/CompetitorCard";
 
 interface CompetitorComparisonBoardProps {
   competitors: CompetitorProfile[];
@@ -29,7 +31,7 @@ export const CompetitorComparisonBoard: React.FC<CompetitorComparisonBoardProps>
 }) => {
   const [selectedCompId, setSelectedCompId] = useState<number>(0);
   const [expandedRow, setExpandedRow] = useState<number | null>(null);
-  const [viewMode, setViewMode] = useState<"executive" | "specs">("executive");
+  const [viewMode, setViewMode] = useState<"cards" | "executive" | "specs">("cards");
 
   const criticalDrivers = dynamicTaxonomy?.critical_jtbd_drivers || [];
   const active = competitors[selectedCompId] || competitors[0];
@@ -59,6 +61,19 @@ export const CompetitorComparisonBoard: React.FC<CompetitorComparisonBoardProps>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           {/* View Mode Toggle */}
           <div className="inline-flex rounded-md border border-zinc-200 bg-zinc-100 p-0.5 text-xs font-medium">
+            <button
+              type="button"
+              onClick={() => setViewMode("cards")}
+              className={cn(
+                "px-2.5 py-1 rounded cursor-pointer transition flex items-center gap-1.5",
+                viewMode === "cards"
+                  ? "bg-white text-zinc-900 shadow-2xs font-semibold"
+                  : "text-zinc-600 hover:text-zinc-900"
+              )}
+            >
+              <LayoutDashboard className="w-3.5 h-3.5" />
+              <span>Cards</span>
+            </button>
             <button
               type="button"
               onClick={() => setViewMode("executive")}
@@ -116,7 +131,26 @@ export const CompetitorComparisonBoard: React.FC<CompetitorComparisonBoardProps>
         </div>
       </div>
 
-      {/* ── Comparison Table ───────────────────────────────────────── */}
+      {/* ── Card Grid ──────────────────────────────────────────────── */}
+      {viewMode === "cards" ? (
+        competitors.length === 0 ? (
+          <div className="border border-zinc-200 rounded-lg bg-white p-10 text-center text-xs text-zinc-500">
+            No competitors discovered yet.
+          </div>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {competitors.map((comp, idx) => (
+              <CompetitorCard
+                key={`${comp.brand_name}-${idx}`}
+                competitor={comp}
+                taxonomy={dynamicTaxonomy}
+              />
+            ))}
+          </div>
+        )
+      ) : (
+
+      /* ── Comparison Table ───────────────────────────────────────── */
       <div className="border border-zinc-200 rounded-lg bg-white overflow-hidden shadow-xs">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs border-collapse">
@@ -364,9 +398,11 @@ export const CompetitorComparisonBoard: React.FC<CompetitorComparisonBoardProps>
           </table>
         </div>
       </div>
+      )}
 
       {/* ── Active Inspection Card (When row clicked) ──────────────── */}
-      {active && (
+      {/* Cards already carry per-competitor detail, so this only applies to the table views. */}
+      {viewMode !== "cards" && active && (
         <div className="border border-zinc-200 rounded-lg p-4 bg-white shadow-xs space-y-3">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-zinc-200 pb-2.5">
             <div>

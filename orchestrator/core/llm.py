@@ -25,9 +25,12 @@ def has_llm_credentials(byok: BYOKConfig | None) -> bool:
     return bool((byok and byok.api_key) or get_settings().openai_api_key)
 
 
-def build_chat_model(byok: BYOKConfig | None = None) -> Any:
-    """Builds a LangChain chat model, preferring the user's own key, with a small-model fallback."""
-    primary, primary_model = _build_primary(byok)
+def build_chat_model(byok: BYOKConfig | None = None, fast: bool = False) -> Any:
+    """
+    Builds a LangChain chat model, preferring the user's own key, with a small-model fallback.
+    `fast` selects settings.llm_fast_model for light tasks; a user's own model choice is kept.
+    """
+    primary, primary_model = _build_primary(byok, fast)
     fallback = _build_fallback(byok, primary_model)
     return primary.with_fallbacks([fallback]) if fallback is not None else primary
 
@@ -49,7 +52,7 @@ def _build_fallback(byok: BYOKConfig | None, primary_model: str) -> Any | None:
     return ChatOpenAI(model=model, temperature=settings.llm_temperature, api_key=SecretStr(key))
 
 
-def _build_primary(byok: BYOKConfig | None) -> tuple[Any, str]:
+def _build_primary(byok: BYOKConfig | None, fast: bool = False) -> tuple[Any, str]:
     settings = get_settings()
 
     if byok is None or not byok.api_key:
@@ -57,11 +60,12 @@ def _build_primary(byok: BYOKConfig | None) -> tuple[Any, str]:
             raise LLMConfigurationError("No OpenAI API key configured on the server.")
         from langchain_openai import ChatOpenAI
 
+        model = (settings.llm_fast_model if fast else "") or settings.llm_model
         return ChatOpenAI(
-            model=settings.llm_model,
+            model=model,
             temperature=settings.llm_temperature,
             api_key=SecretStr(settings.openai_api_key),
-        ), settings.llm_model
+        ), model
 
     # Custom endpoints make the server issue requests to arbitrary user-supplied hosts.
     base_url = byok.custom_endpoint if settings.allow_custom_llm_endpoints else None

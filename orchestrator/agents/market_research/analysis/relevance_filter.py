@@ -12,10 +12,101 @@ import json
 import logging
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from orchestrator.agents.market_research.analysis.grounding import is_supported_by
-from orchestrator.schemas.research import DashboardInsights, SWOTReportDelta
+from orchestrator.schemas.research import (
+    CompetitorProfile,
+    CompetitorRelevance,
+    DashboardInsights,
+    SWOTReportDelta,
+)
 
 logger = logging.getLogger(__name__)
+
+# How many heuristic-ranked candidates the category judge sees. Past ~20 the tail is
+# directories and one-mention noise; the prompt cost grows and the picks do not change.
+_CATEGORY_JUDGE_POOL = 20
+# Below this a candidate is not in the merchant's category and never makes the shortlist.
+_CATEGORY_FIT_FLOOR = 0.4
+
+
+class _CategoryFit(BaseModel):
+    competitor_relevance: list[CompetitorRelevance] = Field(default_factory=list)
+
+
+CATEGORY_FIT_PROMPT = """\
+You are vetting a competitor shortlist for one merchant. For EVERY candidate, by its 0-based \
+index, give a score 0.0-1.0 for how directly it competes with the merchant, and one short reason.
+
+- 1.0: sells the same kind of product/service to the same kind of customer
+- 0.7: same category, somewhat different segment, scale or offering
+- 0.4: adjacent category; a buyer would rarely compare the two
+- <0.4: not a competitor at all: a directory or listing site (Clutch, G2, Yelp), a blog or \
+publisher, a job board, a placeholder site, a vendor that sells TO this industry, or a \
+different category entirely
+
+Judge only from what is given. Do not invent facts about a candidate."""
+
+
+async def rank_by_category_fit(
+    candidates: list[CompetitorProfile],
+    merchant_context: dict[str, Any],
+    llm: Any,
+) -> list[CompetitorProfile]:
+    """
+    Re-orders candidates by how squarely they sit in the merchant's category. The heuristic
+    ranking counts mentions and evidence, so a directory site or a frequently-mentioned firm
+    in a neighbouring category could take a shortlist slot. Candidates the judge scores below
+    the floor drop behind every in-category one. On any failure the input order is returned.
+    """
+    pool = candidates[:_CATEGORY_JUDGE_POOL]
+    if llm is None or len(pool) < 2:
+        return candidates
+
+    listing = [
+        {
+            "index": i,
+            "name": c.product_name,
+            "brand": c.brand_name,
+            "website": (c.sources or [""])[0],
+            "about": (c.core_claims or c.factual_evidence or [""])[0][:200],
+        }
+        for i, c in enumerate(pool)
+    ]
+    merchant = {
+        k: merchant_context.get(k)
+        for k in ("product_name", "category", "description", "target_geography", "business_model")
+        if merchant_context.get(k)
+    }
+    try:
+        result = await llm.with_structured_output(_CategoryFit).ainvoke([
+            {"role": "system", "content": CATEGORY_FIT_PROMPT},
+            {
+                "role": "user",
+                "content": f"## Merchant\n{json.dumps(merchant, indent=2)}\n\n"
+                f"## Candidates\n{json.dumps(listing, indent=2)}",
+            },
+        ])
+    except Exception as exc:
+        logger.warning("Category-fit judge failed, keeping heuristic order: %s", exc)
+        return candidates
+
+    scores: dict[int, float] = {}
+    for item in getattr(result, "competitor_relevance", []) or []:
+        if 0 <= item.index < len(pool):
+            scores[item.index] = item.score
+            pool[item.index].relevance_score = item.score
+            if item.reason:
+                pool[item.index].relevance_reason = item.reason
+    if not scores:
+        return candidates
+
+    # Unscored candidates sit at the floor: kept, but behind every confirmed in-category rival.
+    ranked = sorted(range(len(pool)), key=lambda i: (-scores.get(i, _CATEGORY_FIT_FLOOR), i))
+    fits = [pool[i] for i in ranked if scores.get(i, _CATEGORY_FIT_FLOOR) >= _CATEGORY_FIT_FLOOR]
+    misfits = [pool[i] for i in ranked if scores.get(i, _CATEGORY_FIT_FLOOR) < _CATEGORY_FIT_FLOOR]
+    return fits + candidates[_CATEGORY_JUDGE_POOL:] + misfits
 
 RELEVANCE_SYSTEM_PROMPT = """\
 You are a strategic intelligence analyst curating a dashboard for a specific merchant.

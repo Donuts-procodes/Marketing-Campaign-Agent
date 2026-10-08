@@ -95,6 +95,44 @@ def is_supported_by(statement: str, texts: list[str]) -> bool:
     return _is_supported(statement, [_document(t) for t in texts if t])
 
 
+def build_documents(texts: list[str]) -> list[tuple[str, set[tuple[str, ...]]]]:
+    """Pre-built match index for `find_support_excerpt` over many statements."""
+    return [_document(t) for t in texts if t]
+
+
+def find_support_excerpt(
+    statement: str,
+    texts: list[str],
+    width: int = 420,
+    documents: list[tuple[str, set[tuple[str, ...]]]] | None = None,
+) -> str | None:
+    """
+    The passage a statement was grounded on: ~`width` characters of the first source text
+    that supports it, centred on the match. None when no text supports it.
+
+    `documents` may be passed pre-built when checking many statements; it must be
+    `[_document(t) for t in texts if t]` for the same `texts`.
+    """
+    body = _strip_label(statement)
+    if not body:
+        return None
+    body_lower = body.lower()
+    needed = _phrases(_tokens(body))
+    docs = documents if documents is not None else [_document(t) for t in texts if t]
+    for (raw, doc_phrases), text in zip(docs, [t for t in texts if t]):
+        at = raw.find(body_lower)
+        if at < 0:
+            if not needed or len(needed & doc_phrases) / len(needed) < _MIN_PHRASE_SUPPORT:
+                continue
+            # Near-verbatim: centre on a shared three-word phrase (punctuation may sit between).
+            first = next(iter(needed & doc_phrases))
+            m = re.search(r"[^a-z0-9]+".join(map(re.escape, first)), raw)
+            at = m.start() if m else 0
+        start = max(0, at - width // 3)
+        return text[start : start + width].strip()
+    return None
+
+
 def _keep_supported(
     items: list[str], documents: list[tuple[str, set[tuple[str, ...]]]], field_name: str, brand: str, diagnostics: list[str]
 ) -> list[str]:

@@ -12,7 +12,7 @@ import re
 from typing import Any
 
 from orchestrator.core.config import get_settings
-from orchestrator.schemas.api import AutofillFields
+from orchestrator.schemas.api import AutofillFields, BYOKConfig
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +48,14 @@ def _verify(fields: AutofillFields, text: str) -> AutofillFields:
     return fields
 
 
-async def autofill_from_text(text: str, llm: Any = None) -> AutofillFields:
+async def autofill_from_text(text: str, llm: Any = None, byok_config: BYOKConfig | None = None) -> AutofillFields:
     settings = get_settings()
     text = text[: settings.max_autofill_chars]
     if llm is None:
         from orchestrator.core.llm import LLMConfigurationError, build_chat_model
 
         try:
-            llm = build_chat_model()
+            llm = build_chat_model(byok=byok_config, fast=True)
         except LLMConfigurationError as exc:
             raise AutofillUnavailableError(str(exc)) from exc
     try:

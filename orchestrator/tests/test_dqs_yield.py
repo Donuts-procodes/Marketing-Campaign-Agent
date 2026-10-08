@@ -50,18 +50,18 @@ class TestPlaceholderPricingDoesNotSatisfyTheGate:
         assert calculate_dqs(_competitors(PLACEHOLDER_PRICING), _SOURCES).passed is False
 
     def test_real_prices_score_full_credit(self):
-        result = calculate_dqs(_competitors("$399.99"), _SOURCES)
+        result = calculate_dqs(_competitors("$399.99", n=5), _SOURCES)
         assert result.p_pricing == 1.0
         assert result.passed is True
 
     def test_placeholder_and_real_prices_are_counted_differently(self):
-        placeholder = calculate_dqs(_competitors(PLACEHOLDER_PRICING), _SOURCES)
-        real = calculate_dqs(_competitors("$49/mo"), _SOURCES)
+        placeholder = calculate_dqs(_competitors(PLACEHOLDER_PRICING, n=5), _SOURCES)
+        real = calculate_dqs(_competitors("$49/mo", n=5), _SOURCES)
         assert real.score > placeholder.score
 
     def test_mixed_set_counts_only_the_real_ones(self):
-        comps = _competitors("$19/mo", n=1) + _competitors(PLACEHOLDER_PRICING, n=2)
-        # MIN_PRICING_FULL is 2, so one real price is half credit.
+        comps = _competitors("$19/mo", n=2) + _competitors(PLACEHOLDER_PRICING, n=3)
+        # MIN_PRICING_FULL is 4, so two real prices is half credit.
         assert calculate_dqs(comps, _SOURCES).p_pricing == 0.5
 
 

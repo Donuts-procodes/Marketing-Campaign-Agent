@@ -31,6 +31,8 @@ export interface StreamState {
   completedPhases: AgentPhase[];
   telemetryLogs: TelemetryLogItem[];
   swotReport: SWOTReportDelta | null;
+  /** The merchant brief the run was started with (product, category, price...). */
+  merchantContext: Record<string, unknown> | null;
   hitlCheckpoint: HitlState | null;
   error: string | null;
   jobId: string | null;
@@ -42,6 +44,7 @@ const INITIAL_STATE: StreamState = {
   completedPhases: [],
   telemetryLogs: [],
   swotReport: null,
+  merchantContext: null,
   hitlCheckpoint: null,
   error: null,
   jobId: null,
@@ -342,6 +345,9 @@ export function useCampaignStream(jobId: string | null | undefined) {
     getSession(jobId)
       .then((detail) => {
         if (!isMounted) return;
+        if (detail.merchant_context) {
+          setState((s) => ({ ...s, merchantContext: detail.merchant_context }));
+        }
         if (detail.swot_report) {
           const logs: TelemetryLogItem[] = (detail.events || [])
             .filter((e) => e.type === "TELEMETRY_LOG" || e.type === "NODE_STARTED" || e.type === "NODE_COMPLETE")

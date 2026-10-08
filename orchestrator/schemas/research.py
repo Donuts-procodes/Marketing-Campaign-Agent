@@ -66,6 +66,25 @@ class CampaignClassification(BaseModel):
     )
 
 
+class CompetitorChange(BaseModel):
+    """
+    One observed difference between two scans of the same competitor.
+
+    Re-running research for a product used to union old and new data, so a price moving from
+    $49 to $59 silently became "$59" and the move itself -- the most actionable thing a repeat
+    scan can tell a merchant -- was discarded. Each entry records one such move.
+    """
+
+    observed_at: str = Field(..., description="ISO date of the run that noticed the change")
+    field: str = Field(..., description="Which part of the profile moved, e.g. 'pricing_model'")
+    previous: str | None = Field(default=None, description="Value held before this run")
+    current: str | None = Field(default=None, description="Value found by this run")
+    source: str | None = Field(
+        default=None,
+        description="'merchant' when the merchant corrected the value; empty when a scan observed it",
+    )
+
+
 class CompetitorProfile(BaseModel):
     """Structured profile extracted per discovered competitor."""
 
@@ -82,6 +101,19 @@ class CompetitorProfile(BaseModel):
     weaknesses_mined: list[str] = Field(
         default_factory=list,
         description="User-reported complaints, gripes, and review pain points",
+    )
+    strengths_mined: list[str] = Field(
+        default_factory=list,
+        description="User-reported praise from the same review and forum pages the complaints "
+        "come from: what customers say this competitor actually does well",
+    )
+    rating: str | None = Field(
+        default=None,
+        description="Average review score on a 0-5 scale as stated on a review page, or null",
+    )
+    review_count: int | None = Field(
+        default=None,
+        description="Number of reviews behind the rating, or null when no page states one",
     )
     dynamic_attributes: dict[str, str | None] = Field(
         default_factory=dict,
@@ -113,6 +145,20 @@ class CompetitorProfile(BaseModel):
     relevance_reason: str = Field(
         default="",
         description="One sentence on why this rival matters to the merchant, shown on the dashboard",
+    )
+    founded: str | None = Field(
+        default=None,
+        description="Founding year or date as stated on the competitor's own pages, or null",
+    )
+    milestones: list[str] = Field(
+        default_factory=list,
+        description="Dated company or product events stated on their pages: launches, funding, "
+        "acquisitions, version releases. Each entry leads with its date.",
+    )
+    change_history: list[CompetitorChange] = Field(
+        default_factory=list,
+        description="What moved between our own scans of this competitor. Accumulated across "
+        "runs, so it is the one history no single page states.",
     )
 
 

@@ -53,11 +53,16 @@ async def _crawlapi_pages(
     semaphore = asyncio.Semaphore(max_concurrent)
     provider = getattr(crawl_client, "provider", None)
     label = provider if isinstance(provider, str) else "crawlapi"
+    # The client's own timeout is sized for JS-rendered ad libraries; one dead competitor page
+    # waiting that long held a whole round's crawl for ~90s.
+    page_timeout = get_settings().crawl_page_timeout_seconds
 
     async def _fetch_one(url: str) -> ExtractedPage | None:
         async with semaphore:
             try:
-                response = await crawl_client.fetch(url, output_format="md")
+                response = await asyncio.wait_for(
+                    crawl_client.fetch(url, output_format="md"), timeout=page_timeout
+                )
             except Exception as exc:
                 logger.warning("CrawlAPI fetch failed for %s: %s", url, exc)
                 return None
@@ -134,14 +139,37 @@ async def extract_pages(
     return pages
 
 
-# Paths worth guessing when search never surfaced a competitor's commercial pages. Pricing
-# leads because P_pricing is the DQS dimension that most often sits at zero.
-_GUESSED_PATHS = ("/pricing", "/plans", "/features")
+# Paths worth guessing when search never surfaced a competitor's commercial pages.
+# Pricing and products lead so P_pricing and core claims get populated across both SaaS and physical e-commerce.
+_GUESSED_PATHS = ("/pricing", "/plans", "/products", "/shop", "/product", "/features")
 
 # Path segments that mark a page as commercially informative rather than incidental.
 _COMMERCIAL_SEGMENTS = (
-    "", "pricing", "plans", "price", "features", "product", "solutions", "compare", "services",
+    "", "pricing", "plans", "price", "products", "shop", "product", "features", "solutions", "compare", "services",
 )
+
+
+# Hosts that list or host many businesses: never a competitor's own domain, so guessing
+# /pricing on them only buys a 404.
+_NOT_OWN_DOMAIN = (
+    "clutch.co", "goodfirms.co", "designrush.com", "upwork.com", "g2.com", "capterra.com",
+    "trustpilot.com", "yelp.com", "reddit.com", "quora.com", "linkedin.com", "crunchbase.com",
+    "glassdoor.com", "indeed.com", "facebook.com", "instagram.com", "youtube.com", "x.com",
+    "twitter.com", "medium.com", "site123.me", "wixsite.com", "wordpress.com", "blogspot.com",
+    "github.io", "jobicy.com", "justdial.com", "indiamart.com", "sulekha.com",
+)
+# Guesses cost a full crawl each; most 404. Two is enough to catch /pricing and /plans.
+_MAX_GUESSES = 2
+
+
+def _canonical(url: str) -> str:
+    """Drops query and fragment: ?ref=, ?source=, utm_ variants are the same page."""
+    p = urlparse(url)
+    return f"{p.scheme or 'https'}://{p.netloc}{p.path or '/'}"
+
+
+def _is_own_domain(host: str) -> bool:
+    return bool(host) and not any(host == d or host.endswith("." + d) for d in _NOT_OWN_DOMAIN)
 
 
 def extract_competitor_target_urls(
@@ -170,7 +198,7 @@ def extract_competitor_target_urls(
             continue
         host = (urlparse(r.url).hostname or "").removeprefix("www.").lower()
         if host:
-            by_host.setdefault(host, []).append(r.url)
+            by_host.setdefault(host, []).append(_canonical(r.url))
 
     def _commercial_rank(url: str) -> int:
         path = (urlparse(url).path or "/").lower().strip("/")
@@ -180,12 +208,12 @@ def extract_competitor_target_urls(
     seen: set[str] = set()
 
     for comp in competitors:
-        sources = list(getattr(comp, "sources", []) or [])
-        host = ""
-        for s in sources:
-            host = (urlparse(s).hostname or "").removeprefix("www.").lower()
-            if host:
-                break
+        sources = [_canonical(s) for s in getattr(comp, "sources", []) or []]
+        host = next(
+            (h for h in ((urlparse(s).hostname or "").removeprefix("www.").lower() for s in sources)
+             if _is_own_domain(h)),
+            "",
+        )
         if not host:
             continue
 
@@ -198,11 +226,13 @@ def extract_competitor_target_urls(
             scheme = urlparse(candidates[0]).scheme if candidates else "https"
             root = f"{scheme or 'https'}://{host}"
             have = {(urlparse(u).path or "/").lower().rstrip("/") for u in candidates}
+            guesses = 0
             for path in _GUESSED_PATHS:
-                if len(candidates) >= pages_per_competitor:
+                if len(candidates) >= pages_per_competitor or guesses >= _MAX_GUESSES:
                     break
                 if path not in have:
                     candidates.append(root + path)
+                    guesses += 1
 
         for url in candidates[:pages_per_competitor]:
             if url not in seen:

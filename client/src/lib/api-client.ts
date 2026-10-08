@@ -4,6 +4,7 @@
 
 import {
   AutofillResponse,
+  BYOKConfig,
   CampaignInitPayload,
   CreateJobResponse,
   MoreCompetitorsResponse,
@@ -16,6 +17,7 @@ import {
   SessionSummary,
   UploadDossierResponse,
 } from "@/types/api";
+import type { SWOTReportDelta } from "@/types/research";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_URL?.replace(/\/$/, "") || "";
@@ -110,9 +112,12 @@ export async function interpretQuery(text: string): Promise<AutofillResponse> {
 /**
  * Reads the campaign form fields out of one or more documents (PDF, DOCX, TXT, MD, JSON).
  */
-export async function autofillFromFiles(files: File[]): Promise<AutofillResponse> {
+export async function autofillFromFiles(files: File[], byokConfig?: BYOKConfig): Promise<AutofillResponse> {
   const formData = new FormData();
   files.forEach((f) => formData.append("files", f));
+  if (byokConfig) {
+    formData.append("byok_config", JSON.stringify(byokConfig));
+  }
 
   const response = await fetch(`${API_BASE_URL}/api/v1/campaigns/autofill`, {
     method: "POST",
@@ -224,7 +229,8 @@ export function getCampaignStreamUrl(jobId: string, afterSeq = -1): string {
  * Triggers an on-demand web search for additional competitors.
  */
 export async function fetchMoreCompetitors(
-  jobId: string
+  jobId: string,
+  names: string[] = []
 ): Promise<MoreCompetitorsResponse> {
   const response = await fetch(
     `${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/more-competitors`,
@@ -233,9 +239,30 @@ export async function fetchMoreCompetitors(
       headers: {
         "Content-Type": "application/json",
       },
+      body: JSON.stringify({ names }),
     }
   );
   return handleResponse<MoreCompetitorsResponse>(response);
+}
+
+export interface ReportEdit {
+  op: "remove_item" | "set_price" | "remove_competitor";
+  competitor: string;
+  field?: string | null;
+  value?: string | null;
+}
+
+/** Applies merchant corrections to the report; all edits apply together or none do. */
+export async function applyReportEdits(
+  jobId: string,
+  edits: ReportEdit[]
+): Promise<{ applied: string[]; swot_report: SWOTReportDelta }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/report/edits`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ edits }),
+  });
+  return handleResponse(response);
 }
 
 /**
@@ -255,4 +282,89 @@ export async function reResearchCampaign(
   );
 
   return handleResponse<ReResearchResponse>(response);
+}
+
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** A change the assistant proposed; it only runs when the merchant confirms it. */
+export interface ChatAction {
+  id: string;
+  kind: "refresh" | "research" | "edit";
+  title: string;
+  detail: string;
+  payload: { names?: string[]; edits?: ReportEdit[] };
+}
+
+/** Result of re-fetching a competitor's sources to check one statement. */
+export interface SourceCheck {
+  competitor: string;
+  statement: string;
+  verdict: "confirmed" | "not_found" | "unreachable" | "no_sources";
+  url: string | null;
+  pages_checked: number;
+}
+
+export interface ChatStreamHandlers {
+  onDelta: (text: string) => void;
+  onAction?: (action: ChatAction) => void;
+  onCheck?: (check: SourceCheck) => void;
+  onStatus?: (status: string) => void;
+}
+
+/**
+ * Asks a question about a run's report. The answer streams as server-sent events over the
+ * POST response: text pieces, tool status lines, live source checks, and proposed actions.
+ * Resolves when done, with `offTopic` set when the question was outside the report's scope.
+ */
+export async function streamReportChat(
+  jobId: string,
+  messages: ChatTurn[],
+  handlers: ChatStreamHandlers,
+  signal?: AbortSignal
+): Promise<{ offTopic: boolean }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+    signal,
+  });
+  if (!response.ok || !response.body) {
+    await handleResponse<never>(response);
+    throw new ApiError("The assistant returned no answer.", response.status);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // Frames end with a blank line; keep any partial frame for the next read.
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.split("\n").find((l) => l.startsWith("data: "));
+      if (!line) continue;
+      const payload = JSON.parse(line.slice(6)) as {
+        delta?: string;
+        done?: boolean;
+        error?: string;
+        off_topic?: boolean;
+        status?: string;
+        action?: ChatAction;
+        check?: SourceCheck;
+      };
+      if (payload.error) throw new ApiError(payload.error, 502);
+      if (payload.delta) handlers.onDelta(payload.delta);
+      if (payload.status) handlers.onStatus?.(payload.status);
+      if (payload.action) handlers.onAction?.(payload.action);
+      if (payload.check) handlers.onCheck?.(payload.check);
+      if (payload.done) return { offTopic: !!payload.off_topic };
+    }
+  }
+  return { offTopic: false };
 }

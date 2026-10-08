@@ -137,6 +137,46 @@ class InterpretQueryInput(BaseModel):
     text: Annotated[str, Field(max_length=4000)]
 
 
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: Annotated[str, Field(min_length=1, max_length=4000)]
+
+
+class ReportChatInput(BaseModel):
+    """A conversation about one run's report; the last message is the user's question."""
+
+    messages: Annotated[list[ChatMessage], Field(min_length=1, max_length=40)]
+
+
+EditableField = Literal[
+    "core_claims", "weaknesses_mined", "strengths_mined", "ad_hooks", "factual_evidence", "milestones"
+]
+
+
+class ReportEdit(BaseModel):
+    """One merchant correction to a finished report."""
+
+    op: Literal["remove_item", "set_price", "remove_competitor"]
+    competitor: ShortText
+    field: EditableField | None = None
+    value: Annotated[str, Field(max_length=2000)] | None = None
+
+
+class ReportEditInput(BaseModel):
+    edits: Annotated[list[ReportEdit], Field(min_length=1, max_length=20)]
+
+
+class ReportEditResponse(BaseModel):
+    applied: list[str]
+    swot_report: SWOTReportDelta
+
+
+class MoreCompetitorsInput(BaseModel):
+    """Optional: research these named competitors instead of the next ones found."""
+
+    names: Annotated[list[ShortText], Field(max_length=5)] = Field(default_factory=list)
+
+
 class RenameSessionInput(BaseModel):
     label: ShortText
 

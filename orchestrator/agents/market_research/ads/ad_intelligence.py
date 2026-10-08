@@ -268,7 +268,8 @@ async def _google_ads(
 
 async def _web_mentions(
     competitors: list[CompetitorProfile], tavily_client: Any, category: str = ""
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], list[dict[str, str]]]:
+    """Hooks per competitor, plus the snippets they came from as evidence documents."""
     # Two queries per competitor: a specific ad-copy search, and a broader brand
     # messaging search so something always surfaces even without ad library access.
     queries = []
@@ -285,6 +286,9 @@ async def _web_mentions(
 
     results = await execute_tavily_search(queries, tavily_client=tavily_client)
     mentions: dict[str, list[str]] = {}
+    # The grounding gate checks every hook against the evidence corpus; these snippets come from
+    # a search of their own, so without them as documents every web-mention hook was dropped.
+    documents: list[dict[str, str]] = []
     for comp in competitors:
         found: list[str] = []
         for r in results:
@@ -305,8 +309,10 @@ async def _web_mentions(
             hook = _hook(WEB_LABEL, snippet)
             if hook not in found:
                 found.append(hook)
+                if r.url:
+                    documents.append({"url": r.url, "markdown": snippet})
         mentions[comp.product_name] = found
-    return mentions
+    return mentions, documents
 
 
 # ── Coordinator ──────────────────────────────────────────────────────────────
@@ -373,12 +379,17 @@ async def search_competitor_ad_hooks(
 
     library_task = asyncio.gather(*[_collect(c, p) for c in targets for p in platforms])
     mentions_task = _web_mentions(targets, tavily_client, category)
-    _, mentions = await asyncio.gather(library_task, mentions_task)
+    _, (mentions, mention_docs) = await asyncio.gather(library_task, mentions_task)
 
     for comp in targets:
         # Web mentions describe ads second-hand; use them only when no ad library had real copy.
         library = library_hooks.get(comp.product_name, [])
         hooks = list(dict.fromkeys(library or mentions.get(comp.product_name, [])))
         result.hooks_by_competitor[comp.product_name] = hooks[:max_hooks_per_comp]
+        if not library:
+            used = set(hooks[:max_hooks_per_comp])
+            result.documents.extend(
+                d for d in mention_docs if _hook(WEB_LABEL, d["markdown"]) in used and d not in result.documents
+            )
 
     return result

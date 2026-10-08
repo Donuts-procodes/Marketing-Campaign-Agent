@@ -148,18 +148,20 @@ class CrawlAPIClient:
             payload["location"] = {"country": country}
 
         response: httpx.Response | None = None
-        async with _firecrawl_semaphore(), httpx.AsyncClient(timeout=self.timeout + 15) as client:
-            for attempt in range(max(_FIRECRAWL_RETRIES, 0) + 1):
+        for attempt in range(max(_FIRECRAWL_RETRIES, 0) + 1):
+            # The slot is released before backing off: sleeping while holding it stalled every
+            # other queued page for the whole 10/20/30s backoff.
+            async with _firecrawl_semaphore(), httpx.AsyncClient(timeout=self.timeout + 15) as client:
                 response = await client.post(
                     FIRECRAWL_ENDPOINT,
                     json=payload,
                     headers={"Authorization": f"Bearer {self.firecrawl_api_key}"},
                 )
-                if response.status_code != 429 or attempt == _FIRECRAWL_RETRIES:
-                    break
-                wait = _retry_after_seconds(response, attempt)
-                logger.info("Firecrawl rate limited; retrying %s in %.0fs", url, wait)
-                await asyncio.sleep(wait)
+            if response.status_code != 429 or attempt == _FIRECRAWL_RETRIES:
+                break
+            wait = _retry_after_seconds(response, attempt)
+            logger.info("Firecrawl rate limited; retrying %s in %.0fs", url, wait)
+            await asyncio.sleep(wait)
 
         if response is None:  # defensive: the retry loop always runs at least once
             raise CrawlAPIError(f"Firecrawl made no request for {url}")

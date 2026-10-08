@@ -101,8 +101,13 @@ declare module "react" {
   export function createContext<T>(defaultValue: T): any;
   export function useContext<T>(context: any): T;
 
+  export function useDeferredValue<T>(value: T): T;
+  export function memo<P>(component: (props: P) => ReactElement<any, any> | null): (props: P) => ReactElement<any, any> | null;
+  export function lazy(factory: () => Promise<{ default: (...args: any[]) => any }>): (props: any) => ReactElement<any, any> | null;
+
   export const StrictMode: any;
   export const Fragment: any;
+  export const Suspense: any;
 
   export type FC<P = {}> = (props: P) => ReactElement<any, any> | null;
   export type PropsWithChildren<P = {}> = P & { children?: ReactNode };
@@ -111,6 +116,7 @@ declare module "react" {
   export type ChangeEvent<T = any> = any;
   export type MouseEvent<T = any> = any;
   export type DragEvent<T = any> = any;
+  export type KeyboardEvent<T = any> = any;
 
   const React: any;
   export default React;
@@ -231,6 +237,16 @@ declare module "lucide-react" {
   export const Mail: any;
   export const Share: any;
   export const Share2: any;
+  export const Star: any;
+  export const Globe: any;
+  export const ArrowUpDown: any;
+  export const Crown: any;
+  export const Tag: any;
+  export const Quote: any;
+  export const LayoutGrid: any;
+  export const Table2: any;
+  export const MapPin: any;
+  export const Swords: any;
   const icons: Record<string, any>;
   export default icons;
 }

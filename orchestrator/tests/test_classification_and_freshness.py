@@ -230,14 +230,14 @@ class TestDQSRecencyIntegration:
                 brand_name=f"Brand{i}",
                 product_name=f"Product{i}",
                 pricing_model=f"${i}9/mo",
-                weaknesses_mined=["issue"],
+                weaknesses_mined=["issue_1", "issue_2"],
                 sources=[f"https://example.com/{i}"],
             )
-            for i in range(3)
+            for i in range(5)
         ]
 
     def test_stale_evidence_lowers_dqs(self):
-        sources = [f"https://source{i}.com" for i in range(5)]
+        sources = [f"https://source{i}.com" for i in range(6)]
         very_old = [date(2015, 1, 1), date(2016, 1, 1)]
         fresh = calculate_dqs(self._full_competitors(), sources)
         stale = calculate_dqs(self._full_competitors(), sources, evidence_dates=very_old)
@@ -250,22 +250,22 @@ class TestDQSRecencyIntegration:
 
     def test_stale_evidence_blocks_convergence_despite_passing_dqs(self):
         """At 0.15 weight recency cannot fail DQS alone, so the loop gates on it directly."""
-        sources = [f"https://source{i}.com" for i in range(5)]
+        sources = [f"https://source{i}.com" for i in range(6)]
         stale = calculate_dqs(
             self._full_competitors(), sources, evidence_dates=[date(2015, 1, 1)]
         )
         # DQS itself still passes the 0.80 threshold...
         assert stale.passed is True
         # ...but the recency floor stops the loop from converging on stale data.
-        assert is_research_converged(stale, density=1.0, competitors_count=3, min_recency=0.5) is False
-        assert is_research_converged(stale, density=1.0, competitors_count=3, min_recency=0.0) is True
+        assert is_research_converged(stale, density=1.0, competitors_count=5, min_recency=0.5) is False
+        assert is_research_converged(stale, density=1.0, competitors_count=5, min_recency=0.0) is True
 
     def test_undated_evidence_still_converges(self):
         """Pages without publication metadata must not stall the loop."""
-        sources = [f"https://source{i}.com" for i in range(5)]
+        sources = [f"https://source{i}.com" for i in range(6)]
         undated = calculate_dqs(self._full_competitors(), sources, evidence_dates=[])
         assert undated.r_recency == 1.0
-        assert is_research_converged(undated, density=1.0, competitors_count=3, min_recency=0.5) is True
+        assert is_research_converged(undated, density=1.0, competitors_count=5, min_recency=0.5) is True
 
 
 class TestConversationalGoalDisambiguation:

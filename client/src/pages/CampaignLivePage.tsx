@@ -1,394 +1,437 @@
-import { useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useCampaignStream } from "@/hooks/useCampaignStream";
-import { fetchMoreCompetitors, reResearchCampaign } from "@/lib/api-client";
+import { ChatAction, applyReportEdits, fetchMoreCompetitors, reResearchCampaign } from "@/lib/api-client";
 import { exportToCSV, printDashboardReport } from "@/lib/exportReport";
-import { AppNavbar } from "@/components/dashboard/AppNavbar";
-import { PastelBentoGrid } from "@/components/dashboard/PastelBentoGrid";
-import { CompetitorComparisonBoard } from "@/components/dashboard/CompetitorComparisonBoard";
-import { ActionablePlaybook } from "@/components/dashboard/ActionablePlaybook";
-import { RightCalendarSidebar } from "@/components/dashboard/RightCalendarSidebar";
-import { SWOTGrid } from "@/components/research/SWOTGrid";
-import { DQSBadge } from "@/components/research/DQSBadge";
+import { parseRunProgress } from "@/lib/runProgress";
+import { RivalView, confidenceOf, keyFacts, toRivalView } from "@/lib/rivalMetrics";
+import { cn } from "@/lib/utils";
+import { AppNavbar, NavSection } from "@/components/dashboard/AppNavbar";
 import { LiveConsole } from "@/components/pipeline/LiveConsole";
-import { PipelineProgressLoader } from "@/components/pipeline/PipelineProgressLoader";
-import { safeHref, cn } from "@/lib/utils";
-import {
-  Search,
-  SlidersHorizontal,
-  ExternalLink,
-  Activity,
-  RefreshCw,
-  Download,
-  Printer,
-  X,
-} from "lucide-react";
+import { RunProgressView } from "@/components/intel/RunProgressView";
+import { RivalCard } from "@/components/intel/RivalCard";
+import { RivalDrawer } from "@/components/intel/RivalDrawer";
+import { ComparisonTable } from "@/components/intel/ComparisonTable";
+import { MarketBrief, MarketPanel } from "@/components/intel/MarketPanel";
+import { SourcesPanel } from "@/components/intel/SourcesPanel";
+import { ChatWidget } from "@/components/intel/ChatWidget";
+import { Download, Loader2, Plus, Printer, RefreshCw, Search, Terminal, X } from "lucide-react";
+
+const SECTIONS: NavSection[] = [
+  { id: "overview", label: "Overview" },
+  { id: "rivals", label: "Rivals" },
+  { id: "compare", label: "Compare" },
+  { id: "market", label: "Market" },
+  { id: "sources", label: "Sources" },
+];
+
+// Literal class names so Tailwind generates them; the row always spans the full width.
+const FACT_COLS: Record<number, string> = {
+  1: "lg:grid-cols-1",
+  2: "lg:grid-cols-2",
+  3: "lg:grid-cols-3",
+  4: "lg:grid-cols-4",
+};
+
+const TOOL_BTN =
+  "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-line bg-white hover:bg-[#FBF8F2] text-xs font-semibold text-ink transition disabled:opacity-50 disabled:cursor-not-allowed";
+
+function SectionHeading({ title, hint, action }: { title: string; hint?: string; action?: React.ReactNode }) {
+  return (
+    <div className="flex flex-wrap items-end justify-between gap-2 mb-3">
+      <div>
+        <h2 className="font-display text-lg font-bold text-ink">{title}</h2>
+        {hint && <p className="text-xs text-ink-faint">{hint}</p>}
+      </div>
+      {action}
+    </div>
+  );
+}
 
 export function CampaignLivePage() {
   const { jobId } = useParams<{ jobId: string }>();
-
-  const [activeTab, setActiveTab] = useState("dashboard");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [showConsoleDrawer, setShowConsoleDrawer] = useState(false);
-  const [isFindingMore, setIsFindingMore] = useState(false);
-  const [isReResearching, setIsReResearching] = useState(false);
-  const [findMoreError, setFindMoreError] = useState<string | null>(null);
-
   const { state, reconnect, applyReport } = useCampaignStream(jobId);
+  const { connectionStatus, telemetryLogs, swotReport: report, merchantContext, error: streamError } = state;
 
-  const {
-    connectionStatus,
-    telemetryLogs,
-    swotReport,
-    error: streamError,
-  } = state;
+  const [activeSection, setActiveSection] = useState("overview");
+  // The open profile lives in the URL (?rival=N), so a link can point straight at one rival.
+  const [openRival, setOpenRival] = useState<number | null>(() => {
+    const v = Number.parseInt(new URLSearchParams(window.location.search).get("rival") ?? "", 10);
+    return Number.isFinite(v) && v >= 0 ? v : null;
+  });
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (openRival == null) url.searchParams.delete("rival");
+    else url.searchParams.set("rival", String(openRival));
+    window.history.replaceState(window.history.state, "", url);
+  }, [openRival]);
+  const [logOpen, setLogOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query.trim().toLowerCase());
+  const [busy, setBusy] = useState<"more" | "rerun" | null>(null);
+  const [notice, setNotice] = useState<{ tone: "info" | "error"; text: string } | null>(null);
 
-  const allCompetitors = swotReport?.competitors ?? [];
-  const query = searchQuery.trim().toLowerCase();
-  const matchedCompetitors = query
-    ? allCompetitors.filter((c) =>
-        [c.brand_name, c.product_name, c.pricing_model ?? "", ...c.core_claims, ...c.weaknesses_mined]
-          .join(" ")
-          .toLowerCase()
-          .includes(query)
-      )
-    : allCompetitors;
-  const competitorsToDisplay = matchedCompetitors.slice(0, 5);
+  const merchantName = String(merchantContext?.product_name ?? "").trim();
+  const category = String(merchantContext?.category ?? "").trim();
+  const merchantPriceRaw = merchantContext?.price_usd;
+  const merchantPrice =
+    typeof merchantPriceRaw === "number" && Number.isFinite(merchantPriceRaw) ? `$${merchantPriceRaw.toLocaleString()}` : null;
 
-  const isExecuting = connectionStatus !== "COMPLETED" && (!swotReport || allCompetitors.length === 0);
+  const rivals = useMemo(() => (report?.competitors ?? []).map(toRivalView), [report]);
+  const facts = useMemo(() => keyFacts(rivals), [rivals]);
+  const reserveCount = useMemo(() => parseRunProgress(telemetryLogs).reserveCount, [telemetryLogs]);
+  const lastTimestamp = telemetryLogs[telemetryLogs.length - 1]?.timestamp;
 
-  const statusLine =
-    connectionStatus === "COMPLETED"
-      ? `Research run completed: ${allCompetitors.length} competitor(s) extracted with grounded evidence.`
-      : connectionStatus === "ERROR"
-        ? streamError ?? "The research run failed."
-        : "Autonomous research agents actively crawling, extracting attributes, and verifying claims...";
+  const visibleRivals = useMemo<RivalView[]>(() => {
+    if (!deferredQuery) return rivals;
+    return rivals.filter((r) =>
+      [r.name, r.subtitle ?? "", r.host ?? "", r.priceLabel, ...r.claims, ...r.praise, ...r.complaints, ...r.ads]
+        .join(" ")
+        .toLowerCase()
+        .includes(deferredQuery)
+    );
+  }, [rivals, deferredQuery]);
 
-  const handleFindMoreCompetitors = async () => {
-    if (!jobId) return;
-    setIsFindingMore(true);
-    setFindMoreError(null);
+  const hasReport = !!report && rivals.length > 0;
+  const showProgress = !hasReport && connectionStatus !== "COMPLETED";
+
+  // Highlights the navbar section the reader is currently looking at.
+  useEffect(() => {
+    if (!hasReport) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.filter((e) => e.isIntersecting);
+        if (visible.length) setActiveSection(visible[0].target.id);
+      },
+      { rootMargin: "-40% 0px -55% 0px" }
+    );
+    SECTIONS.forEach((s) => {
+      const el = document.getElementById(s.id);
+      if (el) observer.observe(el);
+    });
+    return () => observer.disconnect();
+  }, [hasReport]);
+
+  const goTo = useCallback((id: string) => {
+    document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  const handleFindMore = async () => {
+    if (!jobId || busy) return;
+    setBusy("more");
+    setNotice(null);
     try {
       const res = await fetchMoreCompetitors(jobId);
       applyReport(res.swot_report);
-      if (res.added_competitors.length === 0) {
-        setFindMoreError("No additional competitors were found.");
-      }
-    } catch (err: unknown) {
-      setFindMoreError(
-        err instanceof Error ? err.message : "Failed to find more competitors"
+      setNotice(
+        res.added_competitors.length
+          ? { tone: "info", text: `Added ${res.added_competitors.map((c) => c.brand_name).join(", ")}.` }
+          : { tone: "info", text: "No further competitors in this market were found." }
       );
+    } catch (err) {
+      setNotice({ tone: "error", text: err instanceof Error ? err.message : "Could not research more competitors." });
     } finally {
-      setIsFindingMore(false);
+      setBusy(null);
     }
   };
 
-  const handleReResearch = async () => {
-    if (!jobId || isReResearching) return;
-    setIsReResearching(true);
-    setFindMoreError(null);
+  const handleRerun = async () => {
+    if (!jobId || busy) return;
+    setBusy("rerun");
+    setNotice(null);
     try {
       reconnect(true);
       const res = await reResearchCampaign(jobId);
       applyReport(res.swot_report);
-    } catch (err: unknown) {
-      setFindMoreError(
-        err instanceof Error ? err.message : "Failed to execute re-research"
-      );
+      setNotice({ tone: "info", text: "Research refreshed with the latest data." });
+    } catch (err) {
+      setNotice({ tone: "error", text: err instanceof Error ? err.message : "Could not refresh the research." });
     } finally {
-      setIsReResearching(false);
+      setBusy(null);
     }
   };
 
+  // Runs an action the merchant confirmed in the chat and returns a one-line result for its card.
+  const runChatAction = async (action: ChatAction): Promise<string> => {
+    if (!jobId) throw new Error("No research run is open.");
+    if (busy) throw new Error("Another update is already running — try again when it finishes.");
+    if (action.kind === "edit") {
+      const res = await applyReportEdits(jobId, action.payload.edits ?? []);
+      applyReport(res.swot_report);
+      return res.applied.join(" · ") || "Report updated.";
+    }
+    if (action.kind === "research") {
+      setBusy("more");
+      try {
+        const res = await fetchMoreCompetitors(jobId, action.payload.names ?? []);
+        applyReport(res.swot_report);
+        return res.added_competitors.length
+          ? `Added ${res.added_competitors.map((c) => c.brand_name).join(", ")} to the report.`
+          : "No new competitors could be researched.";
+      } finally {
+        setBusy(null);
+      }
+    }
+    setBusy("rerun");
+    try {
+      reconnect(true);
+      const res = await reResearchCampaign(jobId);
+      applyReport(res.swot_report);
+      return "The research was re-run and the report is up to date.";
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const conf = report ? confidenceOf(report.dqs_score, report.assumptions_tagged) : null;
+  const sourceCount = report?.source_urls?.length ?? 0;
+
   return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-900 w-full">
-      {/* ── Fixed Top Navbar ─────────────────────────────────── */}
+    <div className="min-h-screen w-full bg-canvas text-ink font-sans">
       <AppNavbar
-        activeTab={activeTab}
+        sections={hasReport ? SECTIONS : undefined}
+        activeTab={activeSection}
+        onTabChange={goTo}
         connectionStatus={connectionStatus}
-        onReconnect={reconnect}
-        onTabChange={(tab) => {
-          setActiveTab(tab);
-          if (tab === "telemetry") {
-            setShowConsoleDrawer(true);
-          } else if (tab === "playbook") {
-            document.getElementById("playbook-section")?.scrollIntoView({ behavior: "smooth" });
-          } else if (tab === "competitors") {
-            document.getElementById("competitors-section")?.scrollIntoView({ behavior: "smooth" });
-          } else if (tab === "agents" || tab === "framework") {
-            document.getElementById("framework-section")?.scrollIntoView({ behavior: "smooth" });
-          } else if (tab === "dashboard") {
-            window.scrollTo({ top: 0, behavior: "smooth" });
-          }
-        }}
+        onReconnect={() => reconnect(true)}
       />
 
-      <div className="w-full max-w-7xl mx-auto pt-16 pb-12 px-4 sm:px-6 lg:px-8">
-        {/* Report masthead for print */}
-        <div className="print-only mb-4 pb-3 border-b border-zinc-400">
-          <h1 className="text-lg font-bold">Market &amp; Competitor Intelligence Report</h1>
-          <p className="text-xs mt-1">
-            Generated {new Date().toLocaleString()}
-            {swotReport?.competitors?.length
-              ? ` · ${swotReport.competitors.length} competitors`
-              : ""}
-            {swotReport?.dqs_score != null
-              ? ` · Data Quality Score ${(swotReport.dqs_score * 100).toFixed(0)}%`
-              : ""}
-            {swotReport?.assumptions_tagged ? " · contains tagged assumptions" : ""}
-          </p>
-        </div>
-
-        {/* Live Zero to 100 Loader Screen while Autonomous Pipeline is Running */}
-        {isExecuting ? (
-          <PipelineProgressLoader
+      <div className="w-full max-w-7xl mx-auto pt-16 pb-16 px-4 sm:px-6 lg:px-8">
+        {showProgress ? (
+          <RunProgressView
             logs={telemetryLogs}
             connectionStatus={connectionStatus}
             error={streamError}
-            onViewLogs={() => setShowConsoleDrawer(true)}
+            productName={merchantName}
             onRetry={() => reconnect(true)}
+            onOpenLog={() => setLogOpen(true)}
           />
+        ) : !hasReport ? (
+          <div className="max-w-lg mx-auto mt-20 text-center space-y-3 animate-fade-up">
+            <h1 className="font-display text-2xl font-bold">No competitors were found</h1>
+            <p className="text-sm text-ink-soft">
+              The run finished without a usable shortlist. A broader category or a few known competitor names usually fixes
+              this.
+            </p>
+            <div className="flex justify-center gap-2">
+              <button type="button" onClick={handleRerun} disabled={!!busy} className={TOOL_BTN}>
+                <RefreshCw className={cn("w-3.5 h-3.5", busy === "rerun" && "animate-spin")} /> Try again
+              </button>
+              <button type="button" onClick={() => setLogOpen(true)} className={TOOL_BTN}>
+                <Terminal className="w-3.5 h-3.5" /> Agent log
+              </button>
+            </div>
+          </div>
         ) : (
-          /* Main Work Area */
-          <div className="flex flex-col lg:flex-row items-start gap-5 mt-4">
-            <main className="flex-1 min-w-0 space-y-5">
-              {/* Header + Search Bar */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-zinc-200">
-                <div>
-                  <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-zinc-900">
-                    Market &amp; Competitor Intelligence Dashboard
+          <div className="space-y-10">
+            {/* ── Overview ─────────────────────────────────────────── */}
+            <section id="overview" className="scroll-mt-20 space-y-5 pt-6">
+              <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-semibold uppercase tracking-widest text-ink-faint">
+                    Competitor report{category ? ` · ${category}` : ""}
+                  </p>
+                  <h1 className="mt-1 font-display text-3xl sm:text-4xl font-bold tracking-tight">
+                    {merchantName ? (
+                      <>
+                        {merchantName} <span className="text-ink-faint font-medium">vs.</span> {rivals.length} rival
+                        {rivals.length === 1 ? "" : "s"}
+                      </>
+                    ) : (
+                      `${rivals.length} rivals profiled`
+                    )}
                   </h1>
-                  <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500">
-                    <span>{statusLine}</span>
-                    <button
-                      type="button"
-                      onClick={() => setShowConsoleDrawer(true)}
-                      className="font-medium text-zinc-900 hover:underline cursor-pointer"
-                    >
-                      View agent trace &rarr;
-                    </button>
-                  </div>
-                </div>
-
-                {/* Toolbar: Re-research + Quick Export Buttons + Filter Input */}
-                <div className="no-print flex items-center flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={handleReResearch}
-                    disabled={isReResearching || isFindingMore}
-                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-white border border-zinc-300 hover:bg-zinc-50 text-zinc-800 transition disabled:opacity-50 cursor-pointer shadow-2xs shrink-0"
-                    title="Re-run the entire market research agent and discovery loop"
-                  >
-                    <RefreshCw className={cn("w-3.5 h-3.5 text-zinc-600", isReResearching && "animate-spin text-zinc-900")} />
-                    <span>{isReResearching ? "Re-researching..." : "Re-research"}</span>
-                  </button>
-
-                  {swotReport && (
-                    <>
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-ink-soft">
+                    {conf && (
                       <button
                         type="button"
-                        onClick={() => exportToCSV(swotReport)}
-                        className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold bg-white border border-zinc-300 hover:bg-zinc-50 text-zinc-700 transition cursor-pointer shadow-2xs shrink-0"
-                        title="Export competitor intelligence matrix to CSV"
+                        onClick={() => goTo("sources")}
+                        className={cn("inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-semibold", conf.tone)}
+                        title="See what this confidence is based on"
                       >
-                        <Download className="w-3.5 h-3.5 text-zinc-500" />
-                        <span>Export CSV</span>
+                        <span className={cn("w-1.5 h-1.5 rounded-full", conf.dot)} />
+                        {conf.label}
                       </button>
-
-                      <button
-                        type="button"
-                        onClick={() => printDashboardReport()}
-                        className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold bg-white border border-zinc-300 hover:bg-zinc-50 text-zinc-700 transition cursor-pointer shadow-2xs shrink-0"
-                        title="Print executive summary or save as PDF"
-                      >
-                        <Printer className="w-3.5 h-3.5 text-zinc-500" />
-                        <span>Print / PDF</span>
-                      </button>
-                    </>
-                  )}
-
-                  <div className="w-full sm:w-60 flex items-center gap-2 bg-white border border-zinc-300 rounded-md px-3 py-1.5 shadow-2xs focus-within:border-zinc-500">
-                    <Search className="w-4 h-4 text-zinc-400 shrink-0" />
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="Filter competitors, pricing..."
-                      className="bg-transparent text-xs text-zinc-900 outline-hidden flex-1 placeholder:text-zinc-400"
-                    />
-                    {query && (
-                      <span className="text-[11px] font-mono text-zinc-400 shrink-0">
-                        {competitorsToDisplay.length}/{allCompetitors.length}
-                      </span>
+                    )}
+                    <span>{sourceCount} pages read</span>
+                    {lastTimestamp && (
+                      <span>· {new Date(lastTimestamp).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}</span>
                     )}
                   </div>
                 </div>
-              </div>
 
-              {/* 4 Clean Metric Cards */}
-              <PastelBentoGrid
-                swotReport={swotReport}
-                competitorCount={allCompetitors.length}
-              />
-
-              {/* Competitor Comparison Board Table */}
-              <div id="competitors-section">
-                <CompetitorComparisonBoard
-                  competitors={competitorsToDisplay}
-                  dynamicTaxonomy={swotReport?.dynamic_taxonomy}
-                  onFindMore={handleFindMoreCompetitors}
-                  isFindingMore={isFindingMore}
-                  onReResearch={handleReResearch}
-                  isReResearching={isReResearching}
-                />
-              </div>
-
-              {/* Merchant Action Plan & Counter-Campaign Playbook */}
-              {swotReport && competitorsToDisplay.length > 0 && (
-                <div id="playbook-section">
-                  <ActionablePlaybook
-                    competitors={competitorsToDisplay}
-                    positioningGap={swotReport.positioning_gap || swotReport.market_positioning_gap}
-                    dynamicTaxonomy={swotReport.dynamic_taxonomy}
-                  />
-                </div>
-              )}
-
-              {findMoreError && (
-                <div className="p-3 rounded bg-rose-50 border border-rose-200 text-rose-700 text-xs">
-                  {findMoreError}
-                </div>
-              )}
-
-              {/* Dynamic Market Attributes & SWOT */}
-              {swotReport && (
-                <section id="framework-section" className="space-y-4 pt-2">
-                  <div className="flex items-center justify-between pb-2 border-b border-zinc-200">
-                    <div className="flex items-center gap-2">
-                      <SlidersHorizontal className="w-4 h-4 text-zinc-700" />
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-900">
-                        Learned Parameter Framework &amp; Strategic SWOT
-                      </h3>
-                    </div>
-                    <DQSBadge
-                      score={swotReport.dqs_score}
-                      assumptionsTagged={swotReport.assumptions_tagged}
-                      diagnostics={swotReport.dqs_diagnostics}
-                      sourceUrlsCount={swotReport.source_urls.length}
+                <div className="no-print flex flex-wrap items-center gap-2">
+                  <label className="flex items-center gap-2 rounded-lg border border-line bg-white px-2.5 py-1.5 focus-within:border-ink/40 w-full sm:w-56">
+                    <Search className="w-3.5 h-3.5 text-ink-faint shrink-0" />
+                    <span className="sr-only">Filter rivals</span>
+                    <input
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      placeholder="Filter rivals, prices, quotes…"
+                      className="flex-1 min-w-0 bg-transparent text-xs outline-none placeholder:text-ink-faint"
                     />
-                  </div>
+                    {query && (
+                      <button type="button" onClick={() => setQuery("")} aria-label="Clear filter">
+                        <X className="w-3.5 h-3.5 text-ink-faint hover:text-ink" />
+                      </button>
+                    )}
+                  </label>
+                  <button type="button" onClick={handleRerun} disabled={!!busy} className={TOOL_BTN} title="Run the research again">
+                    <RefreshCw className={cn("w-3.5 h-3.5", busy === "rerun" && "animate-spin")} />
+                    {busy === "rerun" ? "Refreshing…" : "Refresh"}
+                  </button>
+                  <button type="button" onClick={() => report && exportToCSV(report)} className={TOOL_BTN}>
+                    <Download className="w-3.5 h-3.5" /> CSV
+                  </button>
+                  <button type="button" onClick={() => printDashboardReport(merchantName)} className={TOOL_BTN}>
+                    <Printer className="w-3.5 h-3.5" /> PDF
+                  </button>
+                  <button type="button" onClick={() => setLogOpen(true)} className={TOOL_BTN} title="Agent log">
+                    <Terminal className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
 
-                  {/* Attribute Matrix Card */}
-                  {swotReport.dynamic_taxonomy && (
-                    <div className="p-4 rounded-lg bg-white border border-zinc-200 shadow-xs space-y-3">
-                      <div className="flex items-center justify-between border-b border-zinc-100 pb-2">
-                        <span className="text-xs font-bold text-zinc-900">
-                          Dynamic Spec Parameter Taxonomy
-                        </span>
-                        {swotReport.attribute_density !== undefined && (
-                          <span className="px-2 py-0.5 rounded text-[11px] font-mono font-semibold bg-zinc-100 text-zinc-700 border border-zinc-200">
-                            {Math.round(swotReport.attribute_density * 100)}% Spec Density
-                          </span>
-                        )}
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div className="space-y-1.5">
-                          <span className="text-[11px] font-bold text-zinc-600 uppercase tracking-wider block">
-                            Critical JTBD Drivers ({swotReport.dynamic_taxonomy.critical_jtbd_drivers.length})
-                          </span>
-                          <div className="flex flex-wrap gap-1.5">
-                            {swotReport.dynamic_taxonomy.critical_jtbd_drivers.map((d, i) => (
-                              <span
-                                key={i}
-                                className="px-2.5 py-0.5 rounded text-xs font-medium bg-zinc-100 text-zinc-800 border border-zinc-200"
-                              >
-                                {d.replace(/_/g, " ")}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <span className="text-[11px] font-bold text-zinc-600 uppercase tracking-wider block">
-                            Minor Specification Attributes ({swotReport.dynamic_taxonomy.minor_attributes.length})
-                          </span>
-                          <div className="flex flex-wrap gap-1.5">
-                            {swotReport.dynamic_taxonomy.minor_attributes.map((a, i) => (
-                              <span
-                                key={i}
-                                className="px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-50 text-zinc-600 border border-zinc-200"
-                              >
-                                {a.replace(/_/g, " ")}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* SWOT Grid */}
-                  <SWOTGrid
-                    swot={swotReport.swot || swotReport.swot_analysis}
-                    positioningGap={swotReport.positioning_gap || swotReport.market_positioning_gap}
-                  />
-
-                  {/* Verified Research Sources */}
-                  {swotReport.source_urls && swotReport.source_urls.length > 0 && (
-                    <div className="p-4 rounded-lg bg-white border border-zinc-200 shadow-xs space-y-2.5">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-zinc-900 block">
-                          Verified Web Research Provenance ({swotReport.source_urls.length} URLs)
-                        </span>
-                        <span className="text-[11px] text-zinc-500 font-mono">
-                          Grounding Evidence
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
-                        {swotReport.source_urls.map((url, i) => (
-                          <a
-                            key={i}
-                            href={safeHref(url)}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-xs text-zinc-700 hover:text-zinc-900 bg-zinc-50 hover:bg-zinc-100 p-2 rounded border border-zinc-200 truncate flex items-center justify-between gap-1 transition"
-                          >
-                            <span className="truncate">{url}</span>
-                            <ExternalLink className="w-3 h-3 shrink-0 text-zinc-400" />
-                          </a>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </section>
+              {report?.sample_data && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900">
+                  Sample data — the server has no live search keys configured, so these rivals are illustrative.
+                </div>
               )}
-            </main>
 
-            {/* Right Pipeline Info Sidebar */}
-            <RightCalendarSidebar
-              onReconnect={reconnect}
-              onOpenLogs={() => setShowConsoleDrawer(true)}
-              connectionStatus={connectionStatus}
-            />
+              {/* Key facts across all rivals: each opens the rival it is about */}
+              <div className={cn("grid grid-cols-2 gap-2.5", FACT_COLS[Math.min(facts.length, 4)])}>
+                {facts.slice(0, 4).map((f, i) => {
+                  const clickable = f.rivalIndex != null;
+                  return (
+                    <button
+                      key={f.id}
+                      type="button"
+                      disabled={!clickable}
+                      onClick={() => clickable && setOpenRival(f.rivalIndex)}
+                      className={cn(
+                        "min-w-0 text-left rounded-2xl border border-line bg-white p-4 shadow-card animate-fade-up transition-all",
+                        clickable ? "hover:shadow-lift hover:-translate-y-0.5" : "cursor-default"
+                      )}
+                      style={{ animationDelay: `${i * 60}ms` }}
+                    >
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-ink-faint">{f.label}</div>
+                      <div className="mt-1 font-display text-lg font-bold text-ink truncate">{f.value}</div>
+                      <div className="mt-0.5 text-[11px] text-ink-soft line-clamp-2">{f.detail}</div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {report && <MarketBrief report={report} />}
+            </section>
+
+            {/* ── Rivals ───────────────────────────────────────────── */}
+            <section id="rivals" className="scroll-mt-20">
+              <SectionHeading
+                title="Your rivals"
+                hint={
+                  deferredQuery
+                    ? `${visibleRivals.length} of ${rivals.length} match “${query.trim()}”`
+                    : "Picked for how closely they compete with you. Open any card for the full profile."
+                }
+              />
+              {visibleRivals.length ? (
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                  {visibleRivals.map((r) => (
+                    <RivalCard key={r.key} rival={r} onOpen={setOpenRival} />
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-2xl border border-dashed border-line bg-white/50 p-8 text-center text-xs text-ink-faint">
+                  No rival matches that filter.
+                </p>
+              )}
+
+              <div className="no-print mt-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-2xl border border-dashed border-line bg-white/60 px-4 py-3">
+                <p className="text-xs text-ink-soft">
+                  {reserveCount
+                    ? `${reserveCount} more competitors were found but not researched in depth.`
+                    : "Want a wider view of the market?"}
+                </p>
+                <button type="button" onClick={handleFindMore} disabled={!!busy} className={TOOL_BTN}>
+                  {busy === "more" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                  {busy === "more" ? "Researching…" : "Research the next rivals"}
+                </button>
+              </div>
+              {notice && (
+                <p
+                  role="status"
+                  className={cn(
+                    "mt-2 rounded-lg px-3 py-2 text-xs",
+                    notice.tone === "error" ? "bg-rose-50 text-rose-800" : "bg-emerald-50 text-emerald-800"
+                  )}
+                >
+                  {notice.text}
+                </p>
+              )}
+            </section>
+
+            {/* ── Compare ──────────────────────────────────────────── */}
+            <section id="compare" className="scroll-mt-20">
+              <SectionHeading title="Side by side" hint="Your product and every rival on the same measures." />
+              <ComparisonTable
+                rivals={visibleRivals}
+                taxonomy={report?.dynamic_taxonomy}
+                merchantName={merchantName}
+                merchantPrice={merchantPrice}
+                onOpen={setOpenRival}
+              />
+            </section>
+
+            {/* ── Market ───────────────────────────────────────────── */}
+            {report && (
+              <section id="market" className="scroll-mt-20">
+                <SectionHeading title="The market" hint="Strengths, weaknesses, openings and threats — each backed by what was found." />
+                <MarketPanel report={report} />
+              </section>
+            )}
+
+            {/* ── Sources ──────────────────────────────────────────── */}
+            {report && (
+              <section id="sources" className="scroll-mt-20">
+                <SectionHeading title="Sources & confidence" hint="Every page the research used, grouped by website." />
+                <SourcesPanel report={report} />
+              </section>
+            )}
           </div>
         )}
       </div>
 
-      {/* ── Telemetry Drawer Modal ──────────────────────────────── */}
-      {showConsoleDrawer && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs">
-          <div className="w-full max-w-3xl bg-white rounded-lg border border-zinc-300 p-5 shadow-2xl space-y-3">
-            <div className="flex items-center justify-between border-b border-zinc-200 pb-2.5">
-              <div className="flex items-center gap-2">
-                <Activity className="w-4 h-4 text-zinc-700" />
-                <h3 className="text-sm font-bold text-zinc-900">Live Execution Telemetry &amp; Agent Logs</h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowConsoleDrawer(false)}
-                className="w-7 h-7 rounded hover:bg-zinc-100 flex items-center justify-center text-zinc-500 transition cursor-pointer"
-              >
+      {hasReport && jobId && (
+        <ChatWidget
+          jobId={jobId}
+          rivals={rivals}
+          merchantName={merchantName}
+          onOpenRival={setOpenRival}
+          onAction={runChatAction}
+        />
+      )}
+
+      <RivalDrawer
+        rivals={rivals}
+        openIndex={openRival}
+        taxonomy={report?.dynamic_taxonomy}
+        onClose={() => setOpenRival(null)}
+        onNavigate={setOpenRival}
+      />
+
+      {logOpen && (
+        <div className="no-print fixed inset-0 z-[70] flex items-center justify-center p-4 bg-ink/40 backdrop-blur-[2px] animate-fade-in" onClick={() => setLogOpen(false)}>
+          <div
+            className="w-full max-w-3xl rounded-2xl bg-white border border-line p-5 shadow-2xl space-y-3"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Agent log"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold">Agent log</h3>
+              <button type="button" onClick={() => setLogOpen(false)} className="p-1.5 rounded-lg hover:bg-canvas" aria-label="Close log">
                 <X className="w-4 h-4" />
               </button>
             </div>

@@ -35,8 +35,11 @@ from orchestrator.agents.market_research.discovery.search import (
     TavilySearchResult,
     build_missing_data_queries,
     build_search_queries,
+    derive_geo_signals,
     derive_scale_signals,
+    filter_out_of_area_results,
     filter_out_of_scale_results,
+    rank_by_recency,
 )
 from orchestrator.agents.market_research.analysis.freshness import (
     extract_publication_date,
@@ -72,7 +75,7 @@ def _time_range_since(prior_run_at: str | None) -> str:
         return "month"
     try:
         from datetime import datetime, timezone as tz
-        prior_dt = datetime.fromisoformat(str(prior_run_at).replace("Z", "+00:00"))
+        prior_dt = datetime.fromisoformat(prior_run_at.replace("Z", "+00:00"))
         days_ago = (datetime.now(tz.utc) - prior_dt).days
         if days_ago <= 1:
             return "day"
@@ -184,6 +187,82 @@ def _is_complaint(text: str) -> bool:
     return len(text) > 20 and bool(_COMPLAINT_RE.search(text))
 
 
+# The review and forum pages mined for complaints carry praise in the same breath -- the
+# thread that says support is slow also says the dashboard is excellent. Only the complaint
+# half was ever kept, so every competitor profile recorded what was wrong with a rival and
+# nothing about what actually wins them customers.
+_STRENGTH_KEYWORDS = (
+    "love", "excellent", "outstanding", "best in", "great", "fantastic", "reliable",
+    "intuitive", "easy to use", "fast", "responsive", "worth it", "recommend",
+    "impressed", "seamless", "lifesaver", "solid", "powerful", "flexible",
+    "helpful", "affordable", "value for money", "well worth", "professional",
+)
+_PRAISE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in _STRENGTH_KEYWORDS) + r")",
+    re.IGNORECASE,
+)
+
+#: Praise phrased as a let-down ("not great", "hardly reliable") is a complaint. Checked
+#: before the praise test so a negated positive never lands in the strengths column.
+_NEGATED_PRAISE_RE = re.compile(
+    r"\b(?:not|never|hardly|barely|isn't|isnt|wasn't|wasnt|far from|less than)\s+\w{0,10}\s*(?:"
+    + "|".join(re.escape(k) for k in _STRENGTH_KEYWORDS)
+    + r")",
+    re.IGNORECASE,
+)
+
+
+def _clean_mined_snippet(snippet: str) -> str:
+    """Strips scraper and byline boilerplate that would otherwise be quoted as user opinion."""
+    out = snippet[:200].strip()
+    out = re.sub(r"^Title:\s*[^|]+\|\s*", "", out, flags=re.IGNORECASE).strip()
+    out = re.sub(
+        r"^(?:written by|by)\s+[A-Za-z0-9 \"'.,-]+?(?:\u2014|-|:|\.\s+)", "", out, flags=re.IGNORECASE
+    ).strip()
+    out = re.sub(r"#{1,6}\s*", "", out).strip()
+    out = re.sub(r"\*{2,}", "", out).strip()
+    return out
+
+
+def _is_praise(text: str) -> bool:
+    """A snippet counts as a strength only when it praises and does not also complain."""
+    if len(text) <= 20 or _NEGATED_PRAISE_RE.search(text):
+        return False
+    return bool(_PRAISE_RE.search(text)) and not _COMPLAINT_RE.search(text)
+
+
+# "4.6 out of 5", "4.6/5", "Rated 4.6". Bounded to a 0-5 scale so a price or a year cannot
+# be read as a rating.
+_RATING_RE = re.compile(
+    r"\b([0-5](?:\.\d)?)\s*(?:/\s*5\b|out of\s+5\b|stars?\b)",
+    re.IGNORECASE,
+)
+
+# "1,240 reviews", "based on 312 ratings"
+_REVIEW_COUNT_RE = re.compile(
+    r"\b(\d{1,3}(?:,\d{3})*|\d+)\s+(?:customer\s+|verified\s+|user\s+)?(?:reviews?|ratings?)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_rating(text: str) -> str | None:
+    match = _RATING_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _extract_review_count(text: str) -> int | None:
+    match = _REVIEW_COUNT_RE.search(text)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    # A single-digit "3 reviews" is noise more often than signal, and an absurd count means
+    # the number belonged to something else on the page.
+    return value if 3 <= value <= 10_000_000 else None
+
+
 _LISTICLE_RE = re.compile(
     r"\b(best|top\s+\d+|\d+\s+best|vs\.?|versus|alternatives?|compared|comparison|review(?:s|ed)?|"
     r"ranked|guide|our (?:top )?picks)\b",
@@ -267,6 +346,7 @@ def extract_preliminary_competitors(
 
         has_pricing = _has_price(r.snippet)
         has_weakness = _is_complaint(r.snippet)
+        has_strength = _is_praise(r.snippet)
         evidence_snippet = f'"{r.snippet[:200].strip()}..."' if len(r.snippet) > 25 else None
         extracted_claim = r.snippet[:160].strip() if len(r.snippet) > 15 else ""
 
@@ -282,6 +362,8 @@ def extract_preliminary_competitors(
                 existing.core_claims.append(extracted_claim)
             if has_weakness and r.snippet[:200] not in existing.weaknesses_mined:
                 existing.weaknesses_mined.append(r.snippet[:200])
+            if has_strength and r.snippet[:200] not in existing.strengths_mined:
+                existing.strengths_mined.append(r.snippet[:200])
             if evidence_snippet and evidence_snippet not in existing.factual_evidence:
                 existing.factual_evidence.append(evidence_snippet)
             if r.url not in existing.sources:
@@ -294,9 +376,44 @@ def extract_preliminary_competitors(
             pricing_model=PLACEHOLDER_PRICING if has_pricing else None,
             core_claims=[extracted_claim] if extracted_claim else [],
             weaknesses_mined=[r.snippet[:200]] if has_weakness else [],
+            strengths_mined=[r.snippet[:200]] if has_strength else [],
             factual_evidence=[evidence_snippet] if evidence_snippet else [],
             sources=[r.url],
         )
+
+    # Review pages also carry the rating and the review count, which is the social proof a
+    # merchant judges a rival on long before they read any individual complaint.
+    for r in review_results:
+        text_lower = f"{r.title} {r.snippet}".lower()
+        named = [p for p in profiles.values() if p.brand_name.lower() in text_lower]
+        if len(named) != 1:
+            continue  # ambiguous page: a rating here could belong to any rival it lists
+        profile = named[0]
+        if profile.rating is None:
+            rating = _extract_rating(r.snippet)
+            if rating:
+                profile.rating = rating
+        if profile.review_count is None:
+            count = _extract_review_count(r.snippet)
+            if count:
+                profile.review_count = count
+
+    # Attach review/forum praise to the best-matching competitor the text names.
+    for r in review_results:
+        if not _is_praise(r.snippet):
+            continue
+        text = f"{r.title} {r.snippet}"
+        text_lower = text.lower()
+        text_tokens = _tokens(text)
+        candidates = [p for p in profiles.values() if p.brand_name.lower() in text_lower]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda p: len(_tokens(p.product_name) & text_tokens))
+        praise = _clean_mined_snippet(r.snippet)
+        if praise and praise not in best.strengths_mined:
+            best.strengths_mined.append(praise)
+        if r.url not in best.sources:
+            best.sources.append(r.url)
 
     # Attach review/forum complaints to the best-matching competitor the text names.
     for r in review_results:
@@ -379,6 +496,49 @@ def rank_competitors(
         return (0, score)
 
     return sorted(competitors, key=_score, reverse=True)
+
+
+# "Founded in 1998", "Est. 2015", "since 2007". Bounded to plausible years so a price or a
+# street number cannot masquerade as a founding date.
+_FOUNDED_RE = re.compile(
+    r"\b(?:founded|established|est\.?|incorporated|started|launched|serving\s+\w+\s+since|since)"
+    r"[^\d]{0,20}((?:19[5-9]\d|20[0-2]\d))\b",
+    re.IGNORECASE,
+)
+
+# A dated sentence: "In 2021 we opened our Berlin office." Milestones are only useful when
+# they carry a date, so an undated achievement line is deliberately not matched.
+_MILESTONE_RE = re.compile(
+    r"(?:^|[.\n])\s*((?:in\s+)?(?:19[5-9]\d|20[0-2]\d)[^.\n]{15,160})",
+    re.IGNORECASE,
+)
+
+_MILESTONE_KEYWORDS = (
+    "launch", "found", "establish", "acquir", "merge", "expand", "open", "raise", "fund",
+    "partner", "award", "certif", "release", "introduc", "reach", "grew", "grow", "million",
+    "office", "headquarter", "rebrand", "ipo", "series",
+)
+
+
+def _extract_founded(text: str) -> str | None:
+    match = _FOUNDED_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _extract_milestones(text: str) -> list[str]:
+    """Dated company events, kept verbatim so the UI never presents a paraphrase as a fact."""
+    out: list[str] = []
+    for match in _MILESTONE_RE.finditer(text):
+        sentence = " ".join(match.group(1).split()).strip()
+        if len(sentence) < 20:
+            continue
+        if not any(k in sentence.lower() for k in _MILESTONE_KEYWORDS):
+            continue
+        if sentence not in out:
+            out.append(sentence)
+        if len(out) >= 6:
+            break
+    return out
 
 
 def merge_duplicate_competitors(
@@ -480,6 +640,28 @@ def enrich_competitors_from_pages(
         if url not in comp.sources:
             comp.sources.append(url)
 
+        # Background history: when a competitor was founded and what they date as milestones.
+        # Stated on about/company pages, which the shortlist crawl now reaches.
+        if not comp.founded:
+            founded = _extract_founded(markdown)
+            if founded:
+                comp.founded = founded
+        if len(comp.milestones) < 6:
+            for event in _extract_milestones(markdown):
+                if event not in comp.milestones:
+                    comp.milestones.append(event)
+                if len(comp.milestones) >= 6:
+                    break
+
+        if comp.rating is None:
+            rating = _extract_rating(markdown)
+            if rating:
+                comp.rating = rating
+        if comp.review_count is None:
+            count = _extract_review_count(markdown)
+            if count:
+                comp.review_count = count
+
         if len(comp.factual_evidence) < 4:
             excerpt = " ".join(markdown[:400].split()).strip()
             if excerpt:
@@ -576,6 +758,8 @@ async def execute_research_loop(
         [DynamicParameterTaxonomy, list[str]], Awaitable[DynamicParameterTaxonomy]
     ]
     | None = None,
+    judge_category_fit: Callable[[list[CompetitorProfile]], Awaitable[list[CompetitorProfile]]]
+    | None = None,
 ) -> ResearchLoopResult:
     """
     Executes the multi-iteration research loop with dynamic parameter refinement,
@@ -603,6 +787,9 @@ async def execute_research_loop(
     # Scale guard: giants slip past the query's soft "-name" exclusions (semantic engines
     # ignore them), so discovery results are filtered deterministically before they accumulate.
     scale_signals = derive_scale_signals(merchant_context)
+    # Where the merchant actually sells. For a geographically bound business a rival in another
+    # city is not a rival at all, and the quoted place name in the query does not enforce that.
+    geo_signals = derive_geo_signals(merchant_context)
 
     accumulated_search_results: list[TavilySearchResult] = []
     accumulated_extracted_pages: list[dict[str, Any]] = []
@@ -616,11 +803,31 @@ async def execute_research_loop(
     # Previous round's yield, for the plateau check below.
     last_competitor_count = -1
     last_dqs_score = -1.0
+    locked_names: list[str] | None = None
+    fit_verdicts: dict[str, tuple[float, str]] = {}
+
+    async def _filtered(round_results: list[Any]) -> list[Any]:
+        in_scale = filter_out_of_scale_results(round_results, scale_signals)
+        in_area = filter_out_of_area_results(in_scale, geo_signals)
+        if len(in_area) < len(in_scale):
+            await _report(
+                on_progress,
+                f"[GEO_FILTER] Dropped {len(in_scale) - len(in_area)} result(s) serving a market "
+                f"other than {geo_signals.raw}",
+            )
+        current = rank_by_recency(in_area, max_age_days=get_settings().recency_max_age_days)
+        if len(current) < len(in_area):
+            await _report(
+                on_progress,
+                f"[RECENCY] Dropped {len(in_area) - len(current)} result(s) published more than "
+                f"{get_settings().recency_max_age_days} days ago",
+            )
+        return current
 
     while True:
         # Step A: Search subagent executes the query batch (incumbents filtered out by scale)
         round_results = await search_agent.run(queries, round_number=current_retries)
-        accumulated_search_results.extend(filter_out_of_scale_results(round_results, scale_signals))
+        accumulated_search_results.extend(await _filtered(round_results))
 
         # Step B: Identify who the competitors are. This precedes the crawl so the page budget
         # can be aimed at the shortlist; selecting crawl targets from raw search results spread
@@ -634,8 +841,98 @@ async def execute_research_loop(
             merchant_context.get("known_competitors") or [],
         )
 
+        # The list is settled once, from the first search, before any deep work starts. Later
+        # rounds only deepen these rivals; anyone they newly surface joins the bench. Letting
+        # the shortlist re-rank each round swapped rivals mid-run, so crawl and ad lookups
+        # were spent on companies that then fell off the report.
+        if locked_names is None:
+            # One category query cannot surface every serious rival, so before locking, ask who
+            # competes with the strongest names found. A rival missed by the first query but
+            # known as an alternative to the leaders gets ranked before the list is settled
+            # rather than landing on the bench after deep work has started.
+            # Repeats while it keeps surfacing new strong names; stops once an iteration adds
+            # nothing to the top 10, or after research_discovery_iterations.
+            expanded: set[str] = set()
+            for iteration in range(1, settings.research_discovery_iterations + 1):
+                leaders = [
+                    c.product_name for c in preliminary_competitors[:10] if c.product_name not in expanded
+                ][:3]
+                if not leaders:
+                    break
+                expanded.update(leaders)
+                top_before = {c.product_name for c in preliminary_competitors[:10]}
+                expansion = [
+                    SearchQuery(
+                        vector="alternative_discovery",
+                        query=f'"{name}" (alternatives OR competitors OR "similar companies")',
+                        time_range="year",
+                    )
+                    for name in leaders
+                ]
+                accumulated_search_results.extend(
+                    await _filtered(await search_agent.run(expansion, round_number=current_retries))
+                )
+                preliminary_competitors = rank_competitors(
+                    extract_preliminary_competitors(
+                        accumulated_search_results, merchant_context.get("known_competitors") or []
+                    ),
+                    accumulated_search_results,
+                    merchant_context.get("known_competitors") or [],
+                )
+                new_strong = {c.product_name for c in preliminary_competitors[:10]} - top_before
+                await _report(
+                    on_progress,
+                    f"[DISCOVERY] Iteration {iteration}: alternatives to {', '.join(leaders)} -> "
+                    f"{len(preliminary_competitors)} candidates, {len(new_strong)} new in the top 10",
+                )
+                if not new_strong:
+                    break
+
+            # Mention counts cannot tell a rival from a directory or a neighbouring category;
+            # the final pick is by fit with the merchant's own category.
+            if judge_category_fit is not None:
+                try:
+                    preliminary_competitors = await judge_category_fit(preliminary_competitors)
+                except Exception as exc:
+                    logger.warning("Category-fit judge hook failed: %s", exc)
+                fit_verdicts = {
+                    c.product_name: (c.relevance_score, c.relevance_reason)
+                    for c in preliminary_competitors
+                    if c.relevance_reason
+                }
+            locked_names = [
+                c.product_name for c in preliminary_competitors[: settings.research_deep_crawl_competitors]
+            ]
+            await _report(
+                on_progress,
+                f"[COMPETITOR_LIST] {len(preliminary_competitors)} competitor(s) found; deep research "
+                f"and ad search on: {', '.join(locked_names)}",
+            )
+        else:
+            # Profiles are rebuilt each round, so re-apply the judge's verdicts: locked rivals
+            # first, then the bench with judged misfits last.
+            for c in preliminary_competitors:
+                if c.product_name in fit_verdicts:
+                    c.relevance_score, c.relevance_reason = fit_verdicts[c.product_name]
+            order = {name: i for i, name in enumerate(locked_names)}
+            preliminary_competitors.sort(
+                key=lambda c: (
+                    order.get(c.product_name, len(order)),
+                    c.product_name in fit_verdicts and fit_verdicts[c.product_name][0] < 0.4,
+                )
+            )
+
+        # Deep crawl and ad search start together on the same settled list. Ad lookups need
+        # only names; a failure there must not abort the research loop.
+        if on_first_competitors is not None and preliminary_competitors:
+            try:
+                await on_first_competitors(list(preliminary_competitors))
+            except Exception as exc:
+                logger.warning("on_first_competitors hook failed: %s", exc)
+            on_first_competitors = None
+
         # Step C: Deep-crawl the shortlist's own domains, several pages each.
-        shortlist = preliminary_competitors[: settings.research_deep_crawl_competitors]
+        shortlist = [c for c in preliminary_competitors if c.product_name in locked_names]
         target_urls = extract_competitor_target_urls(
             shortlist,
             accumulated_search_results,
@@ -650,23 +947,14 @@ async def execute_research_loop(
                 f"({', '.join(c.brand_name for c in shortlist[:5])})",
             )
         accumulated_source_urls = list({r.url for r in accumulated_search_results} | set(target_urls))
-        accumulated_extracted_pages.extend(await crawl_agent.run(target_urls))
+        new_pages = await crawl_agent.run(target_urls)
+        accumulated_extracted_pages.extend(new_pages)
 
         # Crawled pages carry the pricing and claims the snippets lacked, so profiles are
         # rebuilt from the enlarged evidence set before they are scored.
         preliminary_competitors = enrich_competitors_from_pages(
             preliminary_competitors, accumulated_extracted_pages
         )
-
-        # Ad-library lookups need only competitor names, which exist from the first round.
-        # Handing them over now lets the caller run that work alongside the remaining rounds
-        # instead of after them; a failure there must not abort the research loop.
-        if on_first_competitors is not None and preliminary_competitors:
-            try:
-                await on_first_competitors(list(preliminary_competitors))
-            except Exception as exc:
-                logger.warning("on_first_competitors hook failed: %s", exc)
-            on_first_competitors = None
 
         # Step D: Dynamically update parameter taxonomy from crawled text
         raw_corpus = [r.snippet for r in accumulated_search_results] + [
@@ -752,8 +1040,10 @@ async def execute_research_loop(
         # be rescued by running the same play again, and each extra round costs a search plus a
         # crawl and enlarges the synthesis corpus. Observed going 32 -> 44 -> 48 -> 48 with DQS
         # 0.77 -> 0.77 -> 0.76 -> 0.76: the last round was pure cost.
+        # A round that crawled nothing new is also a plateau even if the count grew: growth past
+        # the shortlist only adds bench names, which get no deep research this run.
         if (
-            len(preliminary_competitors) <= last_competitor_count
+            (len(preliminary_competitors) <= last_competitor_count or not new_pages)
             and dqs_result.score <= last_dqs_score + _PLATEAU_DQS_EPSILON
             and len(preliminary_competitors) >= settings.research_min_competitors
         ):

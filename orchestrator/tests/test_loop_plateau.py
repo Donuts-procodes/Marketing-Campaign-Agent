@@ -31,12 +31,14 @@ class _StubSearch:
 
     def __init__(self, per_round: list[int]) -> None:
         self.per_round = per_round
-        self.rounds_run = 0
+        self.rounds_run = 0  # search calls, discovery passes included
+        self.loop_rounds: set[int] = set()  # research rounds, by round number
         self.errors = []
 
     async def run(self, queries: list[Any], round_number: int = 0) -> list[TavilySearchResult]:
         count = self.per_round[min(self.rounds_run, len(self.per_round) - 1)]
         self.rounds_run += 1
+        self.loop_rounds.add(round_number)
         return [
             TavilySearchResult(
                 vector="alternative_discovery",
@@ -81,7 +83,7 @@ async def test_plateau_stops_before_exhausting_retries():
     )
 
     # Round 0 establishes the baseline, round 1 detects the plateau and breaks.
-    assert search.rounds_run == 2, "should stop as soon as a round adds nothing"
+    assert search.loop_rounds == {0, 1}, "should stop as soon as a round adds nothing"
     assert result.retries_used < 3
 
 
@@ -140,6 +142,29 @@ async def test_first_competitors_hook_fires_once_and_early():
 
     assert len(calls) == 1, "hook must fire exactly once"
     assert calls[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_list_is_settled_before_deep_crawl_and_ads_start():
+    """Discovery finishes (first search + alternatives pass) before any crawl or ad lookup."""
+    search = _StubSearch(per_round=[8])
+    crawl = _StubCrawl()
+    seen_at_hook: list[tuple[int, int]] = []
+
+    async def _hook(competitors: list[Any]) -> None:
+        seen_at_hook.append((search.rounds_run, crawl.calls))
+
+    await execute_research_loop(
+        merchant_context={"product_name": "Acme", "category": "CRM"},
+        initial_taxonomy=_taxonomy(),
+        search_agent=search,
+        crawl_agent=crawl,
+        on_first_competitors=_hook,
+    )
+
+    searches, crawls = seen_at_hook[0]
+    assert searches >= 2, "the alternatives discovery pass must run before the list is locked"
+    assert crawls == 0, "ad search must start together with the deep crawl, not after it"
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import date
 from dataclasses import dataclass, replace
+from urllib.parse import urlparse
 from typing import Any, Literal
 
 from orchestrator.agents.market_research.analysis.scoring import PLACEHOLDER_PRICING
@@ -119,15 +121,196 @@ class ScaleSignals:
     exclude_terms: tuple[str, ...]  # incumbent names to negate in discovery
 
 
+@dataclass(frozen=True)
+class GeoSignals:
+    """Where the merchant actually sells, used to keep discovery inside that market."""
+
+    raw: str  # the merchant's stated target_geography, verbatim
+    terms: tuple[str, ...]  # place names that mark a result as local ("delhi", "india", "ncr")
+    cctlds: tuple[str, ...]  # country-code domains that mark a result as local (".in")
+    strict: bool  # drop foreign results outright, rather than only demote them
+
+
+#: Country-code TLDs and the place words that imply them. Only entries where a ccTLD is a
+#: reliable signal of serving that market; ".co" and ".io" are generic and deliberately absent.
+_GEO_TLDS: dict[str, tuple[str, ...]] = {
+    "india": (".in", ".co.in"),
+    "united kingdom": (".uk", ".co.uk"),
+    "uk": (".uk", ".co.uk"),
+    "australia": (".au", ".com.au"),
+    "canada": (".ca",),
+    "germany": (".de",),
+    "france": (".fr",),
+    "singapore": (".sg",),
+    "united arab emirates": (".ae",),
+    "uae": (".ae",),
+    "japan": (".jp", ".co.jp"),
+    "brazil": (".br", ".com.br"),
+    "netherlands": (".nl",),
+    "spain": (".es",),
+    "italy": (".it",),
+    "south africa": (".za", ".co.za"),
+    "new zealand": (".nz", ".co.nz"),
+}
+
+#: Major cities mapped to the country they sit in, so "Delhi" also accepts "India" and ".in".
+_CITY_COUNTRY: dict[str, str] = {
+    "delhi": "india", "new delhi": "india", "noida": "india", "gurgaon": "india",
+    "gurugram": "india", "mumbai": "india", "bangalore": "india", "bengaluru": "india",
+    "hyderabad": "india", "chennai": "india", "pune": "india", "kolkata": "india",
+    "ahmedabad": "india", "jaipur": "india",
+    "london": "united kingdom", "manchester": "united kingdom", "birmingham": "united kingdom",
+    "sydney": "australia", "melbourne": "australia",
+    "toronto": "canada", "vancouver": "canada",
+    "dubai": "united arab emirates", "abu dhabi": "united arab emirates",
+    "berlin": "germany", "munich": "germany", "paris": "france",
+    "singapore": "singapore", "tokyo": "japan", "amsterdam": "netherlands",
+}
+
+#: Place words that mark a result as serving somewhere else. Used only to detect a conflict,
+#: never on their own: a page naming a foreign city is dropped only when it names no target one.
+_FOREIGN_MARKERS: tuple[str, ...] = (
+    "new york", "nyc", "san francisco", "los angeles", "chicago", "boston", "seattle",
+    "austin", "miami", "denver", "atlanta", "dallas", "houston", "toronto", "vancouver",
+    "london", "manchester", "dublin", "berlin", "munich", "paris", "amsterdam", "madrid",
+    "barcelona", "milan", "stockholm", "zurich", "sydney", "melbourne", "auckland",
+    "singapore", "dubai", "tokyo", "hong kong", "shanghai", "sao paulo",
+    "delhi", "new delhi", "mumbai", "bangalore", "bengaluru", "hyderabad", "chennai",
+    "pune", "kolkata", "noida", "gurgaon", "gurugram",
+)
+
+
+def derive_geo_signals(
+    merchant_context: dict[str, Any], archetype: str | None = None
+) -> GeoSignals:
+    """
+    Reads the merchant's target market into something discovery can filter on.
+
+    `target_geography` was only ever pasted into the discovery query as a quoted keyword, and
+    semantic search engines treat that as a hint rather than a constraint -- which is how a
+    merchant selling in Delhi ends up with New York and London rivals. This produces the terms
+    a deterministic post-filter can check instead.
+
+    Strictness follows the archetype: a local trade or an agency competes inside its city, so
+    a foreign result is simply wrong. Software and e-commerce routinely cross borders, so there
+    the same signal only demotes a result rather than removing it.
+    """
+    raw = str(merchant_context.get("target_geography") or "").strip()
+    if not raw:
+        return GeoSignals(raw="", terms=(), cctlds=(), strict=False)
+
+    lowered = raw.lower()
+    # "Delhi NCR, India" -> each part is a usable match term.
+    parts = [p.strip() for p in re.split(r"[,/|&]| and ", lowered) if p.strip()]
+    terms: list[str] = []
+    cctlds: list[str] = []
+
+    for part in parts:
+        if part not in terms:
+            terms.append(part)
+        country = _CITY_COUNTRY.get(part)
+        if country:
+            if country not in terms:
+                terms.append(country)
+            cctlds.extend(_GEO_TLDS.get(country, ()))
+        cctlds.extend(_GEO_TLDS.get(part, ()))
+
+    if archetype is None:
+        archetype = resolve_archetype(merchant_context, f"{merchant_context.get('category','')}".lower())
+
+    # Global / worldwide targets are not a location constraint at all.
+    if any(t in ("global", "worldwide", "international", "anywhere") for t in terms):
+        return GeoSignals(raw=raw, terms=(), cctlds=(), strict=False)
+
+    return GeoSignals(
+        raw=raw,
+        terms=tuple(dict.fromkeys(terms)),
+        cctlds=tuple(dict.fromkeys(cctlds)),
+        strict=archetype in (ARCH_LOCAL, ARCH_SERVICE),
+    )
+
+
+def filter_out_of_area_results(
+    results: list[TavilySearchResult],
+    geo: GeoSignals,
+) -> list[TavilySearchResult]:
+    """
+    Drops discovery results that clearly serve a different market than the merchant's.
+
+    A result is removed only when it names a foreign place and names none of the merchant's own
+    -- an explicit conflict. A page with no location signal at all is kept, because most company
+    sites never state one and dropping them would gut recall to buy a little precision.
+
+    Geography is judged on the discovery vector, since that is where a rival is proposed. Other
+    vectors are then dropped only for hosts discovery rejected -- without that, a competitor
+    removed as out-of-area walks straight back in through its own pricing page, because
+    `extract_preliminary_competitors` reads every vector, not just discovery.
+    """
+    if not geo.strict or not geo.terms:
+        return results
+
+    local_pattern = re.compile(
+        r"\b(" + "|".join(re.escape(t) for t in geo.terms) + r")\b", flags=re.IGNORECASE
+    )
+    foreign = tuple(f for f in _FOREIGN_MARKERS if f not in geo.terms)
+    if not foreign:
+        return results
+    foreign_pattern = re.compile(
+        r"\b(" + "|".join(re.escape(f) for f in foreign) + r")\b", flags=re.IGNORECASE
+    )
+
+    def _host(url: str) -> str:
+        try:
+            return (urlparse(url).hostname or "").removeprefix("www.").lower()
+        except Exception:
+            return ""
+
+    kept: list[TavilySearchResult] = []
+    rejected_hosts: set[str] = set()
+
+    for r in results:
+        if r.vector != "alternative_discovery":
+            continue
+
+        haystack = f"{r.title} {r.snippet} {r.url}"
+        host = _host(r.url)
+
+        if geo.cctlds and host.endswith(tuple(geo.cctlds)):
+            kept.append(r)  # a local ccTLD settles it
+        elif local_pattern.search(haystack):
+            kept.append(r)
+        elif foreign_pattern.search(haystack):
+            logger.debug("Geo filter dropped out-of-area result: %s", r.url)
+            if host:
+                rejected_hosts.add(host)
+        else:
+            kept.append(r)  # no location signal either way: keep
+
+    # A host discovery accepted anywhere stays accepted: one listicle naming a foreign city
+    # must not disqualify a competitor another result placed locally.
+    accepted_hosts = {_host(r.url) for r in kept}
+    rejected_hosts -= accepted_hosts
+
+    for r in results:
+        if r.vector == "alternative_discovery":
+            continue
+        if _host(r.url) in rejected_hosts:
+            logger.debug("Geo filter dropped %s evidence for rejected host: %s", r.vector, r.url)
+            continue
+        kept.append(r)
+
+    return kept
+
+
 #: Pricing vocabulary per archetype. A services buyer searches for rates and retainers; a
 #: shopper searches for discounts. Keyed by archetype so every stage agrees on which applies.
 _PRICING_TERMS: dict[str, str] = {
     ARCH_SERVICE: 'pricing OR price OR rates OR fees OR retainer OR "cost"',
     ARCH_LOCAL: 'pricing OR price OR rates OR fees OR "cost" OR quote',
-    ARCH_ECOMMERCE: "pricing OR price OR cost OR tiers OR discount",
+    ARCH_ECOMMERCE: 'pricing OR price OR "MSRP" OR cost OR "buy" OR shop OR discount OR "$"',
     ARCH_CREATOR: "pricing OR price OR cost OR enrollment OR tuition",
     ARCH_SAAS: "pricing OR price OR cost OR tiers OR plans",
-    ARCH_OTHER: "pricing OR price OR cost OR tiers OR plans",
+    ARCH_OTHER: 'pricing OR price OR cost OR "MSRP" OR tiers OR plans OR "$"',
 }
 
 #: Where this archetype's customers actually complain.
@@ -278,6 +461,45 @@ def filter_out_of_scale_results(
     return kept
 
 
+_RECENCY_HALF_LIFE_DAYS = 180
+# ponytail: an undated page is scored as if ~3 months old — ranks below anything provably
+# newer, above anything provably older. Upgrade path: fetch the page's own date meta.
+_UNDATED_AGE_DAYS = 90
+
+
+def rank_by_recency(
+    results: list[TavilySearchResult],
+    *,
+    max_age_days: int,
+    today: date | None = None,
+) -> list[TavilySearchResult]:
+    """
+    Weights each result's score by how close its publication date is to today and returns
+    them newest-weighted first. A result the search provider itself dates older than
+    `max_age_days` is dropped. Dates guessed from snippet text only lower the rank, never
+    drop: a snippet saying "since 2019" is not a 2019 page.
+    """
+    from orchestrator.agents.market_research.analysis.freshness import (
+        extract_publication_date,
+        parse_iso_date,
+    )
+    from orchestrator.core.clock import today as clock_today
+
+    ref = today or clock_today()
+    kept: list[TavilySearchResult] = []
+    for r in results:
+        provider_date = parse_iso_date(r.published_date)
+        if provider_date and (ref - provider_date).days > max_age_days:
+            logger.debug("Dropping stale result (%s): %s", provider_date, r.url)
+            continue
+        dated = provider_date or extract_publication_date(f"{r.title} {r.snippet}")
+        age = max(0, (ref - dated).days) if dated else _UNDATED_AGE_DAYS
+        r.score = round(r.score * 0.5 ** (age / _RECENCY_HALF_LIFE_DAYS), 4)
+        kept.append(r)
+    kept.sort(key=lambda r: r.score, reverse=True)
+    return kept
+
+
 _ARCHETYPE_CATEGORY_FALLBACKS: dict[str, str] = {
     ARCH_SAAS: "B2B SaaS Software",
     ARCH_SERVICE: "Professional Services Agency",
@@ -298,7 +520,7 @@ def _clean_search_category(category: str, archetype: str) -> str:
     Sanitizes category token for search queries so conversational phrases
     are never quoted verbatim in search engines.
     """
-    clean = str(category or "").strip()
+    clean = (category.strip() or "").strip()
     if not clean:
         return _ARCHETYPE_CATEGORY_FALLBACKS.get(archetype, "B2B Services")
     from orchestrator.agents.market_research.analysis.classification import is_conversational_statement
@@ -314,7 +536,7 @@ def _clean_search_category(category: str, archetype: str) -> str:
 
 def _clean_search_product(product_name: str, fallback_category: str) -> str:
     """Sanitizes product name so sentences are not quoted verbatim."""
-    prod = str(product_name or "").strip()
+    prod = (product_name or "").strip()
     if not prod:
         return fallback_category
     from orchestrator.agents.market_research.analysis.classification import is_conversational_statement
@@ -359,6 +581,10 @@ def build_search_queries(
     if taxonomy and taxonomy.critical_jtbd_drivers:
         crit_keywords = " ".join(taxonomy.critical_jtbd_drivers[:3])
 
+    # A quoted place name is a hint, not a constraint -- semantic engines routinely ignore it,
+    # which is why filter_out_of_area_results exists. The clause still helps steer the engine,
+    # so it is kept and now also applied to the gripe and claims vectors, where a local
+    # merchant's rivals are discussed in local forums and local press.
     geo_clause = f' "{target_geography}"' if target_geography else ""
 
     scale = derive_scale_signals(merchant_context, context_str)
@@ -385,17 +611,16 @@ def build_search_queries(
     else:
         gripe_query = (
             f'({gripe_site_filter}) '
-            f'"{category}" (complaint OR issue OR problem OR limitation OR negative review)'
+            f'"{category}" (complaint OR issue OR problem OR limitation OR negative review){geo_clause}'
         )
 
     if competitor_names:
         claims_target = f'({competitor_names})'
     else:
         claims_target = f'"{product_name}"'
-    claims_query = f'{claims_target} "{category}" (tagline OR slogan OR "value proposition" OR "why choose")'
+    claims_query = f'{claims_target} "{category}" (tagline OR slogan OR "value proposition" OR "why choose"){geo_clause}'
 
     # Update runs override time_range to "month" so only recent changes are fetched.
-    # Gripe mining keeps no override (complaints don't expire).
     tr_discovery = time_range_override or "year"
     tr_pricing = time_range_override or "year"
     tr_claims = time_range_override or "year"
@@ -404,11 +629,12 @@ def build_search_queries(
         # Broadened discovery vector capturing alternatives, rivals, and top category picks
         SearchQuery(vector="alternative_discovery", query=discovery_query, time_range=tr_discovery),
         SearchQuery(vector="pricing_scrape", query=pricing_query, time_range=tr_pricing),
-        # Complaints age well — an older thread is still valid evidence of a weakness.
+        # A complaint about a product as it was two years ago may already be fixed.
         SearchQuery(
             vector="gripe_mining",
             query=gripe_query,
             include_domains=gripe_domains,
+            time_range=time_range_override or "year",
         ),
         SearchQuery(vector="messaging_claims", query=claims_query, time_range=tr_claims),
     ]
@@ -440,35 +666,48 @@ def build_missing_data_queries(
     queries: list[SearchQuery] = []
 
     # 1. Target rivals missing pricing model
-    unpriced = [c.brand_name for c in competitors if not c.pricing_model or c.pricing_model == PLACEHOLDER_PRICING]
-    if unpriced:
-        brand_terms = " OR ".join(f'"{b}"' for b in unpriced[:3])
+    unpriced_comps = [c for c in competitors if not c.pricing_model or c.pricing_model == PLACEHOLDER_PRICING]
+    for comp in unpriced_comps[:4]:
+        prod = comp.product_name if comp.product_name and comp.product_name != "Product" else comp.brand_name
         queries.append(
             SearchQuery(
                 vector="pricing_scrape",
-                query=f'({brand_terms}) ({price_keywords}) "{category}"',
+                query=f'"{comp.brand_name}" "{prod}" ({price_keywords})',
+                time_range="year",
+            )
+        )
+        # Dedicated price check query without restrictive quotes in case brand and product are merged
+        queries.append(
+            SearchQuery(
+                vector="pricing_scrape",
+                query=f'{comp.brand_name} {prod} price cost MSRP buy',
                 time_range="year",
             )
         )
 
     # 2. Target rivals missing real user complaints/weaknesses.
-    # Two passes: brand-specific first, then a broader category-level search across the
-    # full gripe domain list so lesser-known competitors that have no reviews by name
-    # still surface category-wide friction points the synthesis can attribute.
-    missing_gripes = [c.brand_name for c in competitors if not c.weaknesses_mined]
-    if missing_gripes:
-        brand_terms = " OR ".join(f'"{b}"' for b in missing_gripes[:3])
-        # Use all gripe domains in this retry, not just the primary 3.
-        all_gripe_site_filter = " OR ".join(f"site:{d}" for d in review_domains)
+    missing_gripes = [c for c in competitors if not c.weaknesses_mined]
+    all_gripe_site_filter = " OR ".join(f"site:{d}" for d in review_domains)
+    for comp in missing_gripes[:3]:
+        prod = comp.product_name if comp.product_name and comp.product_name != "Product" else comp.brand_name
         queries.append(
             SearchQuery(
                 vector="gripe_mining",
-                query=f'({all_gripe_site_filter}) ({brand_terms}) (complaint OR issue OR downside OR problem OR "not worth" OR "bad experience")',
+                query=f'({all_gripe_site_filter}) "{comp.brand_name}" "{prod}" (complaint OR issue OR downside OR problem OR "not worth" OR "bad experience" OR negative)',
                 include_domains=review_domains,
             )
         )
-        # Category-level fallback: when brand has no reviews at all, look for what
-        # customers dislike about the category in general — still useful signal.
+        queries.append(
+            SearchQuery(
+                vector="gripe_mining",
+                query=f'({all_gripe_site_filter}) {comp.brand_name} {prod} review complaint problem',
+                include_domains=review_domains,
+            )
+        )
+
+    # Category-level fallback: when brand has no reviews at all, look for what
+    # customers dislike about the category in general — still useful signal.
+    if missing_gripes:
         queries.append(
             SearchQuery(
                 vector="gripe_mining",
@@ -478,13 +717,13 @@ def build_missing_data_queries(
         )
 
     # 3. Target rivals missing core claims or specs
-    missing_specs = [c.brand_name for c in competitors if not c.core_claims or not c.factual_evidence]
-    if missing_specs:
-        brand_terms = " OR ".join(f'"{b}"' for b in missing_specs[:4])
+    missing_specs = [c for c in competitors if not c.core_claims or not c.factual_evidence]
+    for comp in missing_specs[:3]:
+        prod = comp.product_name if comp.product_name and comp.product_name != "Product" else comp.brand_name
         queries.append(
             SearchQuery(
                 vector="messaging_claims",
-                query=f'({brand_terms}) "{category}" (features OR capabilities OR specifications OR "what is" OR overview)',
+                query=f'"{comp.brand_name}" "{prod}" (features OR specifications OR specs OR capabilities OR "what is" OR overview)',
                 time_range="year",
             )
         )
@@ -619,6 +858,7 @@ async def execute_you_search(
                     # You.com returns ranked results without a score; derive one from rank.
                     score=round(max(0.3, 0.75 - rank * 0.03), 3),
                     provider="you",
+                    published_date=hit.get("page_age"),
                 )
             )
         return results
@@ -647,7 +887,9 @@ class DuckDuckGoSearchClient:
             from duckduckgo_search import DDGS  # older package name
         return DDGS
 
-    async def search(self, query: str, max_results: int = 10) -> list[dict[str, Any]]:
+    async def search(
+        self, query: str, max_results: int = 10, timelimit: str | None = None
+    ) -> list[dict[str, Any]]:
         loop_id = id(asyncio.get_running_loop())
         semaphore = self._semaphores.get(loop_id)
         if semaphore is None:
@@ -656,8 +898,17 @@ class DuckDuckGoSearchClient:
         ddgs_cls = self._ddgs_class()
         async with semaphore:
             return await asyncio.to_thread(
-                lambda: list(ddgs_cls().text(query, region=self.region, max_results=max_results) or [])
+                lambda: list(
+                    ddgs_cls().text(
+                        query, region=self.region, max_results=max_results, timelimit=timelimit
+                    )
+                    or []
+                )
             )
+
+
+# Tavily time_range -> DuckDuckGo timelimit.
+_DDG_TIMELIMIT = {"day": "d", "week": "w", "month": "m", "year": "y"}
 
 
 _DDG_OPERATORS = {"or", "and", "not"}
@@ -693,9 +944,19 @@ async def execute_duckduckgo_search(
         attempts = _ddg_queries(query.query)
         if query.include_domains and attempts:
             attempts = [f"{attempts[-1]} site:{query.include_domains[0]}"] + attempts
+        timelimit = _DDG_TIMELIMIT.get(query.time_range or "")
         for attempt in attempts:
             try:
-                hits = await ddg_client.search(attempt, max_results=settings.duckduckgo_max_results)
+                if timelimit:
+                    try:
+                        hits = await ddg_client.search(
+                            attempt, max_results=settings.duckduckgo_max_results, timelimit=timelimit
+                        )
+                    except TypeError:
+                        # A stub client without timelimit: the recency re-rank still applies.
+                        hits = await ddg_client.search(attempt, max_results=settings.duckduckgo_max_results)
+                else:
+                    hits = await ddg_client.search(attempt, max_results=settings.duckduckgo_max_results)
             except Exception as exc:
                 logger.info("DuckDuckGo search returned nothing for vector=%s (%r): %s", query.vector, attempt, exc)
                 hits = []
