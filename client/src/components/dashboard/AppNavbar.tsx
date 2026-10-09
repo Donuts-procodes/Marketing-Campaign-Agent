@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { PlusCircle, RefreshCw, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { GlobalSettingsModal } from "./GlobalSettingsModal";
+import { LiveTokenTracker } from "./LiveTokenTracker";
 
 export interface NavSection {
   id: string;
@@ -68,6 +69,7 @@ export const AppNavbar: React.FC<AppNavbarProps> = ({
         )}
 
         <div className="flex items-center gap-2.5 shrink-0">
+          <LiveTokenTracker onClick={() => setIsSettingsOpen(true)} />
           {connectionStatus && (
             <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-white/5 border border-white/10 text-zinc-300">
               <span

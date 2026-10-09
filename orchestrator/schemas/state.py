@@ -39,6 +39,14 @@ class StrategyState(TypedDict, total=False):
     prior_run_at: str | None
     """ISO datetime string of when the prior run finished. Used to bound time-range queries."""
 
+    baseline_report: SWOTReportDelta | None
+    """The last finished run for the same product, loaded on EVERY run (fresh or update).
+    Read only by the wedge scan and threat watch, which need a previous reading to measure
+    movement; it is never merged into a fresh run's findings."""
+
+    baseline_run_at: str | None
+    """ISO datetime of when baseline_report's run finished; the start of the momentum window."""
+
     bench_competitors: list
     """Competitors the research loop discovered but the top-N cut-off excluded. Served by
     'find more competitors' before any new search is run."""

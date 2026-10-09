@@ -1,3 +1,4 @@
+@import "./workspace.css";
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -86,6 +87,7 @@
     white-space: normal !important;
     display: block !important;
     -webkit-line-clamp: unset !important;
+    line-clamp: unset !important;
     text-overflow: clip !important;
   }
 

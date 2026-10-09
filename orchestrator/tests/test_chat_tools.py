@@ -67,7 +67,14 @@ async def test_edit_is_proposed_as_a_card_and_the_report_is_not_touched():
     frames = [json.loads(f.removeprefix("data: ").strip()) async for f in stream_report_chat(
         llm, report, MERCHANT, [ChatMessage(role="user", content="that complaint is wrong, remove it")])]
 
-    assert llm.bound == ["verify_claim", "propose_refresh", "propose_research_competitors", "propose_edit"]
+    assert set(llm.bound) == {
+        "lookup_competitor_intel",
+        "verify_claim",
+        "propose_refresh",
+        "propose_research_competitors",
+        "propose_edit",
+        "propose_update_merchant_context",
+    }
     action = next(f["action"] for f in frames if "action" in f)
     assert action["kind"] == "edit" and action["payload"]["edits"][0]["op"] == "remove_item"
     assert "Onboarding was slow" in action["detail"]
@@ -137,3 +144,4 @@ async def test_tool_loop_is_bounded():
     frames = await _run(llm)
     assert len(llm.prompts) == 4, "a reply may not call tools forever"
     assert frames[-1] == {"done": True}
+

@@ -48,6 +48,8 @@ Your job is to fill in the following fields as best you can:
 
 - price_usd: only if an explicit USD price is stated. Otherwise null.
 
+- target_geography: target city, state, country, or market if mentioned or clearly implied (e.g. 'Delhi', 'Austin, TX', 'United States', 'Global'). If the product is localized to a city/region, capture that location. If purely online/worldwide software with no location stated, null.
+
 Always return something useful for goal — it is the most reliably present field.
 For product_name, returning null is correct and honest when no product is named.
 """

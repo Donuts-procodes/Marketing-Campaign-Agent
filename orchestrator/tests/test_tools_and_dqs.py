@@ -213,7 +213,8 @@ class TestQueryGeneration:
         queries = build_search_queries(ctx)
         assert len(queries) == 4
         pricing_q = next(q for q in queries if q.vector == "pricing_scrape")
-        assert self.MOCK_CONTEXT["product_name"] in pricing_q.query
+        assert self.MOCK_CONTEXT["category"] in pricing_q.query
+        assert self.MOCK_CONTEXT["product_name"] not in pricing_q.query
 
     def test_all_queries_use_advanced_depth(self):
         queries = build_search_queries(self.MOCK_CONTEXT)

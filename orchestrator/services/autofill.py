@@ -29,15 +29,32 @@ Extract ONLY what the documents explicitly state about the merchant's product.
 - known_competitors: only competitor names that appear in the documents.
 - price_usd: only if a USD price for the merchant's product is written; otherwise null.
 - primary_value_prop and goal: stay close to the documents' own wording.
+- target_geography: specific target city, state, country, or service region if explicitly stated (e.g. 'Delhi', 'Austin, TX', 'United States', 'Global').
 """
 
 
 def _verify(fields: AutofillFields, text: str) -> AutofillFields:
     """Drops names and prices the documents do not actually contain."""
     lower = text.lower()
-    if fields.product_name and fields.product_name.lower() not in lower:
-        fields.product_name = None
-    fields.known_competitors = [c for c in fields.known_competitors if c.strip() and c.lower() in lower][:20]
+    clean_text = re.sub(r"[^\w\s]", " ", lower)
+    if fields.product_name:
+        prod_lower = fields.product_name.lower()
+        clean_prod = re.sub(r"[^\w\s]", " ", prod_lower).strip()
+        tokens = [t for t in clean_prod.split() if len(t) >= 3]
+        if prod_lower not in lower and clean_prod not in clean_text and not (tokens and all(t in clean_text for t in tokens)):
+            fields.product_name = None
+
+    verified_competitors = []
+    for c in fields.known_competitors:
+        if not c.strip():
+            continue
+        c_lower = c.strip().lower()
+        clean_c = re.sub(r"[^\w\s]", " ", c_lower).strip()
+        tokens = [t for t in clean_c.split() if len(t) >= 3]
+        if c_lower in lower or clean_c in clean_text or (tokens and all(t in clean_text for t in tokens)):
+            verified_competitors.append(c.strip())
+    fields.known_competitors = verified_competitors[:20]
+
     fields.existing_customer_profiles = [p for p in fields.existing_customer_profiles if p.strip()][:20]
     if fields.price_usd is not None:
         digits = re.sub(r"(?<=\d),(?=\d)", "", text)

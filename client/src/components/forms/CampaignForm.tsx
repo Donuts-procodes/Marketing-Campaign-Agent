@@ -20,6 +20,7 @@ import {
   Bookmark,
   Check,
   Trash2,
+  MapPin,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -47,6 +48,7 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
   // Merchant State
   const [productName, setProductName] = useState("");
   const [category, setCategory] = useState("");
+  const [targetGeography, setTargetGeography] = useState("");
   const [primaryValueProp, setPrimaryValueProp] = useState("");
   const [goal, setGoal] = useState("");
   const [priceUsd, setPriceUsd] = useState<string>("");
@@ -125,6 +127,7 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
       };
       fill("product name", productName, fields.product_name, setProductName);
       fill("category", category, fields.category, setCategory);
+      fill("target geography", targetGeography, fields.target_geography, setTargetGeography);
       fill("value proposition", primaryValueProp, fields.primary_value_prop, setPrimaryValueProp);
       fill("goal", goal, fields.goal, setGoal);
       fill("price", priceUsd, fields.price_usd != null ? String(fields.price_usd) : null, setPriceUsd);
@@ -165,6 +168,7 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
     const merchant_context: MerchantContext = {
       product_name: productName.trim(),
       category: category.trim(),
+      target_geography: targetGeography.trim() || undefined,
       primary_value_prop: primaryValueProp.trim(),
       goal: goal.trim() || undefined,
       price_usd: priceUsd ? parseFloat(priceUsd) : undefined,
@@ -240,7 +244,7 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
           </h3>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="space-y-1.5">
             <label className="text-xs font-bold text-[#19191B]">
               Product Name <span className="text-rose-500">*</span>
@@ -267,6 +271,37 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
               placeholder="e.g. B2B Ergonomic Computer Peripherals"
               className="w-full px-4 py-2.5 rounded-2xl bg-[#FAF7EE] border border-[#EDE7D8] text-[#19191B] placeholder:text-zinc-400 text-xs font-medium focus:outline-none focus:border-[#19191B] focus:ring-1 focus:ring-[#19191B] transition"
             />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-xs font-bold text-[#19191B] flex items-center gap-1.5">
+              <MapPin className="w-3.5 h-3.5 text-rose-500" />
+              <span>Target Location / Geography</span>
+            </label>
+            <input
+              type="text"
+              value={targetGeography}
+              onChange={(e) => setTargetGeography(e.target.value)}
+              placeholder="e.g. Delhi, Austin TX, or Worldwide"
+              className="w-full px-4 py-2.5 rounded-2xl bg-[#FAF7EE] border border-[#EDE7D8] text-[#19191B] placeholder:text-zinc-400 text-xs font-medium focus:outline-none focus:border-[#19191B] focus:ring-1 focus:ring-[#19191B] transition"
+            />
+            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+              {["Delhi", "India", "United States", "Worldwide"].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setTargetGeography(preset)}
+                  className={cn(
+                    "px-2 py-0.5 rounded-md text-[10px] font-semibold border transition cursor-pointer",
+                    targetGeography.toLowerCase() === preset.toLowerCase()
+                      ? "bg-[#19191B] text-white border-[#19191B]"
+                      : "bg-white text-zinc-600 border-[#EDE7D8] hover:border-zinc-400"
+                  )}
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 

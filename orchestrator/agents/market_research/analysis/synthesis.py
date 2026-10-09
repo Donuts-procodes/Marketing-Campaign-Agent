@@ -110,10 +110,23 @@ a price, claim or product is current against THAT date, never against your own t
 this run. When a source carries a publication date, prefer the most recent source on a conflict and set as_of to \
 that date (YYYY-MM-DD). Do not describe data as "current" or "latest" when its source is visibly older than the \
 stated date — report what the source says and let as_of carry the age.
-11. FULL TABLE COMPLETION & MINIMUM 5 COMPETITORS: You MUST synthesize profiles for at least 5 distinct direct competitors \
-(or all discovered competitors if 5+ are available). NEVER artificially limit or truncate the list to 3 or 4. Ensure EVERY column \
-in the competitor profile table (brand_name, product_name, pricing_model, core_claims, weaknesses_mined, dynamic_attributes, \
-factual_evidence, sources, as_of) is populated from the provided extracts so the entire competitor matrix is completely filled with latest data.
+11. PRIORITIZE SUCCESSFUL COMPANIES WITH SIMILAR PRODUCTS & CREATE DETAILED PROFILES:
+- When selecting competitors to profile from the evidence corpus, prioritize companies offering similar products/services that have achieved proven commercial success (category leaders, breakout peers with marquee client rosters, high transaction volumes, or strong market reputations).
+- Build each competitor profile in exhaustive detail:
+  * brand_name & product_name: The company and specific competing product/service line.
+  * founded: Establishment year as stated in evidence (e.g., '2014').
+  * headquarters: City/country where their primary headquarters is located.
+  * operating_locations: Array of active branch locations, service regions, or countries where they operate.
+  * other_products & product_catalog_count: Other products, models, or service offerings in their catalog.
+  * pricing_model: Specific commercial rates, monthly plans, or project tiers.
+  * core_claims: 2-4 primary feature claims or value propositions from their web pages.
+  * strengths_mined: What users praise and what drove their commercial success.
+  * weaknesses_mined: Verified customer complaints, limitations, or missing capabilities.
+  * dynamic_attributes: Map every critical driver and specification to concrete evidence.
+  * relevance_reason: Explain why this successful rival's product directly competes with and benchmarks against the merchant.
+- Synthesize profiles for at least 5 distinct direct competitors (or all discovered if 5+ available). NEVER artificially truncate to 3 or 4. Ensure EVERY field is populated from the provided extracts so the entire competitor matrix is completely filled with latest data.
+12. NEVER INCLUDE THE MERCHANT ITSELF AS A COMPETITOR:
+- The merchant's own business, product, or domain must NEVER be listed as a competitor profile. Competitors must be independent third-party market rivals.
 
 {untrusted_protocol}
 """
@@ -204,13 +217,13 @@ async def synthesize_swot_with_llm(
     scale_context = ""
     if scale.tier not in ("unknown", "enterprise"):
         scale_context = (
-            f"## Peer-Scale Guidance\n"
+            f"## Peer & Breakout Scale Guidance\n"
             f"The merchant is a {scale.tier}-scale {scale.archetype} business. Prioritize competitors "
-            f"of comparable scale (similar team size, pricing tier, and customer segment). Treat global "
-            f"incumbents that merely dominate the category's search results — far larger firms the "
-            f"merchant does not realistically compete with — as out of scope: omit them from the "
-            f"competitor profiles even if they appear in the crawl data, unless the merchant named them "
-            f"as a known competitor. This is a scope filter only; never invent facts to fill the gap.\n\n"
+            f"that match this wedge, including both direct peers and 'Breakout Leap' rivals: category "
+            f"specialists that originated in this exact wedge/niche (e.g. boutique agencies or specialist tools) "
+            f"and successfully leaped to marquee enterprise clients, high contract values, and market scale. "
+            f"Exclude ONLY generic legacy conglomerates (e.g. IBM, Accenture, Deloitte) that never shared this "
+            f"specialized wedge origin. This is a scope filter only; never invent facts to fill the gap.\n\n"
         )
 
     prompt_context = dict(merchant_context)
@@ -247,6 +260,16 @@ async def synthesize_swot_with_llm(
         {"role": "user", "content": user_message},
     ])
 
-    if isinstance(result, SWOTReportDelta):
-        return result
-    return SWOTReportDelta.model_validate(result)
+    from orchestrator.agents.market_research.discovery.source_types import (
+        is_merchant_identity,
+        merchant_identifiers,
+    )
+
+    delta = result if isinstance(result, SWOTReportDelta) else SWOTReportDelta.model_validate(result)
+    m_keys, m_hosts = merchant_identifiers(merchant_context)
+    delta.competitors = [
+        c for c in delta.competitors
+        if not is_merchant_identity(c.brand_name, c.sources, m_keys, m_hosts)
+        and not is_merchant_identity(c.product_name, c.sources, m_keys, m_hosts)
+    ]
+    return delta

@@ -34,8 +34,11 @@ from orchestrator.schemas.api import (
     SessionDetailResponse,
     SessionListResponse,
     SessionSummary,
+    UpdateContextInput,
+    UpdateContextResponse,
     UploadedFileInfo,
 )
+from orchestrator.schemas.strategy import CampaignStrategyBrief
 from orchestrator.services.campaign_service import (
     CampaignInterruptNotFoundError,
     CampaignJobConflictError,
@@ -406,6 +409,7 @@ async def get_session(
             finished_at=finished_at.isoformat() if hasattr(finished_at, "isoformat") else (str(finished_at) if finished_at else None),
             merchant_context=job.merchant_context,
             swot_report=report,
+            strategy_brief=job.strategy_brief,
             events=events,
         )
     except CampaignJobNotFoundError as exc:
@@ -429,6 +433,36 @@ async def rename_session(
     rows = await service.list_sessions(limit=200)
     row = next((r for r in rows if r["job_id"] == job_id), None)
     return SessionSummary(**row) if row else SessionSummary(job_id=job_id, status="unknown", label=payload.label)
+
+
+@router.patch(
+    "/{job_id}/context",
+    response_model=UpdateContextResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update merchant campaign context or goal (Human-In-The-Loop)",
+)
+async def update_merchant_context(
+    job_id: str,
+    payload: UpdateContextInput,
+    service: CampaignService = Depends(get_campaign_service),
+) -> UpdateContextResponse:
+    try:
+        updated_context, applied = await service.update_merchant_context(
+            job_id=job_id,
+            field=payload.field,
+            value=payload.value,
+            reasoning=payload.reasoning,
+        )
+        return UpdateContextResponse(
+            status="ACCEPTED",
+            field=payload.field,
+            value=payload.value,
+            applied=applied,
+            merchant_context=updated_context,
+        )
+    except CampaignJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
 
 
 @router.delete(
@@ -559,3 +593,21 @@ async def chat_about_report(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post(
+    "/{job_id}/strategy/approve",
+    response_model=CampaignStrategyBrief,
+    status_code=status.HTTP_200_OK,
+    summary="Founder approval gate: approves campaign strategy brief for downstream execution",
+)
+async def approve_campaign_strategy(
+    job_id: str,
+    service: CampaignService = Depends(get_campaign_service),
+) -> CampaignStrategyBrief:
+    try:
+        return await service.approve_strategy(job_id)
+    except CampaignJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CampaignJobConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc

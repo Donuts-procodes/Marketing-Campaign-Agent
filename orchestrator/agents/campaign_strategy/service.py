@@ -8,12 +8,12 @@ Run with:
 
 from __future__ import annotations
 
+from orchestrator.agents.campaign_strategy.agent import execute_campaign_strategy
 from orchestrator.agents.microservice import create_agent_microservice
-from orchestrator.agents.stubs import stub_campaign_strategy_agent
 
 app = create_agent_microservice(
     agent_name="campaign_strategy",
-    execute_fn=stub_campaign_strategy_agent,
+    execute_fn=execute_campaign_strategy,
     description="Autonomous Campaign Strategy & Budget Decomposition Agent Microservice",
     version="1.0.0",
     service_endpoint="http://agent_campaign_strategy:8003",

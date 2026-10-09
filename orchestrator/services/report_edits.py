@@ -61,6 +61,15 @@ def apply_report_edits(report: SWOTReportDelta, edits: list[ReportEdit]) -> tupl
             )
             comp.pricing_model = value
             applied.append(f"Set {comp.brand_name}'s price to {value}" if value else f"Cleared {comp.brand_name}'s price")
+        elif edit.op == "set_rating":
+            value = (edit.value or "").strip() or None
+            comp.change_history.append(
+                CompetitorChange(
+                    observed_at=today, field="rating", previous=comp.rating, current=value, source="merchant"
+                )
+            )
+            comp.rating = value
+            applied.append(f"Set {comp.brand_name}'s rating to {value}" if value else f"Cleared {comp.brand_name}'s rating")
         else:  # remove_item
             if not edit.field or not edit.value:
                 raise ReportEditError("Removing an item needs the field and the item's text.")

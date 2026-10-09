@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from orchestrator.agents.market_research.analysis.grounding import build_documents, find_support_excerpt
 from orchestrator.agents.market_research.analysis.scoring import PLACEHOLDER_PRICING
-from orchestrator.schemas.research import SWOTReportDelta
+from orchestrator.schemas.research import FieldStatus, SWOTReportDelta
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,12 @@ def apply_rejections(
         comp = report.competitors[ci]
         if field == "pricing_model":
             diagnostics.append(f"[VALIDATOR] Removed price for {comp.brand_name} ({comp.pricing_model}): {r.reason}")
+            # Kept on the profile so the dashboard can say why the price is empty; profile
+            # completion then searches again and overwrites this if it finds a verified one.
+            comp.fact_status["pricing_model"] = FieldStatus(
+                status="removed",
+                reason=f"A price was found (“{comp.pricing_model[:60]}”) but removed: {r.reason}.",
+            )
             comp.pricing_model = None
             continue
         by_field.setdefault((ci, field), set()).add(ii)  # type: ignore[arg-type]

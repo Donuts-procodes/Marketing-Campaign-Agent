@@ -1,7 +1,7 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useCampaignStream } from "@/hooks/useCampaignStream";
-import { ChatAction, applyReportEdits, fetchMoreCompetitors, reResearchCampaign } from "@/lib/api-client";
+import { ChatAction, applyReportEdits, fetchMoreCompetitors, reResearchCampaign, updateMerchantContext } from "@/lib/api-client";
 import { exportToCSV, printDashboardReport } from "@/lib/exportReport";
 import { parseRunProgress } from "@/lib/runProgress";
 import { RivalView, confidenceOf, keyFacts, toRivalView } from "@/lib/rivalMetrics";
@@ -14,12 +14,14 @@ import { RivalDrawer } from "@/components/intel/RivalDrawer";
 import { ComparisonTable } from "@/components/intel/ComparisonTable";
 import { MarketBrief, MarketPanel } from "@/components/intel/MarketPanel";
 import { SourcesPanel } from "@/components/intel/SourcesPanel";
+import { WatchPanel } from "@/components/intel/WatchPanel";
 import { ChatWidget } from "@/components/intel/ChatWidget";
 import { Download, Loader2, Plus, Printer, RefreshCw, Search, Terminal, X } from "lucide-react";
 
 const SECTIONS: NavSection[] = [
   { id: "overview", label: "Overview" },
   { id: "rivals", label: "Rivals" },
+  { id: "watch", label: "Watch" },
   { id: "compare", label: "Compare" },
   { id: "market", label: "Market" },
   { id: "sources", label: "Sources" },
@@ -135,6 +137,26 @@ export function CampaignLivePage() {
     }
   };
 
+  // "Research deeper" on a niche candidate: promotes it into a full profile via find-more.
+  const handleResearchName = async (name: string) => {
+    if (!jobId || busy) return;
+    setBusy("more");
+    setNotice(null);
+    try {
+      const res = await fetchMoreCompetitors(jobId, [name]);
+      applyReport(res.swot_report);
+      setNotice(
+        res.added_competitors.length
+          ? { tone: "info", text: `Researched ${res.added_competitors.map((c) => c.brand_name).join(", ")} in depth.` }
+          : { tone: "info", text: `Could not find enough about ${name} to build a profile.` }
+      );
+    } catch (err) {
+      setNotice({ tone: "error", text: err instanceof Error ? err.message : `Could not research ${name}.` });
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const handleRerun = async () => {
     if (!jobId || busy) return;
     setBusy("rerun");
@@ -159,6 +181,13 @@ export function CampaignLivePage() {
       const res = await applyReportEdits(jobId, action.payload.edits ?? []);
       applyReport(res.swot_report);
       return res.applied.join(" · ") || "Report updated.";
+    }
+    if (action.kind === "update_context") {
+      if (action.payload.field && action.payload.value !== undefined) {
+        const res = await updateMerchantContext(jobId, action.payload.field, action.payload.value);
+        return res.applied || "Campaign context updated.";
+      }
+      return "No field specified for context update.";
     }
     if (action.kind === "research") {
       setBusy("more");
@@ -371,6 +400,25 @@ export function CampaignLivePage() {
               )}
             </section>
 
+            {/* ── Watch ────────────────────────────────────────────── */}
+            {report && (
+              <section id="watch" className="scroll-mt-20">
+                <SectionHeading
+                  title="Watch"
+                  hint="Who is gaining on you, and every player in your niche — including brands too new to rank."
+                />
+                <WatchPanel
+                  threatWatch={report.threat_watch}
+                  wedgeScan={report.wedge_scan}
+                  leapBenchmarks={report.leap_benchmarks}
+                  rivals={rivals}
+                  onOpenRival={setOpenRival}
+                  onResearch={handleResearchName}
+                  busy={!!busy}
+                />
+              </section>
+            )}
+
             {/* ── Compare ──────────────────────────────────────────── */}
             <section id="compare" className="scroll-mt-20">
               <SectionHeading title="Side by side" hint="Your product and every rival on the same measures." />
@@ -402,7 +450,7 @@ export function CampaignLivePage() {
         )}
       </div>
 
-      {hasReport && jobId && (
+      {jobId && (
         <ChatWidget
           jobId={jobId}
           rivals={rivals}

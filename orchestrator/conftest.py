@@ -9,6 +9,7 @@ _API_KEY_FIELDS = (
     "openai_api_key",
     "tavily_api_key",
     "you_api_key",
+    "scrapedo_api_key",
     "firecrawl_api_key",
     "crawlapi_token",
     "crawlapi_js_token",

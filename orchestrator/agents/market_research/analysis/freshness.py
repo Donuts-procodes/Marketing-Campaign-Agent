@@ -154,3 +154,52 @@ def score_recency(
 def latest_iso(dates: list[date]) -> str | None:
     """ISO string for the newest date, or None when the list is empty."""
     return max(dates).isoformat() if dates else None
+
+
+def audit_report_freshness(report, corpus: list[str], *, max_age_days: int) -> list[str]:
+    """
+    Fills `as_of` where grounding left it empty and summarizes how current the report is.
+
+    Grounding dates a profile only from snippets naming the brand. A rival often appears by
+    product name instead ("MX Master 3S" rather than "Logitech"), and an explicit "Updated
+    <date>" marker beats a stray date in body text, so this second pass matches both names and
+    prefers marker dates. A profile with no datable evidence stays null: undated is not stale.
+    """
+    reference = _clock_today()
+    filled: list[str] = []
+    stale: list[str] = []
+    undated: list[str] = []
+
+    for comp in report.competitors:
+        if not comp.as_of:
+            names = [n.lower() for n in (comp.brand_name, comp.product_name) if n and len(n) > 2]
+            dates = [
+                d for text in corpus
+                if text and any(n in text.lower() for n in names)
+                for d in [extract_publication_date(text)] if d
+            ]
+            if dates:
+                comp.as_of = latest_iso(dates)
+                filled.append(comp.brand_name)
+        if not comp.as_of:
+            undated.append(comp.brand_name)
+            continue
+        try:
+            age = (reference - date.fromisoformat(comp.as_of)).days
+        except ValueError:
+            continue
+        if age > max_age_days:
+            stale.append(f"{comp.brand_name} ({comp.as_of})")
+
+    diagnostics = [
+        f"[FRESHNESS_AUDIT] {len(report.competitors) - len(undated)}/{len(report.competitors)} "
+        f"competitors dated; {len(filled)} newly dated by product-name/marker match."
+    ]
+    if stale:
+        diagnostics.append(
+            f"[FRESHNESS_AUDIT] Evidence older than {max_age_days} days: {', '.join(stale)} — "
+            "pricing and claims may have moved."
+        )
+    if undated:
+        diagnostics.append(f"[FRESHNESS_AUDIT] No dated evidence for: {', '.join(undated)}.")
+    return diagnostics

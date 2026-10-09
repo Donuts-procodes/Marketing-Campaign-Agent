@@ -26,6 +26,18 @@ const TAG_STYLES: Record<string, { chip: string; dot: string; label: string }> =
   MORE_COMPETITORS_FOUND: { chip: "bg-pink-500/15 text-pink-300 border-pink-500/40", dot: "bg-pink-400", label: "Find more" },
   CONFIG: { chip: "bg-orange-500/20 text-orange-300 border-orange-500/50", dot: "bg-orange-400", label: "Config" },
   LLM_CONFIG: { chip: "bg-rose-500/20 text-rose-300 border-rose-500/50", dot: "bg-rose-400", label: "LLM config" },
+  FILTER_VALIDATOR: { chip: "bg-teal-500/15 text-teal-300 border-teal-500/40", dot: "bg-teal-400", label: "Validator" },
+  DATA_REPAIR: { chip: "bg-teal-500/15 text-teal-300 border-teal-500/40", dot: "bg-teal-400", label: "Repair" },
+  REVIEW_CONTEXT: { chip: "bg-blue-500/15 text-blue-300 border-blue-500/40", dot: "bg-blue-400", label: "Reviews" },
+  FRESHNESS_AUDIT: { chip: "bg-slate-500/15 text-slate-300 border-slate-500/40", dot: "bg-slate-400", label: "Freshness" },
+  PRICE_NORM: { chip: "bg-green-500/15 text-green-300 border-green-500/40", dot: "bg-green-400", label: "Pricing" },
+  EXEC_SUMMARY: { chip: "bg-zinc-500/15 text-zinc-200 border-zinc-500/40", dot: "bg-zinc-300", label: "Summary" },
+  CHANGE_DETECT: { chip: "bg-yellow-500/15 text-yellow-300 border-yellow-500/40", dot: "bg-yellow-400", label: "Changes" },
+  AD_COPY: { chip: "bg-purple-500/15 text-purple-300 border-purple-500/40", dot: "bg-purple-400", label: "Ad copy" },
+  WEDGE_FINDER: { chip: "bg-cyan-500/15 text-cyan-200 border-cyan-400/40", dot: "bg-cyan-300", label: "Niche scan" },
+  THREAT_MONITOR: { chip: "bg-red-500/15 text-red-300 border-red-500/40", dot: "bg-red-400", label: "Threat watch" },
+  LEAP_BENCHMARK: { chip: "bg-purple-500/15 text-purple-200 border-purple-400/40", dot: "bg-purple-300", label: "Leap" },
+  PROFILE_COMPLETER: { chip: "bg-green-500/15 text-green-300 border-green-500/40", dot: "bg-green-400", label: "Profile facts" },
   NODE: { chip: "bg-indigo-500/15 text-indigo-300 border-indigo-500/40", dot: "bg-indigo-400", label: "Pipeline" },
 };
 

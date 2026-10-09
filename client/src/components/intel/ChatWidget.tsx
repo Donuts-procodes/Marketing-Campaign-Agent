@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatAction, ChatTurn, SourceCheck, streamReportChat } from "@/lib/api-client";
+import { countTokens, addLiveTokens } from "@/lib/tiktokenTracker";
 import { RivalView } from "@/lib/rivalMetrics";
 import { cn, safeHref } from "@/lib/utils";
 import {
@@ -115,8 +116,14 @@ function suggestionsFor(rivals: RivalView[], merchantName?: string): string[] {
   if (rivals.some((r) => r.priceValue != null)) out.push("Who has the lowest price, and how does it compare?");
   const mostComplained = [...rivals].sort((a, b) => b.complaints.length - a.complaints.length)[0];
   if (mostComplained?.complaints.length) out.push(`What do customers complain about at ${mostComplained.name}?`);
-  out.push("Which rivals are advertising right now, and what do their ads say?");
-  out.push(merchantName ? `Where is the gap ${merchantName} could own?` : "Where is the gap in this market?");
+  if (rivals.length > 0) {
+    out.push("Which rivals are advertising right now, and what do their ads say?");
+    out.push(merchantName ? `Where is the gap ${merchantName} could own?` : "Where is the gap in this market?");
+  } else {
+    out.push("Summarize the current run progress and reasoning");
+    out.push("Update our campaign goal");
+    out.push("Show human-in-the-loop pending items");
+  }
   if (rivals.length > 1) out.push(`How is ${rivals[0].name} different from ${rivals[1].name}?`);
   return out.slice(0, 4);
 }
@@ -170,6 +177,12 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
       const controller = new AbortController();
       abortRef.current = controller;
 
+      // Track user prompt tokens live
+      const promptTokens = countTokens(user.content);
+      if (promptTokens > 0) {
+        addLiveTokens(promptTokens);
+      }
+
       const patch = (fn: (m: Message) => Message) =>
         setMessages((all) => all.map((m) => (m.id === replyId ? fn(m) : m)));
 
@@ -178,7 +191,13 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
           jobId,
           history.slice(-12),
           {
-            onDelta: (delta) => patch((m) => ({ ...m, content: m.content + delta, status: undefined })),
+            onDelta: (delta) => {
+              const deltaTokens = countTokens(delta);
+              if (deltaTokens > 0) {
+                addLiveTokens(deltaTokens);
+              }
+              patch((m) => ({ ...m, content: m.content + delta, status: undefined }));
+            },
             onStatus: (status) => patch((m) => ({ ...m, status })),
             onCheck: (check) => patch((m) => ({ ...m, status: undefined, checks: [...(m.checks ?? []), check] })),
             onAction: (action) =>
@@ -247,12 +266,20 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="no-print fixed bottom-5 right-5 z-[55] inline-flex items-center gap-2 pl-3.5 pr-4 py-3 rounded-full bg-ink text-white shadow-lift hover:-translate-y-0.5 transition-transform animate-fade-up"
-        aria-label="Ask about your rivals"
+        className="no-print fixed bottom-5 right-5 z-[55] inline-flex items-center gap-2.5 px-4 py-3 rounded-full bg-ink text-white shadow-2xl hover:scale-105 transition-all duration-200 border border-white/20 cursor-pointer animate-fade-up"
+        aria-label="Open AI Assistant & HITL Chat"
       >
+        <span className="relative flex h-2.5 w-2.5">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+          <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+        </span>
         <Sparkles className="w-4 h-4 text-emerald-300" />
-        <span className="hidden sm:inline text-sm font-semibold">Ask about your rivals</span>
-        {messages.length > 0 && <span className="w-2 h-2 rounded-full bg-emerald-400" aria-hidden />}
+        <span className="text-xs sm:text-sm font-bold tracking-tight">AI Assistant & HITL</span>
+        {messages.length > 0 && (
+          <span className="ml-0.5 px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-white/20 text-white">
+            {messages.length}
+          </span>
+        )}
       </button>
     );
   }
@@ -297,8 +324,16 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
         {messages.length === 0 && (
           <div className="space-y-3 animate-fade-up">
             <div className="rounded-2xl bg-white border border-line p-3.5 text-[13px] text-ink-soft leading-relaxed">
-              Ask anything about the {rivals.length} rivals in this report — prices, what customers say, their ads, or where{" "}
-              {merchantName || "you"} could stand out. I only use what the research found.
+              {rivals.length > 0 ? (
+                <>
+                  Ask anything about the {rivals.length} rivals in this report — prices, what customers say, their ads, or where{" "}
+                  {merchantName || "you"} could stand out. I only use what the research found.
+                </>
+              ) : (
+                <>
+                  Ask for run progress summaries, reasoning, or propose updates to your campaign goal and initial merchant parameters. I also serve as your Human-in-the-Loop decision partner.
+                </>
+              )}
             </div>
             <div className="space-y-1.5">
               {suggestions.map((s) => (

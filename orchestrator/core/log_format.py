@@ -34,6 +34,18 @@ TAG_STYLES = {
     "AD_INTELLIGENCE": "\033[93m",    # yellow
     "LLM_SYNTH": "\033[35m",          # purple
     "DATA_VALIDATION": "\033[32m",    # dark green
+    "FILTER_VALIDATOR": "\033[36m",   # teal
+    "DATA_REPAIR": "\033[36m",        # teal
+    "REVIEW_CONTEXT": "\033[34m",     # deep blue
+    "FRESHNESS_AUDIT": "\033[37m",    # light grey
+    "PRICE_NORM": "\033[92m",         # bright green
+    "EXEC_SUMMARY": "\033[97m",       # white
+    "CHANGE_DETECT": "\033[93m",      # bright yellow
+    "AD_COPY": "\033[95m",            # bright magenta
+    "WEDGE_FINDER": "\033[96m",       # bright cyan
+    "THREAT_MONITOR": "\033[91m",     # bright red
+    "PROFILE_COMPLETER": "\033[32m",  # green
+    "LEAP_BENCHMARK": "\033[35m",     # purple
     "CONFIG": "\033[33m",             # orange-ish
     "LLM_CONFIG": "\033[91m",         # red
 }

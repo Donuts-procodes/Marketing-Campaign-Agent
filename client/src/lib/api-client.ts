@@ -18,6 +18,7 @@ import {
   UploadDossierResponse,
 } from "@/types/api";
 import type { SWOTReportDelta } from "@/types/research";
+import type { CampaignStrategyBrief } from "@/types/strategy";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_URL?.replace(/\/$/, "") || "";
@@ -246,7 +247,7 @@ export async function fetchMoreCompetitors(
 }
 
 export interface ReportEdit {
-  op: "remove_item" | "set_price" | "remove_competitor";
+  op: "remove_item" | "set_price" | "set_rating" | "remove_competitor";
   competitor: string;
   field?: string | null;
   value?: string | null;
@@ -292,10 +293,30 @@ export interface ChatTurn {
 /** A change the assistant proposed; it only runs when the merchant confirms it. */
 export interface ChatAction {
   id: string;
-  kind: "refresh" | "research" | "edit";
+  kind: "refresh" | "research" | "edit" | "update_context";
   title: string;
   detail: string;
-  payload: { names?: string[]; edits?: ReportEdit[] };
+  payload: {
+    names?: string[];
+    edits?: ReportEdit[];
+    field?: string;
+    value?: unknown;
+    reasoning?: string;
+  };
+}
+
+/** Updates initial merchant brief context or campaign goal (HITL). */
+export async function updateMerchantContext(
+  jobId: string,
+  field: string,
+  value: unknown
+): Promise<{ status: string; applied: string; merchant_context: Record<string, unknown> }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/context`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ field, value }),
+  });
+  return handleResponse(response);
 }
 
 /** Result of re-fetching a competitor's sources to check one statement. */
@@ -367,4 +388,18 @@ export async function streamReportChat(
     }
   }
   return { offTopic: false };
+}
+
+/**
+ * Founder approval gate for Campaign Strategy Brief.
+ */
+export async function approveCampaignStrategy(jobId: string): Promise<CampaignStrategyBrief> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/strategy/approve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+  return handleResponse<CampaignStrategyBrief>(response);
 }

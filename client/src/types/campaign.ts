@@ -64,6 +64,12 @@ export interface RunFailedEvent {
   timestamp: number;
 }
 
+export interface StrategyApprovedEvent {
+  type: "STRATEGY_APPROVED";
+  brief: Record<string, unknown>;
+  timestamp: number;
+}
+
 /** Every server frame carries a monotonically increasing sequence number for resume. */
 export type SSEEventPayload = (
   | NodeStartedEvent
@@ -72,4 +78,5 @@ export type SSEEventPayload = (
   | HitlInterruptEvent
   | RunCompleteEvent
   | RunFailedEvent
+  | StrategyApprovedEvent
 ) & { seq?: number };

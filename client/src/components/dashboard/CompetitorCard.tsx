@@ -12,6 +12,9 @@ import {
   CheckCircle2,
   TrendingUp,
   ThumbsUp,
+  MapPin,
+  Target,
+  Users,
 } from "lucide-react";
 import { pricingLabel, safeHref, cn } from "@/lib/utils";
 
@@ -70,6 +73,7 @@ export function CompetitorCard({
   const sources = comp.sources ?? [];
   const strengths = comp.strengths_mined ?? [];
   const milestones = comp.milestones ?? [];
+  const rc = comp.review_context;
   // Newest first: what moved most recently is what a merchant acts on.
   const changes = [...(comp.change_history ?? [])].reverse();
 
@@ -148,6 +152,37 @@ export function CompetitorCard({
               {comp.review_count ? (
                 <span className="font-mono opacity-70">({comp.review_count.toLocaleString()})</span>
               ) : null}
+            </span>
+          )}
+          {comp.founded && (
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-50 text-blue-800 border border-blue-200"
+              title={`In business since ${comp.founded}`}
+            >
+              <Clock className="w-2.5 h-2.5" />
+              Est. {comp.founded}
+              {(() => {
+                const years = new Date().getFullYear() - Number(comp.founded);
+                return Number.isFinite(years) && years > 0 ? ` (${years}y)` : "";
+              })()}
+            </span>
+          )}
+          {(comp.headquarters || (comp.operating_locations && comp.operating_locations.length > 0)) && (
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-purple-50 text-purple-800 border border-purple-200 max-w-[180px] truncate"
+              title={`Headquarters / Offices: ${comp.headquarters ?? comp.operating_locations?.join(", ")}`}
+            >
+              <MapPin className="w-2.5 h-2.5 shrink-0" />
+              <span className="truncate">{comp.headquarters ?? comp.operating_locations?.[0]}</span>
+            </span>
+          )}
+          {((comp.other_products && comp.other_products.length > 0) || comp.product_catalog_count) && (
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-800 border border-slate-200"
+              title={comp.other_products?.length ? `Other models: ${comp.other_products.join(", ")}` : "Product catalog"}
+            >
+              <Layers className="w-2.5 h-2.5" />
+              {comp.product_catalog_count ? `${comp.product_catalog_count} models` : `${comp.other_products?.length} other models`}
             </span>
           )}
         </div>
@@ -327,33 +362,111 @@ export function CompetitorCard({
           </div>
         )}
 
-        {/* Company background, only once expanded */}
-        {expanded && (comp.founded || milestones.length > 0) && (
-          <div className="space-y-1.5">
+        {/* Review context, only once expanded: the consensus and the counter-angle behind the
+            quotes above. Collapsed cards stay a scannable grid. */}
+        {expanded && rc && (rc.overall_sentiment_consensus || rc.counter_positioning_angle || !!rc.top_complaint_drivers?.length) && (
+          <div className="space-y-2 p-2.5 rounded-lg bg-zinc-50 border border-zinc-200">
             <div className="flex items-center gap-1.5">
-              <Clock className="w-3 h-3 text-zinc-400 shrink-0" />
-              <span className={LABEL}>Company history</span>
+              <Users className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
+              <span className={LABEL}>Customer sentiment & feedback</span>
             </div>
-            {comp.founded && (
-              <p className="text-[11px] text-zinc-700">
-                Founded <strong>{comp.founded}</strong>
-                {(() => {
-                  const years = new Date().getFullYear() - Number(comp.founded);
-                  return Number.isFinite(years) && years > 0 ? ` · ${years} years in market` : "";
-                })()}
-              </p>
+            {rc.overall_sentiment_consensus && (
+              <p className="text-[11px] text-zinc-700 leading-relaxed">{rc.overall_sentiment_consensus}</p>
             )}
-            {milestones.length > 0 && (
+            {!!rc.top_complaint_drivers?.length && (
               <ul className="space-y-1">
-                {milestones.map((m, i) => (
-                  <li
-                    key={i}
-                    className="text-[11px] text-zinc-600 leading-relaxed border-l-2 border-zinc-200 pl-2"
-                  >
-                    {m}
+                {rc.top_complaint_drivers.slice(0, 3).map((a, i) => (
+                  <li key={i} className="text-[11px] text-rose-900 leading-relaxed pl-2 border-l-2 border-rose-200">
+                    <strong>{a.topic}</strong>
+                    {a.root_cause ? ` — ${a.root_cause}` : a.summary ? ` — ${a.summary}` : ""}
                   </li>
                 ))}
               </ul>
+            )}
+            {!!rc.unmet_customer_needs?.length && (
+              <p className="text-[11px] text-zinc-700">
+                <span className="text-zinc-500 font-medium">Still asking for: </span>
+                {rc.unmet_customer_needs.slice(0, 3).join(" · ")}
+              </p>
+            )}
+            {rc.counter_positioning_angle && (
+              <div className="rounded-md bg-amber-50 border border-amber-200 px-2 py-1.5">
+                <div className="flex items-center gap-1 mb-0.5">
+                  <Target className="w-3 h-3 text-amber-600 shrink-0" />
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700">
+                    Your counter-angle
+                  </span>
+                </div>
+                <p className="text-[11px] text-amber-900 leading-relaxed">{rc.counter_positioning_angle}</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Company background, only once expanded */}
+        {expanded && (comp.founded || comp.headquarters || (comp.operating_locations && comp.operating_locations.length > 0) || (comp.other_products && comp.other_products.length > 0) || milestones.length > 0) && (
+          <div className="space-y-2 p-2.5 rounded-lg bg-zinc-50 border border-zinc-200">
+            <div className="flex items-center gap-1.5">
+              <Layers className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
+              <span className={LABEL}>Corporate footprint & Catalog</span>
+            </div>
+            {comp.founded && (
+              <p className="text-[11px] text-zinc-700">
+                Established <strong>{comp.founded}</strong>
+                {(() => {
+                  const years = new Date().getFullYear() - Number(comp.founded);
+                  return Number.isFinite(years) && years > 0 ? ` · ${years} years active` : "";
+                })()}
+              </p>
+            )}
+            {comp.headquarters && (
+              <p className="text-[11px] text-zinc-700 flex items-start gap-1">
+                <MapPin className="w-3 h-3 text-zinc-400 mt-0.5 shrink-0" />
+                <span>Headquarters: <strong>{comp.headquarters}</strong></span>
+              </p>
+            )}
+            {comp.operating_locations && comp.operating_locations.length > 0 && (
+              <div className="text-[11px] text-zinc-700 space-y-0.5">
+                <span className="text-zinc-500 font-medium">Active branches & territories:</span>
+                <div className="flex flex-wrap gap-1 mt-0.5">
+                  {comp.operating_locations.map((loc, i) => (
+                    <span key={i} className="px-1.5 py-0.5 rounded bg-white border border-zinc-200 text-[10px] text-zinc-700">
+                      {loc}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {((comp.other_products && comp.other_products.length > 0) || comp.product_catalog_count) && (
+              <div className="text-[11px] text-zinc-700 space-y-0.5">
+                <span className="text-zinc-500 font-medium">
+                  Product lineup ({comp.product_catalog_count ?? comp.other_products?.length} products):
+                </span>
+                {comp.other_products && comp.other_products.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-0.5">
+                    {comp.other_products.map((prod, i) => (
+                      <span key={i} className="px-1.5 py-0.5 rounded bg-white border border-zinc-200 text-[10px] text-zinc-700 font-medium">
+                        {prod}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {milestones.length > 0 && (
+              <div className="pt-1 border-t border-zinc-200 space-y-1">
+                <span className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Milestones</span>
+                <ul className="space-y-1">
+                  {milestones.map((m, i) => (
+                    <li
+                      key={i}
+                      className="text-[11px] text-zinc-600 leading-relaxed border-l-2 border-zinc-300 pl-2"
+                    >
+                      {m}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
           </div>
         )}

@@ -19,6 +19,7 @@ import {
   AlertCircle,
   Layers,
   Send,
+  MapPin,
 } from "lucide-react";
 import { AppNavbar } from "@/components/dashboard/AppNavbar";
 import { RecentSessions } from "@/components/dashboard/RecentSessions";
@@ -96,9 +97,10 @@ export function OrchestratorPage() {
   const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Intake inputs: dedicated product & category, manual description, research goal, known competitors, and files
+  // Intake inputs: dedicated product & category, target location, manual description, research goal, known competitors, and files
   const [productNameInput, setProductNameInput] = useState("");
   const [categoryInput, setCategoryInput] = useState("");
+  const [targetGeographyInput, setTargetGeographyInput] = useState("");
   const [manualDescription, setManualDescription] = useState("");
   const [query, setQuery] = useState("");
   const [knownCompetitorsInput, setKnownCompetitorsInput] = useState("");
@@ -119,6 +121,7 @@ export function OrchestratorPage() {
   const [missingRequirements, setMissingRequirements] = useState<string[]>([]);
   const [modalProductName, setModalProductName] = useState("");
   const [modalCategory, setModalCategory] = useState("");
+  const [modalTargetGeography, setModalTargetGeography] = useState("");
   const [modalDescription, setModalDescription] = useState("");
   // LLM interpretation state: tracks whether the modal fields were AI-suggested
   const [isInterpreting, setIsInterpreting] = useState(false);
@@ -221,6 +224,7 @@ export function OrchestratorPage() {
 
     write("product_name", fields?.product_name?.trim() || "", setProductNameInput);
     write("category", fields?.category?.trim() || "", setCategoryInput);
+    write("target_geography", fields?.target_geography?.trim() || "", setTargetGeographyInput);
     write("primary_value_prop", fields?.primary_value_prop?.trim() || "", setManualDescription);
     write("known_competitors", fields?.known_competitors?.join(", ") || "", setKnownCompetitorsInput);
     write("goal", fields?.goal?.trim() || "", setQuery);
@@ -294,7 +298,8 @@ export function OrchestratorPage() {
     pName: string,
     cat: string,
     desc: string,
-    fileCount: number
+    fileCount: number,
+    geo?: string
   ) => {
     const missing: string[] = [];
     if (!pName || isConversational(pName)) {
@@ -306,18 +311,23 @@ export function OrchestratorPage() {
     if (fileCount === 0 && (!desc || desc.length < 30 || isConversational(desc))) {
       missing.push("Product Description & Core Offering (what it does, audience, features, or upload a deck/PDF)");
     }
+    if (!geo || isConversational(geo)) {
+      missing.push("Target Location / Service Area (e.g. Delhi, Austin TX, United States, or Worldwide)");
+    }
     return missing;
   };
 
   const resolvedProductName = productNameInput.trim() || parsedFields?.product_name?.trim() || "";
   const resolvedCategory = categoryInput.trim() || parsedFields?.category?.trim() || "";
+  const resolvedTargetGeography = targetGeographyInput.trim() || parsedFields?.target_geography?.trim() || "";
   const resolvedDescription = manualDescription.trim() || parsedFields?.primary_value_prop?.trim() || "";
 
   const currentMissing = evaluateMissingEssentials(
     resolvedProductName,
     resolvedCategory,
     resolvedDescription,
-    files.length
+    files.length,
+    resolvedTargetGeography
   );
   const isGreatMinimumMet = currentMissing.length === 0;
   const canRun = enabledAgents.size > 0;
@@ -326,6 +336,7 @@ export function OrchestratorPage() {
     productName: string;
     category: string;
     description: string;
+    targetGeography?: string;
   }) => {
     setIsRunning(true);
     setErrorMsg(null);
@@ -353,12 +364,14 @@ export function OrchestratorPage() {
       .filter(Boolean);
     const docCompetitors = activeFields?.known_competitors || [];
     const mergedCompetitors = Array.from(new Set([...manualCompetitors, ...docCompetitors]));
+    const finalGeo = (ctx.targetGeography || resolvedTargetGeography || "Worldwide").trim();
 
     const payload: CampaignInitPayload = {
       run_mode: priorRun?.found ? runMode : "fresh",
       merchant_context: {
         product_name: ctx.productName,
         category: ctx.category,
+        target_geography: finalGeo,
         primary_value_prop:
           ctx.description ||
           (files.length > 0 ? `Context extracted from documents: ${files.map((f) => f.name).join(", ")}` : ctx.productName),
@@ -400,9 +413,11 @@ export function OrchestratorPage() {
       // Seed modal with whatever the user already has
       const seedName = productNameInput && !isConversational(productNameInput) ? productNameInput : (parsedFields?.product_name || "");
       const seedCat = categoryInput && !isConversational(categoryInput) ? categoryInput : (parsedFields?.category || "");
+      const seedGeo = targetGeographyInput && !isConversational(targetGeographyInput) ? targetGeographyInput : (parsedFields?.target_geography || "");
       const seedDesc = manualDescription || parsedFields?.primary_value_prop || "";
       setModalProductName(seedName);
       setModalCategory(seedCat);
+      setModalTargetGeography(seedGeo);
       setModalDescription(seedDesc);
       setMissingRequirements(currentMissing);
       setAiSuggestedFields(new Set());
@@ -413,7 +428,8 @@ export function OrchestratorPage() {
       const inputText = [manualDescription, query].filter(Boolean).join("\n\n");
       const needsName = !seedName;
       const needsCategory = !seedCat;
-      if (inputText.trim().length >= 10 && (needsName || needsCategory)) {
+      const needsGeo = !seedGeo;
+      if (inputText.trim().length >= 10 && (needsName || needsCategory || needsGeo)) {
         setIsInterpreting(true);
         interpretQuery(inputText.trim())
           .then((res) => {
@@ -425,6 +441,10 @@ export function OrchestratorPage() {
             if (needsCategory && res.fields.category) {
               setModalCategory(res.fields.category);
               suggested.add("category");
+            }
+            if (needsGeo && res.fields.target_geography) {
+              setModalTargetGeography(res.fields.target_geography);
+              suggested.add("targetGeography");
             }
             if (!seedDesc && res.fields.primary_value_prop) {
               setModalDescription(res.fields.primary_value_prop);
@@ -444,6 +464,7 @@ export function OrchestratorPage() {
       productName: resolvedProductName,
       category: resolvedCategory,
       description: resolvedDescription,
+      targetGeography: resolvedTargetGeography,
     });
   };
 
@@ -451,9 +472,10 @@ export function OrchestratorPage() {
     e.preventDefault();
     const pName = modalProductName.trim() || parsedFields?.product_name?.trim() || "";
     const cat = modalCategory.trim() || parsedFields?.category?.trim() || "";
+    const geo = modalTargetGeography.trim() || parsedFields?.target_geography?.trim() || "";
     const desc = modalDescription.trim() || parsedFields?.primary_value_prop?.trim() || "";
 
-    const check = evaluateMissingEssentials(pName, cat, desc, files.length);
+    const check = evaluateMissingEssentials(pName, cat, desc, files.length, geo);
     if (check.length > 0) {
       setMissingRequirements(check);
       return;
@@ -461,6 +483,7 @@ export function OrchestratorPage() {
 
     if (modalProductName.trim()) setProductNameInput(modalProductName.trim());
     if (modalCategory.trim()) setCategoryInput(modalCategory.trim());
+    if (modalTargetGeography.trim()) setTargetGeographyInput(modalTargetGeography.trim());
     if (modalDescription.trim()) setManualDescription(modalDescription.trim());
 
     setIsMissingModalOpen(false);
@@ -468,6 +491,7 @@ export function OrchestratorPage() {
       productName: pName,
       category: cat,
       description: desc,
+      targetGeography: geo,
     });
   };
 
@@ -617,8 +641,8 @@ export function OrchestratorPage() {
                   </div>
                 )}
 
-                {/* 2-Column Grid: Structured Product / Brand & Category */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {/* 3-Column Grid: Structured Product / Brand, Category & Target Location */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
                       <label className="text-xs font-bold text-[#19191B] flex items-center gap-1.5">
@@ -669,6 +693,51 @@ export function OrchestratorPage() {
                       placeholder={parsedFields?.category ? `e.g. ${parsedFields.category}` : "e.g. B2B Sales CRM, Developer Analytics"}
                       className="w-full px-4 py-2.5 rounded-2xl bg-[#FFFDF9] border border-[#EDE7D8] text-[#19191B] placeholder:text-zinc-400 text-xs font-medium focus:outline-none focus:border-[#19191B] focus:ring-1 focus:ring-[#19191B] transition"
                     />
+                  </div>
+
+                  <div className="space-y-1.5 sm:col-span-2 lg:col-span-1">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-bold text-[#19191B] flex items-center gap-1.5">
+                        <MapPin className="w-3.5 h-3.5 text-rose-500" />
+                        <span>Target Location / Geography</span>
+                        <span className="text-rose-500">*</span>
+                      </label>
+                      {autofilledKeys.has("target_geography") && (
+                        <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                          Auto-filled from doc
+                        </span>
+                      )}
+                    </div>
+                    <input
+                      type="text"
+                      value={targetGeographyInput}
+                      onChange={(e) => {
+                        setTargetGeographyInput(e.target.value);
+                        if (validationError) setValidationError(null);
+                      }}
+                      placeholder={parsedFields?.target_geography ? `e.g. ${parsedFields.target_geography}` : "e.g. Delhi, Austin TX, Worldwide"}
+                      className="w-full px-4 py-2.5 rounded-2xl bg-[#FFFDF9] border border-[#EDE7D8] text-[#19191B] placeholder:text-zinc-400 text-xs font-medium focus:outline-none focus:border-[#19191B] focus:ring-1 focus:ring-[#19191B] transition"
+                    />
+                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                      {["Delhi", "India", "United States", "Worldwide"].map((preset) => (
+                        <button
+                          key={preset}
+                          type="button"
+                          onClick={() => {
+                            setTargetGeographyInput(preset);
+                            if (validationError) setValidationError(null);
+                          }}
+                          className={cn(
+                            "px-2 py-0.5 rounded-md text-[10px] font-semibold border transition cursor-pointer",
+                            targetGeographyInput.toLowerCase() === preset.toLowerCase()
+                              ? "bg-[#19191B] text-white border-[#19191B]"
+                              : "bg-white text-zinc-600 border-[#EDE7D8] hover:border-zinc-400"
+                          )}
+                        >
+                          {preset}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
@@ -816,6 +885,18 @@ export function OrchestratorPage() {
                       {resolvedCategory && !isConversational(resolvedCategory)
                         ? "✓ Category"
                         : "⚠️ Category required"}
+                    </span>
+                    <span
+                      className={cn(
+                        "px-2.5 py-1 rounded-full text-[11px] font-medium flex items-center gap-1",
+                        resolvedTargetGeography && !isConversational(resolvedTargetGeography)
+                          ? "bg-emerald-50 text-emerald-800 border border-emerald-200"
+                          : "bg-amber-50 text-amber-800 border border-amber-200"
+                      )}
+                    >
+                      {resolvedTargetGeography && !isConversational(resolvedTargetGeography)
+                        ? `✓ Location: ${resolvedTargetGeography}`
+                        : "⚠️ Location required"}
                     </span>
                     <span
                       className={cn(
@@ -1117,6 +1198,55 @@ export function OrchestratorPage() {
                       : "border-[#EDE7D8] focus:border-[#19191B]"
                   )}
                 />
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-[#19191B] flex items-center gap-1.5">
+                    <MapPin className="w-3.5 h-3.5 text-rose-500" />
+                    <span>Target Location / Geography <span className="text-rose-500">*</span></span>
+                  </label>
+                  {aiSuggestedFields.has("targetGeography") && (
+                    <span className="text-[10px] font-semibold text-violet-700 bg-violet-50 px-2 py-0.5 rounded-full border border-violet-200">
+                      AI suggested
+                    </span>
+                  )}
+                </div>
+                <input
+                  type="text"
+                  value={modalTargetGeography}
+                  onChange={(e) => {
+                    setModalTargetGeography(e.target.value);
+                    setAiSuggestedFields((prev) => { const next = new Set(prev); next.delete("targetGeography"); return next; });
+                  }}
+                  placeholder="e.g. Delhi, Austin TX, United States, or Worldwide"
+                  className={cn(
+                    "w-full px-4 py-2.5 rounded-2xl bg-[#FFFDF9] border text-[#19191B] placeholder:text-zinc-400 text-xs font-medium focus:outline-none focus:ring-1 focus:ring-[#19191B] transition",
+                    aiSuggestedFields.has("targetGeography")
+                      ? "border-violet-300 focus:border-violet-500"
+                      : "border-[#EDE7D8] focus:border-[#19191B]"
+                  )}
+                />
+                <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                  {["Delhi", "India", "United States", "Worldwide"].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => {
+                        setModalTargetGeography(preset);
+                        setAiSuggestedFields((prev) => { const next = new Set(prev); next.delete("targetGeography"); return next; });
+                      }}
+                      className={cn(
+                        "px-2 py-0.5 rounded-md text-[10px] font-semibold border transition cursor-pointer",
+                        modalTargetGeography.toLowerCase() === preset.toLowerCase()
+                          ? "bg-[#19191B] text-white border-[#19191B]"
+                          : "bg-white text-zinc-600 border-[#EDE7D8] hover:border-zinc-400"
+                      )}
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               {files.length === 0 && (

@@ -41,6 +41,7 @@ export interface BYOKConfig {
 }
 
 import type { CompetitorProfile, SWOTReportDelta } from "./research";
+import type { CampaignStrategyBrief } from "./strategy";
 
 export interface MerchantContext {
   product_name: string;
@@ -50,6 +51,7 @@ export interface MerchantContext {
   price_usd?: number;
   known_competitors?: string[];
   existing_customer_profiles?: string[];
+  target_geography?: string;
 }
 
 export interface CampaignInitPayload {
@@ -92,6 +94,7 @@ export interface AutofillFields {
   price_usd: number | null;
   known_competitors: string[];
   existing_customer_profiles: string[];
+  target_geography?: string | null;
 }
 
 export interface AutofillResponse {
@@ -126,6 +129,7 @@ export interface SessionDetailResponse {
   finished_at: string | null;
   merchant_context: Record<string, unknown>;
   swot_report: SWOTReportDelta | null;
+  strategy_brief?: CampaignStrategyBrief | null;
   events: Array<Record<string, unknown>>;
 }
 

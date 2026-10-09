@@ -8,6 +8,8 @@ import {
   TelemetryLogItem,
 } from "@/types/campaign";
 import { SWOTReportDelta } from "@/types/research";
+import type { CampaignStrategyBrief } from "@/types/strategy";
+import { countTokens, addLiveTokens } from "@/lib/tiktokenTracker";
 
 export type ConnectionStatus =
   | "IDLE"
@@ -31,6 +33,7 @@ export interface StreamState {
   completedPhases: AgentPhase[];
   telemetryLogs: TelemetryLogItem[];
   swotReport: SWOTReportDelta | null;
+  strategyBrief: CampaignStrategyBrief | null;
   /** The merchant brief the run was started with (product, category, price...). */
   merchantContext: Record<string, unknown> | null;
   hitlCheckpoint: HitlState | null;
@@ -44,6 +47,7 @@ const INITIAL_STATE: StreamState = {
   completedPhases: [],
   telemetryLogs: [],
   swotReport: null,
+  strategyBrief: null,
   merchantContext: null,
   hitlCheckpoint: null,
   error: null,
@@ -119,10 +123,15 @@ export function useCampaignStream(jobId: string | null | undefined) {
             : [...s.completedPhases, phase];
 
           let swotUpdate = s.swotReport;
+          let strategyBriefUpdate = s.strategyBrief;
           if (p.delta && typeof p.delta === "object") {
             const rawSwot = (p.delta as Record<string, unknown>).swot_report;
             if (rawSwot && typeof rawSwot === "object") {
               swotUpdate = rawSwot as unknown as SWOTReportDelta;
+            }
+            const rawBrief = (p.delta as Record<string, unknown>).strategy_brief;
+            if (rawBrief && typeof rawBrief === "object") {
+              strategyBriefUpdate = rawBrief as unknown as CampaignStrategyBrief;
             }
           }
 
@@ -130,6 +139,7 @@ export function useCampaignStream(jobId: string | null | undefined) {
             ...s,
             completedPhases: updatedCompleted,
             swotReport: swotUpdate,
+            strategyBrief: strategyBriefUpdate,
             telemetryLogs: [
               ...s.telemetryLogs,
               {
@@ -141,6 +151,16 @@ export function useCampaignStream(jobId: string | null | undefined) {
             ],
           };
         });
+        break;
+      }
+      case "STRATEGY_APPROVED": {
+        const rawBrief = payload.brief;
+        if (rawBrief && typeof rawBrief === "object") {
+          setState((s) => ({
+            ...s,
+            strategyBrief: rawBrief as unknown as CampaignStrategyBrief,
+          }));
+        }
         break;
       }
       case "TELEMETRY_LOG": {
@@ -274,6 +294,12 @@ export function useCampaignStream(jobId: string | null | undefined) {
       if (typeof payload.seq === "number") {
         if (payload.seq <= lastSeqRef.current) return; // already applied
         lastSeqRef.current = payload.seq;
+      }
+      if (event.data) {
+        const tokens = countTokens(event.data);
+        if (tokens > 0) {
+          addLiveTokens(tokens);
+        }
       }
       handleStreamPayload(payload);
       if (payload.type === "RUN_COMPLETE" || payload.type === "RUN_FAILED") {

@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from "react";
+import { useState, useEffect, type FC } from "react";
+import { createPortal } from "react-dom";
 import { Settings, X, KeyRound, Check, Trash2, Eye, EyeOff } from "lucide-react";
 import { AVAILABLE_MODELS, BYOKProvider } from "@/types/api";
 import { cn } from "@/lib/utils";
@@ -10,7 +11,7 @@ interface GlobalSettingsModalProps {
   onClose: () => void;
 }
 
-export const GlobalSettingsModal: React.FC<GlobalSettingsModalProps> = ({ isOpen, onClose }) => {
+export const GlobalSettingsModal: FC<GlobalSettingsModalProps> = ({ isOpen, onClose }) => {
   const [provider, setProvider] = useState<BYOKProvider>("openai");
   const [model, setModel] = useState<string>("gpt-4o");
   const [apiKey, setApiKey] = useState("");
@@ -69,14 +70,20 @@ export const GlobalSettingsModal: React.FC<GlobalSettingsModalProps> = ({ isOpen
 
   const modelsForCurrentProvider = AVAILABLE_MODELS[provider];
 
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="bg-white rounded-[24px] shadow-2xl w-full max-w-lg overflow-hidden flex flex-col border border-zinc-200 text-[#19191B]">
+  return createPortal(
+    <div
+      onClick={onClose}
+      className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-white rounded-[24px] shadow-2xl w-full max-w-lg overflow-hidden flex flex-col border border-zinc-200 text-[#19191B] m-auto animate-in zoom-in-95 duration-200"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-100 bg-[#FAF7EE]">
           <div className="flex items-center gap-2">
             <Settings className="w-5 h-5 text-zinc-600" />
-            <h2 className="text-sm font-bold font-display tracking-tight">Global Settings</h2>
+            <h2 className="text-sm font-bold font-display tracking-tight">Global Settings & BYOK</h2>
           </div>
           <button
             onClick={onClose}
@@ -216,6 +223,7 @@ export const GlobalSettingsModal: React.FC<GlobalSettingsModalProps> = ({ isOpen
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 };

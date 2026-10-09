@@ -85,7 +85,7 @@ async def test_autofill_drops_invented_name_and_price():
 async def test_autofill_endpoint_reads_multiple_files(monkeypatch):
     seen = {}
 
-    async def fake_autofill(text, llm=None):
+    async def fake_autofill(text, llm=None, byok_config=None, **kwargs):
         seen["text"] = text
         return AutofillFields(product_name="DealFlow CRM", goal="win 500 agencies in 2027")
 

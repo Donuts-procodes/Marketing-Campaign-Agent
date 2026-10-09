@@ -550,6 +550,7 @@ def build_search_queries(
     merchant_context: dict[str, Any],
     taxonomy: DynamicParameterTaxonomy | None = None,
     time_range_override: str | None = None,
+    include_leap: bool = False,
 ) -> list[SearchQuery]:
     """
     Decomposes merchant context and dynamic parameters into taxonomy-scoped search queries.
@@ -596,9 +597,9 @@ def build_search_queries(
     discovery_query += f"{geo_clause} {current_year}"
 
     if competitor_names:
-        pricing_query = f'"{product_name}" OR ({competitor_names}) {pricing_terms}'
+        pricing_query = f'({competitor_names}) {pricing_terms}'
     else:
-        pricing_query = f'"{product_name}" {pricing_terms} "{category}"'
+        pricing_query = f'"{category}" {pricing_terms}'
 
     # Build site: filter from the first 4 gripe domains so the query covers more
     # platforms without going over the engine's operator budget.
@@ -617,8 +618,8 @@ def build_search_queries(
     if competitor_names:
         claims_target = f'({competitor_names})'
     else:
-        claims_target = f'"{product_name}"'
-    claims_query = f'{claims_target} "{category}" (tagline OR slogan OR "value proposition" OR "why choose"){geo_clause}'
+        claims_target = f'"{category}"'
+    claims_query = f'{claims_target} (tagline OR slogan OR "value proposition" OR "why choose"){geo_clause}'
 
     # Update runs override time_range to "month" so only recent changes are fetched.
     tr_discovery = time_range_override or "year"
@@ -626,7 +627,6 @@ def build_search_queries(
     tr_claims = time_range_override or "year"
 
     queries = [
-        # Broadened discovery vector capturing alternatives, rivals, and top category picks
         SearchQuery(vector="alternative_discovery", query=discovery_query, time_range=tr_discovery),
         SearchQuery(vector="pricing_scrape", query=pricing_query, time_range=tr_pricing),
         # A complaint about a product as it was two years ago may already be fixed.
@@ -638,7 +638,24 @@ def build_search_queries(
         ),
         SearchQuery(vector="messaging_claims", query=claims_query, time_range=tr_claims),
     ]
+    if include_leap:
+        leap_terms = '("successful" OR "market leader" OR "case studies" OR "enterprise clients" OR "portfolio" OR "trusted by" OR "client roster")'
+        queries.append(
+            SearchQuery(
+                vector="leap_discovery",
+                query=f'"{category}" {leap_terms}{geo_clause}',
+                time_range=time_range_override or "year",
+            )
+        )
     return queries
+
+
+def _web_name(brand: str) -> str:
+    """The name a rival is written as on the web: "Table XI (TXI)" searches as "Table XI"."""
+    from orchestrator.agents.market_research.discovery.source_types import search_names
+
+    names = search_names(brand)
+    return names[0] if names else brand
 
 
 def build_missing_data_queries(
@@ -672,7 +689,7 @@ def build_missing_data_queries(
         queries.append(
             SearchQuery(
                 vector="pricing_scrape",
-                query=f'"{comp.brand_name}" "{prod}" ({price_keywords})',
+                query=f'"{_web_name(comp.brand_name)}" "{prod}" ({price_keywords})',
                 time_range="year",
             )
         )
@@ -680,7 +697,7 @@ def build_missing_data_queries(
         queries.append(
             SearchQuery(
                 vector="pricing_scrape",
-                query=f'{comp.brand_name} {prod} price cost MSRP buy',
+                query=f'{_web_name(comp.brand_name)} {prod} price cost MSRP buy',
                 time_range="year",
             )
         )
@@ -693,14 +710,14 @@ def build_missing_data_queries(
         queries.append(
             SearchQuery(
                 vector="gripe_mining",
-                query=f'({all_gripe_site_filter}) "{comp.brand_name}" "{prod}" (complaint OR issue OR downside OR problem OR "not worth" OR "bad experience" OR negative)',
+                query=f'({all_gripe_site_filter}) "{_web_name(comp.brand_name)}" "{prod}" (complaint OR issue OR downside OR problem OR "not worth" OR "bad experience" OR negative)',
                 include_domains=review_domains,
             )
         )
         queries.append(
             SearchQuery(
                 vector="gripe_mining",
-                query=f'({all_gripe_site_filter}) {comp.brand_name} {prod} review complaint problem',
+                query=f'({all_gripe_site_filter}) {_web_name(comp.brand_name)} {prod} review complaint problem',
                 include_domains=review_domains,
             )
         )
@@ -723,7 +740,7 @@ def build_missing_data_queries(
         queries.append(
             SearchQuery(
                 vector="messaging_claims",
-                query=f'"{comp.brand_name}" "{prod}" (features OR specifications OR specs OR capabilities OR "what is" OR overview)',
+                query=f'"{_web_name(comp.brand_name)}" "{prod}" (features OR specifications OR specs OR capabilities OR "what is" OR overview)',
                 time_range="year",
             )
         )
@@ -988,6 +1005,18 @@ async def execute_duckduckgo_search(
     return [result for batch in batches for result in batch]
 
 
+_NON_PRODUCT_EXTENSIONS_OR_PATHS = re.compile(
+    r"(?:\.(?:pdf|docx?|xlsx?|pptx?|zip|gz|tar)(?:[?#]|$)|/(?:dam|downloads?|stocks?|sec-filings?|investor-relations|ir)/)",
+    re.IGNORECASE,
+)
+
+_TAVILY_EXCLUDE_NOISE_DOMAINS = (
+    "wikipedia.org", "visa.com", "crunchbase.com", "dealroom.co", "hal.science",
+    "arxiv.org", "drugs.com", "marketbeat.com", "robinhood.com", "bloomberg.com",
+    "reuters.com", "yahoo.com", "msn.com", "sec.gov", "investing.com",
+)
+
+
 def _merge(*result_lists: list[TavilySearchResult]) -> list[TavilySearchResult]:
     """
     Deduplicates per vector and URL, keeping the first (highest-priority engine) result.
@@ -1005,6 +1034,9 @@ def _merge(*result_lists: list[TavilySearchResult]) -> list[TavilySearchResult]:
             secure = enforce_https(r.url)
             if secure is None:
                 logger.debug("_merge: dropped non-HTTPS result: %s", r.url)
+                continue
+            if _NON_PRODUCT_EXTENSIONS_OR_PATHS.search(secure):
+                logger.debug("_merge: dropped non-product document/path: %s", secure)
                 continue
             key = (r.vector, secure)
             if key not in seen:
@@ -1107,15 +1139,18 @@ async def _execute_tavily_only(
             }
             if query.include_domains:
                 search_kwargs["include_domains"] = list(query.include_domains)
+            else:
+                search_kwargs["exclude_domains"] = list(_TAVILY_EXCLUDE_NOISE_DOMAINS)
             if query.time_range:
                 search_kwargs["time_range"] = query.time_range
 
             try:
                 response = await tavily_client.search(**search_kwargs)
             except TypeError:
-                # Older tavily-python (or a stub client) may not accept time_range —
-                # drop the recency hint rather than lose the whole query.
+                # Older tavily-python (or a stub client) may not accept time_range or exclude_domains —
+                # drop the extra hints rather than lose the whole query.
                 search_kwargs.pop("time_range", None)
+                search_kwargs.pop("exclude_domains", None)
                 response = await tavily_client.search(**search_kwargs)
             results = response.get("results", [])
             return [

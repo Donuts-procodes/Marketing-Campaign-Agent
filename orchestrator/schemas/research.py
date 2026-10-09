@@ -85,6 +85,152 @@ class CompetitorChange(BaseModel):
     )
 
 
+class ReviewAspect(BaseModel):
+    """
+    One recurring theme across a competitor's reviews, with the mechanism behind it.
+
+    `weaknesses_mined` holds verbatim gripes, which tells a merchant what was said but not why
+    it keeps being said. An aspect groups the gripes into a theme and names the trigger, so the
+    pattern is actionable rather than anecdotal.
+    """
+
+    topic: str = Field(..., description="Short theme label, e.g. 'Filter lifespan & clogging'")
+    sentiment: str = Field(
+        default="mixed",
+        description="'negative', 'positive' or 'mixed' — the consensus on this theme",
+    )
+    summary: str = Field(default="", description="One-to-two sentence consensus finding on this theme")
+    root_cause: str = Field(
+        default="",
+        description="The underlying mechanism or trigger behind it — a design limit, a billing "
+        "policy, a support process — not a restatement of the complaint",
+    )
+    affected_personas: list[str] = Field(
+        default_factory=list,
+        description="Which buyer segments this theme hits, e.g. 'renters', 'high-TDS well water homes'",
+    )
+    sample_quotes: list[str] = Field(
+        default_factory=list,
+        description="Verbatim review excerpts from the evidence corpus backing this theme",
+    )
+    merchant_opportunity: str = Field(
+        default="",
+        description="Concrete counter-positioning move the merchant can make on this theme",
+    )
+
+
+class CompetitorReviewContext(BaseModel):
+    """Synthesized context behind one competitor's customer reviews."""
+
+    brand_name: str = Field(..., description="Brand this review context belongs to")
+    product_name: str = Field(default="", description="Specific product reviewed")
+    overall_sentiment_consensus: str = Field(
+        default="",
+        description="What reviewers collectively conclude: why they buy and why they churn",
+    )
+    buyer_personas: list[str] = Field(
+        default_factory=list,
+        description="Who is actually reviewing and buying this rival, inferred from review text",
+    )
+    top_praise_drivers: list[ReviewAspect] = Field(
+        default_factory=list,
+        description="Recurring themes customers praise, strongest first",
+    )
+    top_complaint_drivers: list[ReviewAspect] = Field(
+        default_factory=list,
+        description="Recurring themes customers complain about, most damaging first",
+    )
+    unmet_customer_needs: list[str] = Field(
+        default_factory=list,
+        description="What reviewers asked for and did not get — the feature wishlist",
+    )
+    counter_positioning_angle: str = Field(
+        default="",
+        description="The single strongest message for winning this rival's dissatisfied buyers",
+    )
+
+
+class PricingTier(BaseModel):
+    """
+    `pricing_model` parsed into comparable parts.
+
+    The raw string stays on the profile for display; this is what sorting, price-range bars
+    and "who is cheapest?" read, so "$49/mo billed annually" and "$59/month" compare as numbers.
+    """
+
+    tier_name: str | None = Field(default=None, description="Plan name when stated, e.g. 'Pro'")
+    amount: float | None = Field(default=None, description="Lowest stated paid price, as a number")
+    currency: str | None = Field(default=None, description="ISO code, e.g. 'USD'")
+    period: str | None = Field(
+        default=None,
+        description="'monthly', 'annual', 'one_time', 'project', 'hourly', 'usage' or null",
+    )
+    monthly_equivalent: float | None = Field(
+        default=None,
+        description="amount normalized to a monthly figure when the period allows it, else null",
+    )
+    has_free_tier: bool = Field(default=False, description="True when a free plan or trial is stated")
+    raw: str = Field(default="", description="The pricing_model string this was parsed from")
+
+
+class LeapBenchmark(BaseModel):
+    """
+    A competitor that originated as a similar boutique/indie peer in this wedge,
+    but took a big leap in scale, marquee enterprise clients, high-value deals,
+    partner networks, and market valuation.
+    """
+
+    brand_name: str = Field(..., description="Brand of the breakout competitor")
+    origin_story: str = Field(
+        default="",
+        description="How they started out similar to the merchant (e.g. 5-person Rails boutique, small regional studio)",
+    )
+    current_scale: str = Field(
+        default="",
+        description="Current estimated scale, valuation, revenue tier, or headcount (e.g. '$30M+ revenue, 150+ staff')",
+    )
+    flagship_clients: list[str] = Field(
+        default_factory=list,
+        description="Marquee enterprise or unicorn clients they landed (e.g. ['Robinhood', 'Postmates', 'Subaru'])",
+    )
+    network_and_deals: list[str] = Field(
+        default_factory=list,
+        description="High-value alliances, ecosystem partner tiers, or awards (e.g. ['AWS Premier Partner', 'Apple Design Award'])",
+    )
+    pricing_power_leap: str = Field(
+        default="",
+        description="How their pricing and contract sizes expanded beyond boutique rates (e.g. '$150–$250/hr with $25k+ project floor')",
+    )
+    leap_catalysts: list[str] = Field(
+        default_factory=list,
+        description="Key strategic inflection points behind their breakthrough (e.g. open source tools, enterprise pivot, YC network)",
+    )
+    merchant_takeaway_playbook: list[str] = Field(
+        default_factory=list,
+        description="Actionable steps the merchant can borrow to execute a similar leap in this market",
+    )
+
+
+class FieldStatus(BaseModel):
+    """
+    Why one profile fact holds the value it does -- or why it is empty.
+
+    "Not available" told the merchant nothing: it hid four different situations (never looked
+    for, looked and no page says it, found but rejected, never collected). Each fact now carries
+    which one applies, and for a found value the verbatim sentence and page it came from.
+    """
+
+    status: str = Field(
+        default="not_searched",
+        description="'found' (verified), 'not_stated' (searched; no page we read states it), "
+        "'removed' (found but rejected by a check), 'not_searched'",
+    )
+    source_url: str | None = Field(default=None, description="Page the value was read from")
+    quote: str | None = Field(default=None, description="Verbatim sentence that states the value")
+    reason: str = Field(default="", description="Plain-language explanation shown to the merchant")
+    pages_checked: int = Field(default=0, description="Pages and snippets searched for this fact")
+
+
 class CompetitorProfile(BaseModel):
     """Structured profile extracted per discovered competitor."""
 
@@ -150,6 +296,22 @@ class CompetitorProfile(BaseModel):
         default=None,
         description="Founding year or date as stated on the competitor's own pages, or null",
     )
+    headquarters: str | None = Field(
+        default=None,
+        description="Primary office location or headquarters city/country (e.g. 'Los Angeles, CA', 'Berlin, Germany')",
+    )
+    operating_locations: list[str] = Field(
+        default_factory=list,
+        description="Active operating regions, branch offices, service territories, or countries where they have a presence",
+    )
+    other_products: list[str] = Field(
+        default_factory=list,
+        description="Other notable products, models, or service lines offered by this brand",
+    )
+    product_catalog_count: int | None = Field(
+        default=None,
+        description="Total number or estimated count of products/models in their catalog",
+    )
     milestones: list[str] = Field(
         default_factory=list,
         description="Dated company or product events stated on their pages: launches, funding, "
@@ -159,6 +321,46 @@ class CompetitorProfile(BaseModel):
         default_factory=list,
         description="What moved between our own scans of this competitor. Accumulated across "
         "runs, so it is the one history no single page states.",
+    )
+    pricing_parsed: PricingTier | None = Field(
+        default=None,
+        description="pricing_model parsed into amount / period / currency; null when unparseable",
+    )
+    review_context: CompetitorReviewContext | None = Field(
+        default=None,
+        description="Synthesized context behind the reviews: root causes, buyer personas and "
+        "counter-positioning angles. Null when no review evidence was found.",
+    )
+    leap_benchmark: LeapBenchmark | None = Field(
+        default=None,
+        description="Breakout analysis if this competitor took a big leap from similar origins to enterprise/market leader scale",
+    )
+    employee_count: str | None = Field(
+        default=None,
+        description="Team size exactly as a page states it, e.g. '50-249' or '120'. Never estimated.",
+    )
+    annual_revenue: str | None = Field(
+        default=None,
+        description="Revenue exactly as a page states it, e.g. '$10M-$50M'. Never estimated.",
+    )
+    funding: str | None = Field(
+        default=None,
+        description="Funding raised or valuation exactly as a page states it. Never estimated.",
+    )
+    fact_status: dict[str, FieldStatus] = Field(
+        default_factory=dict,
+        description="Per profile fact: found (with source and quote), not stated, removed, or "
+        "not searched, so the dashboard can say why a value is missing",
+    )
+    named_by_merchant: bool = Field(
+        default=False,
+        description="True when the merchant listed this rival; it was researched on top of the "
+        "rivals the agent found independently",
+    )
+    cohort: str = Field(
+        default="",
+        description="'leapfrog' (grew from the merchant's level, with evidence), 'catching_up' "
+        "(peer-size rival accelerating), 'peer', 'larger', 'incumbent', or '' when unknown",
     )
 
 
@@ -235,6 +437,119 @@ class DashboardInsights(BaseModel):
     )
 
 
+class AdAngle(BaseModel):
+    """A ready-to-run ad concept aimed at one rival's documented weakness."""
+
+    hook: str = Field(..., description="Headline, under ~10 words")
+    body: str = Field(default="", description="One or two sentences of supporting copy")
+    target_rival: str = Field(default="", description="Competitor whose buyers this targets")
+    format_hint: str = Field(
+        default="",
+        description="Where it fits best, e.g. 'Google Search', 'Meta feed', 'LinkedIn'",
+    )
+    based_on_weakness: str = Field(
+        default="",
+        description="The rival complaint or gap this angle exploits, as found in the research",
+    )
+
+
+class WedgeCandidate(BaseModel):
+    """
+    One player in the merchant's niche, found by the broad Tier 1 scan.
+
+    Deliberately thin: name, angle, size and when we first saw it. The point of Tier 1 is
+    coverage -- not missing an emerging rival -- so depth is left to Tier 2 and to "research
+    deeper", which promotes a candidate into a full profile.
+    """
+
+    brand_name: str = Field(..., description="Brand as it appears in the evidence")
+    url: str | None = Field(default=None, description="Their own site or launch page, when found")
+    positioning: str = Field(
+        default="",
+        description="Their one-line angle, from the evidence. Empty when the evidence states none.",
+    )
+    scale: str = Field(
+        default="unknown",
+        description="'peer' (similar size to the merchant), 'larger' (well ahead), 'incumbent' "
+        "(category giant) or 'unknown' when the evidence does not say",
+    )
+    scale_evidence: str = Field(default="", description="What the scale call is based on")
+    launch_date: str | None = Field(
+        default=None, description="ISO date of a dated launch, funding or 'just launched' signal"
+    )
+    first_seen: str | None = Field(
+        default=None, description="ISO date our scans first surfaced this brand"
+    )
+    mentions: int = Field(default=0, description="Evidence passages naming it in this scan")
+    emerging: bool = Field(
+        default=False,
+        description="Launched or first seen recently: the rivals most likely to be missed",
+    )
+    deep_researched: bool = Field(
+        default=False, description="True when this brand already has a full profile in the report"
+    )
+    sources: list[str] = Field(default_factory=list)
+
+
+class WedgeScan(BaseModel):
+    """Tier 1: everyone in the merchant's niche, broad and shallow."""
+
+    wedge: str = Field(default="", description="The niche the scan was scoped to, in one line")
+    scanned_at: str = Field(default="", description="ISO date of this scan")
+    candidates: list[WedgeCandidate] = Field(default_factory=list)
+    new_since_last_scan: list[str] = Field(
+        default_factory=list, description="Brands that were not in the previous scan"
+    )
+
+
+class ThreatSignal(BaseModel):
+    """One observable momentum signal behind a threat score."""
+
+    key: str = Field(..., description="Stable id, e.g. 'review_velocity'")
+    label: str = Field(..., description="Human label, e.g. 'Review growth'")
+    value: str = Field(default="", description="Current reading, formatted for display")
+    change: str = Field(default="", description="Movement since the baseline scan, when known")
+    direction: str = Field(default="flat", description="'up', 'down', 'flat' or 'new'")
+    score: float = Field(default=0.0, ge=0.0, le=1.0, description="This signal's 0-1 contribution")
+
+
+class ThreatEntry(BaseModel):
+    """Tier 2: one peer rival under momentum watch."""
+
+    brand_name: str
+    threat_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    momentum: str = Field(
+        default="baseline",
+        description="'accelerating', 'steady', 'slowing'; 'baseline' on the first scan, when "
+        "there is nothing yet to measure against; 'no_data' when a baseline exists but no signal "
+        "could be compared (no review counts or ads, or the last scan is under a week old)",
+    )
+    scale: str = Field(default="unknown")
+    headline: str = Field(default="", description="One line on why this rival is worth watching")
+    signals: list[ThreatSignal] = Field(default_factory=list)
+    what_changed: list[str] = Field(default_factory=list, description="Moves since the last scan")
+    counter_move: str = Field(default="", description="What the merchant can do about it")
+    snapshot: dict[str, float | int | str | None] = Field(
+        default_factory=dict,
+        description="Raw readings stored so the next scan can measure velocity against them",
+    )
+
+
+class ThreatWatch(BaseModel):
+    """Tier 2 output: the few peer rivals most likely to overtake the merchant."""
+
+    scanned_at: str = Field(default="")
+    baseline_date: str | None = Field(
+        default=None, description="ISO date of the scan momentum is measured against; null on a first scan"
+    )
+    watched: list[ThreatEntry] = Field(default_factory=list)
+    alerts: list[str] = Field(default_factory=list, description="Moves that need the merchant's attention")
+    method_note: str = Field(
+        default="",
+        description="What the signals are proxies for, so nobody reads them as revenue figures",
+    )
+
+
 class SWOTReportDelta(BaseModel):
     """
     Immutable delta emitted by the Market Research Agent.
@@ -282,4 +597,18 @@ class SWOTReportDelta(BaseModel):
     sample_data: bool = Field(
         default=False,
         description="True when produced by offline mock clients rather than live research",
+    )
+    suggested_ad_angles: list[AdAngle] = Field(
+        default_factory=list,
+        description="Ad concepts generated from the finished research; empty when none were grounded",
+    )
+    wedge_scan: WedgeScan | None = Field(
+        default=None, description="Tier 1: every player found in the merchant's niche"
+    )
+    threat_watch: ThreatWatch | None = Field(
+        default=None, description="Tier 2: momentum tracking on the peer rivals most likely to overtake"
+    )
+    leap_benchmarks: list[LeapBenchmark] = Field(
+        default_factory=list,
+        description="Aspirational breakout competitors that started similar to the merchant and took a big leap in clients, deals, and valuation",
     )

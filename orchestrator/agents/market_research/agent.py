@@ -22,7 +22,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from orchestrator.agents.market_research.analysis.classification import classify_campaign_context
-from orchestrator.agents.market_research.pipeline.loop import ResearchLoopResult, execute_research_loop
+from orchestrator.agents.market_research.pipeline.loop import ResearchLoopResult, execute_research_loop, split_named
 from orchestrator.agents.market_research.progress import ProgressFn, _report
 from orchestrator.agents.market_research.analysis.relevance_filter import rank_by_category_fit
 from orchestrator.agents.market_research.analysis.scoring import calculate_dqs
@@ -157,6 +157,11 @@ async def execute_market_research(
     prior_run_at: str | None = state.get("prior_run_at")
     run_mode: str | None = state.get("run_mode")
     is_update = run_mode == "update" and prior_report is not None
+    # The last finished run for this product, loaded on every run (not only updates). Only the
+    # wedge scan and threat watch read it -- they need a previous reading to measure movement --
+    # so a fresh run still never merges old findings into the new report.
+    baseline_report: SWOTReportDelta | None = state.get("baseline_report") or prior_report
+    baseline_run_at: str | None = state.get("baseline_run_at") or prior_run_at
 
     llm_error: str | None = None
     # An injected model (tests, callers) serves every step; otherwise light steps get the fast one.
@@ -203,6 +208,12 @@ async def execute_market_research(
     # Phase 1: Taxonomy subagent builds the dynamic parameter framework
     taxonomy = await crew.taxonomy.run(merchant_context)
 
+    # The rivals the merchant named, recorded before update runs add the prior report's rivals
+    # to known_competitors. Only these are guaranteed a profile on top of the agent's own
+    # discoveries; treating re-seeded rivals the same way would grow the report every refresh.
+    merchant_named = [n.strip() for n in (merchant_context.get("known_competitors") or []) if n and n.strip()]
+    merchant_context = {**merchant_context, "merchant_named_competitors": merchant_named}
+
     # Phase 2: Execute dedicated multi-iteration convergence loop
     # For update runs, seed known competitors from the prior report so the search
     # targets those brands directly and uses time-bounded queries for recency.
@@ -222,7 +233,12 @@ async def execute_market_research(
     # Ad intelligence needs only competitor names, so it starts as soon as the first round
     # produces them and runs alongside the remaining rounds. Measured sequentially it was 67s
     # of a 258s run; overlapped, it hides behind crawl time already being spent.
-    category_for_ads = merchant_context.get("category", "")
+    category_for_ads: str = str(merchant_context.get("category") or "")
+    target_geo: str | None = (
+        str(merchant_context.get("target_geography"))
+        if merchant_context.get("target_geography")
+        else None
+    )
     ad_intel_task: asyncio.Task[Any] | None = None
     # Who the early pass looked up, whether or not they run ads. Keying the top-up on "has
     # hooks" re-ran every competitor without ads: 24s of duplicate lookups per run.
@@ -239,7 +255,7 @@ async def execute_market_research(
             crew.ad_intel.run(
                 shortlist,
                 category_for_ads,
-                target_geography=merchant_context.get("target_geography"),
+                target_geography=target_geo,
             )
         )
 
@@ -268,14 +284,25 @@ async def execute_market_research(
     # Phase 3: Curate competitor list (minimum 5, no max limit when <= 0)
     limit = settings.research_max_competitors
     use_limit = bool(limit and limit > 0)
-    top_competitors = (
-        loop_result.preliminary_competitors[:limit]
-        if use_limit
-        else loop_result.preliminary_competitors
+    # Two quotas: every rival the merchant named (up to a cap) PLUS `limit` the agent found
+    # itself. One shared cut let named rivals, always ranked first, take every slot.
+    named_profiles, named_overflow, discovered = split_named(
+        loop_result.preliminary_competitors, merchant_named, settings.research_max_named_competitors
     )
+    for c in named_profiles + named_overflow:
+        c.named_by_merchant = True
+    top_competitors = named_profiles + (discovered[:limit] if use_limit else discovered)
     # Everyone the loop discovered but the cut-off excluded. Kept as the bench so
     # "find more competitors" can serve the next in line instead of re-searching.
-    bench_competitors = loop_result.preliminary_competitors[limit:] if use_limit else []
+    bench_competitors = named_overflow + (discovered[limit:] if use_limit else [])
+    if merchant_named:
+        await _report(
+            on_progress,
+            f"[COMPETITOR_LIST] Researching the {len(named_profiles)} rival(s) you named "
+            f"plus {len(top_competitors) - len(named_profiles)} found independently"
+            + (f"; {len(named_overflow)} more named rival(s) are past the cap of "
+               f"{settings.research_max_named_competitors} and wait in reserve" if named_overflow else ""),
+        )
     if bench_competitors:
         await _report(
             on_progress,
@@ -297,7 +324,7 @@ async def execute_market_research(
     if ad_intel is None:
         ad_intel = await crew.ad_intel.run(
             top_competitors, category_for_ads,
-            target_geography=merchant_context.get("target_geography"),
+            target_geography=target_geo,
         )
     else:
         uncovered = [
@@ -311,7 +338,7 @@ async def execute_market_research(
             )
             top_up = await crew.ad_intel.run(
                 uncovered, category_for_ads,
-                target_geography=merchant_context.get("target_geography"),
+                target_geography=target_geo,
             )
             ad_intel.hooks_by_competitor.update(top_up.hooks_by_competitor)
             ad_intel.documents.extend(top_up.documents)
@@ -373,9 +400,68 @@ async def execute_market_research(
             validator_notes.extend(notes)
         report_delta.validation_diagnostics = grounding_notes + validator_notes
 
+        def _note(lines: list[str]) -> None:
+            if lines:
+                report_delta.validation_diagnostics = (report_delta.validation_diagnostics or []) + lines
+
+        # Phase 6b2: Profile completion — the validator's job is to remove what the evidence does
+        # not support; this one finds what is missing. For every rival it lists the empty facts
+        # (price, rating, reviews, founded, HQ, team size, revenue, funding), searches where they
+        # are published, and keeps a value only when its source sentence is verified on a
+        # fetched page. Whatever stays empty is recorded with the reason it is empty.
+        if crew.profile_completer is not None:
+            completion_docs: list[tuple[str, str]] = [
+                (r.url or "", f"{r.title}\n{r.snippet}") for r in loop_result.search_results if r.snippet
+            ] + [(p.get("url") or "", p["markdown"]) for p in evidence_pages if p.get("markdown")]
+            report_delta, notes = await crew.profile_completer.run(report_delta, completion_docs)
+            _note(notes)
+            raw_text_corpus.extend(crew.profile_completer.new_texts)
+            all_source_urls = list(dict.fromkeys(all_source_urls + crew.profile_completer.new_urls))
+
+        # Phase 6c: Freshness audit — dates profiles grounding could not (product-name and
+        # "Updated <date>" matches) and flags evidence too old to trust. Deterministic.
+        report_delta, notes = await crew.freshness.run(report_delta, raw_text_corpus)
+        _note(notes)
+
         # Phase 7: LLM Relevance Filter — curate which data is most useful for the merchant dashboard
         if llm is not None:
             report_delta = await crew.relevance.run(report_delta, merchant_context)
+
+        # Phase 7b: Display Filter-Validator — checks display data correctness & completeness,
+        # prompting the LLM repair subagent to find and fix any missing or inaccurate data from
+        # evidence. Runs even without an LLM: the placeholder scrub ("N/A", "not available") is
+        # pure code, and leaving those strings in is what put them on the dashboard.
+        report_delta, display_diagnostics = await crew.display_validator.run(
+            report_delta, raw_text_corpus
+        )
+        if display_diagnostics:
+            report_delta.validation_diagnostics = (
+                (report_delta.validation_diagnostics or []) + display_diagnostics
+            )
+
+        # Phase 7c: Pricing normalizer — after the display validator has repaired pricing, so
+        # the parse sees the best text available; makes prices sortable and comparable.
+        report_delta, notes = await crew.pricing.run(report_delta)
+        _note(notes)
+
+        # Phase 7d: Review Context — reads the review evidence a second time to synthesize why
+        # customers praise or complain, who they are, and the counter-angle each theme opens up.
+        # Runs on the final display set, so it never spends tokens on a competitor that was cut.
+        report_delta = await crew.review_context.run(
+            report_delta, raw_text_corpus, merchant_context
+        )
+
+        # Phase 7e: Breakout Leap Benchmark — compares merchant against breakout peers who started
+        # in the same wedge but scaled to high net worth, enterprise client rosters, and partner deals.
+        report_delta, notes = await crew.leap_benchmark.run(
+            report_delta, raw_text_corpus, merchant_context
+        )
+        _note(notes)
+
+        # Phase 7f: Executive summary — rewritten last among the analysis steps, so it can cite
+        # repaired prices, review themes, and leap benchmarks the relevance filter's draft never saw.
+        report_delta, notes = await crew.exec_summary.run(report_delta, merchant_context)
+        _note(notes)
 
         # Phase 8 (update runs only): merge prior run's findings into the new report.
         # Competitors not re-found in recent data are carried forward so the report
@@ -387,6 +473,15 @@ async def execute_market_research(
                 on_progress,
                 f"[NODE] Merged prior run data: {len(report_delta.competitors)} total competitors",
             )
+            # Phase 8b: Snapshot diff — the moves merge does not record (review volume, new ad
+            # creative, normalized monthly price).
+            report_delta, notes = await crew.snapshot_diff.run(report_delta, prior_report)
+            _note(notes)
+
+        # Phase 9: Ad copy — the report ends in concepts the merchant can launch, each tied to
+        # a rival weakness the research actually found.
+        report_delta, notes = await crew.ad_copy.run(report_delta, merchant_context)
+        _note(notes)
 
         final_dqs = calculate_dqs(
             competitors=report_delta.competitors,
@@ -415,7 +510,8 @@ async def execute_market_research(
         discovered = [c.brand_name for c in top_competitors if c.brand_name]
 
         strengths = []
-        value_prop = (merchant_context.get("primary_value_prop") or "").strip()
+        raw_vp = merchant_context.get("primary_value_prop")
+        value_prop = raw_vp.strip() if isinstance(raw_vp, str) else (str(raw_vp).strip() if raw_vp else "")
         if value_prop:
             # The merchant's own claim about itself, attributed as such — not a market finding.
             strengths.append(f"Merchant-stated value proposition: {value_prop}")
@@ -458,6 +554,42 @@ async def execute_market_research(
         except Exception as grounding_exc:  # never let the guard itself break the run
             logger.error("Grounding gate failed on synthesis fallback: %s", grounding_exc)
             errors.append(f"Grounding error on fallback: {grounding_exc}")
+
+        # Profile facts do not depend on synthesis. Completion verifies every value against its
+        # source sentence in code, and reads directory profiles by pattern when no model is up,
+        # so a run whose synthesis failed still gets complete, checked profiles.
+        if crew.profile_completer is not None:
+            fallback_docs: list[tuple[str, str]] = [
+                (r.url or "", f"{r.title}\n{r.snippet}") for r in loop_result.search_results if r.snippet
+            ] + [(p.get("url") or "", p["markdown"]) for p in evidence_pages if p.get("markdown")]
+            report_delta, completion_notes = await crew.profile_completer.run(report_delta, fallback_docs)
+            report_delta.validation_diagnostics = (report_delta.validation_diagnostics or []) + completion_notes
+            raw_text_corpus.extend(crew.profile_completer.new_texts)
+
+    # Phase 10: Tier 1 wedge scan — a broad sweep of the niche for small and newly launched
+    # brands the competitor shortlist can miss. Runs on whichever report the run produced, so
+    # the niche map survives even a synthesis failure.
+    report_delta, wedge_notes = await crew.wedge_finder.run(
+        report_delta,
+        merchant_context=merchant_context,
+        bench=bench_competitors,
+        corpus=raw_text_corpus,
+        baseline=baseline_report,
+        baseline_run_at=baseline_run_at,
+    )
+    # Phase 11: Tier 2 threat watch — momentum on the peer rivals most likely to overtake,
+    # measured against the last run. Deterministic, so every score is re-checkable.
+    report_delta, threat_notes = await crew.threat_monitor.run(
+        report_delta,
+        merchant_context=merchant_context,
+        corpus=raw_text_corpus,
+        baseline=baseline_report,
+        baseline_run_at=baseline_run_at,
+    )
+    if wedge_notes or threat_notes:
+        report_delta.validation_diagnostics = (
+            (report_delta.validation_diagnostics or []) + wedge_notes + threat_notes
+        )
 
     errors.extend(crew.errors)
     logger.info("Research crew usage: %s", crew.usage_summary())

@@ -87,13 +87,31 @@ def _time_range_since(prior_run_at: str | None) -> str:
     except (ValueError, TypeError):
         return "month"
 
-# Review sites, forums, social networks and ad libraries: useful evidence, never competitors.
+# Review sites, forums, social networks, ad libraries, aggregators and payment/infra rails:
+# useful evidence, never competitors.
 NON_COMPETITOR_DOMAINS = frozenset({
     "reddit", "g2", "capterra", "trustpilot", "yelp", "bbb", "sitejabber", "quora",
     "youtube", "facebook", "instagram", "twitter", "x", "linkedin", "tiktok", "medium",
     "wikipedia", "google", "bing", "amazon", "ebay", "producthunt", "trustradius",
     "getapp", "softwareadvice", "forbes", "techradar", "pcmag", "nytimes", "rtings",
+    "crunchbase", "dealroom", "pitchbook", "rocketreach", "zoominfo", "cbinsights", "tracxn",
+    "owler", "signalhire", "comparably", "glassdoor", "indeed", "builtin",
+    "marketbeat", "robinhood", "msn", "yahoo", "bloomberg", "reuters", "cnbc", "marketwatch",
+    "nasdaq", "nyse", "investing", "seekingalpha", "businesswire", "prnewswire", "globenewswire",
+    "einpresswire", "drugs", "webmd", "hal", "arxiv", "researchgate", "springer", "sciencedirect",
+    "academia", "scribd", "slideshare", "vendr", "superbcompanies", "clutch", "goodfirms",
+    "designrush", "sortlist", "themanifest", "upwork", "fiverr", "toptal", "github", "gitlab",
+    "stackoverflow", "visa", "mastercard", "paypal", "stripe", "apple", "microsoft", "aws",
+    "amazonaws", "wordpress", "blogspot", "substack", "wix",
+    "webflow", "vercel", "netlify", "squarespace", "carrd", "framer", "shopify", "myshopify",
+    "render", "fly", "heroku",
 })
+
+_NON_BRAND_PATH = re.compile(
+    r"(?:\.pdf$|/(?:stocks?|news|blog|press|article|articles|research|document|documents|download|"
+    r"dam|organizations?|companies|profile|price-guide|marketplace|frontend|history|collections)/)",
+    re.I,
+)
 
 _SECOND_LEVEL_SUFFIXES = frozenset({"co", "com", "org", "net", "ac", "gov", "edu"})
 
@@ -116,7 +134,17 @@ class ResearchLoopResult:
 
 def _registrable_label(url: str) -> str:
     """Returns the organisation label of a URL's host, e.g. 'microsoft' for store.microsoft.co.uk."""
+    from orchestrator.agents.market_research.discovery.source_types import MULTI_TENANT_DOMAINS
+
     host = (urlparse(url).hostname or "").lower()
+    for mtd in MULTI_TENANT_DOMAINS:
+        if host == mtd:
+            return mtd.split(".")[0]
+        if host.endswith("." + mtd):
+            sub = host[: -len(mtd) - 1]
+            sub_parts = sub.split(".")
+            return sub_parts[-1] if sub_parts else mtd.split(".")[0]
+
     parts = [p for p in host.split(".") if p]
     if len(parts) >= 3 and parts[-2] in _SECOND_LEVEL_SUFFIXES and len(parts[-1]) == 2:
         return parts[-3]
@@ -132,6 +160,10 @@ def _normalize_url(url: str) -> str:
 
 
 def is_competitor_source(url: str) -> bool:
+    if not url:
+        return False
+    if _NON_BRAND_PATH.search(urlparse(url).path or ""):
+        return False
     return _registrable_label(url) not in NON_COMPETITOR_DOMAINS
 
 
@@ -162,16 +194,35 @@ _PRICE_EXTRACT_RE = re.compile(
 )
 
 
+_NON_PRICING_CONTEXT = re.compile(
+    r"\b(?:penalt(?:y|ies)|liabilit(?:y|ies)|bond|insurance|processing volume|transaction volume|"
+    r"volume of|turnover|valuation|raised|funding|fine|fines|damages|settlement)\b",
+    re.IGNORECASE,
+)
+
+
 def _has_price(text: str) -> bool:
+    if _NON_PRICING_CONTEXT.search(text):
+        return False
     return bool(_PRICE_AMOUNT_RE.search(text))
 
 
 def _extract_price(text: str) -> str | None:
+    if _NON_PRICING_CONTEXT.search(text):
+        return None
     match = _PRICE_EXTRACT_RE.search(text)
     if not match:
         return None
-    # Trailing separators get swept up by the digit class ("$49." at a sentence end).
-    return match.group(0).strip().rstrip(".,;:") or None
+    price = match.group(0).strip().rstrip(".,;:")
+    p_num = re.search(r"\d[\d,.]*", price)
+    if p_num:
+        try:
+            val = float(p_num.group(0).replace(",", ""))
+            if "/mo" in price.lower() and val > 50_000:
+                return None
+        except ValueError:
+            pass
+    return price or None
 
 _WEAKNESS_KEYWORDS = (
     "issue", "complaint", "wish it had", "problem", "disappointed",
@@ -231,36 +282,61 @@ def _is_praise(text: str) -> bool:
     return bool(_PRAISE_RE.search(text)) and not _COMPLAINT_RE.search(text)
 
 
-# "4.6 out of 5", "4.6/5", "Rated 4.6". Bounded to a 0-5 scale so a price or a year cannot
-# be read as a rating.
+# "4.6 out of 5", "4.6/5", "4.6/5.0", "Rated 4.6", "Rating: 4.6", "4.6★", JSON-LD ratingValue.
+# Bounded to a 0-5 scale so a price or a year cannot be read as a rating.
 _RATING_RE = re.compile(
-    r"\b([0-5](?:\.\d)?)\s*(?:/\s*5\b|out of\s+5\b|stars?\b)",
+    r"(?:"
+    r"\b([0-5](?:\.\d{1,2})?)\s*(?:/\s*5(?:\.0)?\b|out of\s+5(?:\.0)?\b|stars?\b|★)"
+    r"|(?:rating|rated|score)[\s:]+([0-5](?:\.\d{1,2})?)(?:\s*(?:/\s*5(?:\.0)?|stars?|★))?"
+    r'|"ratingValue"\s*:\s*"?([0-5](?:\.\d{1,2})?)"?'
+    r")",
     re.IGNORECASE,
 )
 
-# "1,240 reviews", "based on 312 ratings"
+# "1,240 reviews", "based on 312 ratings", schema.org reviewCount
 _REVIEW_COUNT_RE = re.compile(
-    r"\b(\d{1,3}(?:,\d{3})*|\d+)\s+(?:customer\s+|verified\s+|user\s+)?(?:reviews?|ratings?)\b",
+    r"(?:"
+    r"\b(\d{1,3}(?:,\d{3})*|\d+)\s+(?:customer\s+|verified\s+|user\s+)?(?:reviews?|ratings?)\b"
+    r'|"reviewCount"\s*:\s*"?(\d+)"?'
+    r")",
+    re.IGNORECASE,
+)
+
+
+_ARTICLE_RATING_RE = re.compile(
+    r"\b(?:rate this (?:article|post|page)|article rating|post rating|editorial rating|author rating)\b",
     re.IGNORECASE,
 )
 
 
 def _extract_rating(text: str) -> str | None:
-    match = _RATING_RE.search(text)
-    return match.group(1) if match else None
+    if not text or _ARTICLE_RATING_RE.search(text):
+        return None
+    for match in _RATING_RE.finditer(text):
+        for group in match.groups():
+            if group is not None:
+                try:
+                    val = float(group)
+                    if 1.0 <= val <= 5.0:
+                        return f"{val:.1f}" if "." in group else str(int(val))
+                except ValueError:
+                    continue
+    return None
 
 
 def _extract_review_count(text: str) -> int | None:
-    match = _REVIEW_COUNT_RE.search(text)
-    if not match:
+    if not text:
         return None
-    try:
-        value = int(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
-    # A single-digit "3 reviews" is noise more often than signal, and an absurd count means
-    # the number belonged to something else on the page.
-    return value if 3 <= value <= 10_000_000 else None
+    for match in _REVIEW_COUNT_RE.finditer(text):
+        for group in match.groups():
+            if group is not None:
+                try:
+                    value = int(group.replace(",", ""))
+                    if 3 <= value <= 10_000_000:
+                        return value
+                except ValueError:
+                    continue
+    return None
 
 
 _LISTICLE_RE = re.compile(
@@ -304,9 +380,24 @@ def _known_competitor_profile(
     profile = CompetitorProfile(brand_name=name, product_name=name)
     for p in matched:
         profile.pricing_model = profile.pricing_model or p.pricing_model
+        profile.rating = profile.rating or p.rating
+        profile.review_count = profile.review_count or p.review_count
+        profile.founded = profile.founded or p.founded
+        profile.headquarters = profile.headquarters or p.headquarters
+        profile.operating_locations.extend(l for l in p.operating_locations if l not in profile.operating_locations)
+        profile.other_products.extend(op for op in p.other_products if op not in profile.other_products)
+        profile.product_catalog_count = profile.product_catalog_count or p.product_catalog_count
         profile.sources.extend(u for u in p.sources if u not in profile.sources)
         profile.factual_evidence.extend(e for e in p.factual_evidence if e not in profile.factual_evidence)
         profile.weaknesses_mined.extend(w for w in p.weaknesses_mined if w not in profile.weaknesses_mined)
+        profile.strengths_mined.extend(s for s in p.strengths_mined if s not in profile.strengths_mined)
+        profile.core_claims.extend(c for c in p.core_claims if c not in profile.core_claims)
+        for k, v in (p.dynamic_attributes or {}).items():
+            profile.dynamic_attributes.setdefault(k, v)
+        for m in p.milestones:
+            if m not in profile.milestones:
+                profile.milestones.append(m)
+
     for r in search_results:
         if not r.url or len(r.snippet) <= 25 or name_lower not in r.snippet.lower():
             continue
@@ -314,8 +405,15 @@ def _known_competitor_profile(
             profile.sources.append(r.url)
         if not profile.pricing_model and _has_price(r.snippet):
             profile.pricing_model = PLACEHOLDER_PRICING
+        combined = f"{r.title} {r.snippet}"
+        if not profile.rating:
+            profile.rating = _extract_rating(combined)
+        if not profile.review_count:
+            profile.review_count = _extract_review_count(combined)
         if _is_complaint(r.snippet) and r.snippet[:200] not in profile.weaknesses_mined:
             profile.weaknesses_mined.append(r.snippet[:200])
+        if _is_praise(r.snippet) and r.snippet[:200] not in profile.strengths_mined:
+            profile.strengths_mined.append(r.snippet[:200])
         evidence = f'"{r.snippet[:200].strip()}..."'
         if len(profile.factual_evidence) < 6 and evidence not in profile.factual_evidence:
             profile.factual_evidence.append(evidence)
@@ -325,6 +423,7 @@ def _known_competitor_profile(
 def extract_preliminary_competitors(
     search_results: list[TavilySearchResult],
     known_competitors: list[str] | None = None,
+    merchant_context: dict[str, Any] | None = None,
 ) -> list[CompetitorProfile]:
     """
     Extracts candidate competitor profiles from factual search snippets.
@@ -333,12 +432,21 @@ def extract_preliminary_competitors(
     social networks, ad libraries and listicle/comparison articles never become competitors;
     their complaints are attached to the competitor profile whose name they best match instead.
     Competitors the merchant named come first, built from the evidence that mentions them.
+    The merchant's own business name and website domain are always excluded.
     """
+    from orchestrator.agents.market_research.discovery.source_types import (
+        is_merchant_identity,
+        merchant_identifiers,
+    )
+
+    merchant_name_keys, merchant_hosts = merchant_identifiers(merchant_context)
     profiles: dict[str, CompetitorProfile] = {}
     review_results: list[TavilySearchResult] = []
 
     for r in search_results:
         if not r.url:
+            continue
+        if is_merchant_identity("", [r.url], merchant_name_keys, merchant_hosts):
             continue
         if not is_competitor_source(r.url) or is_listicle(r.title, r.url):
             review_results.append(r)
@@ -352,6 +460,11 @@ def extract_preliminary_competitors(
 
         brand_name = _extract_brand_from_url(r.url)
         clean_title = _clean_product_name(r.title or "", brand_name)
+
+        if is_merchant_identity(brand_name, [r.url], merchant_name_keys, merchant_hosts):
+            continue
+        if is_merchant_identity(clean_title, [r.url], merchant_name_keys, merchant_hosts):
+            continue
 
         key = _normalize_url(r.url)
         existing = profiles.get(key)
@@ -384,19 +497,26 @@ def extract_preliminary_competitors(
     # Review pages also carry the rating and the review count, which is the social proof a
     # merchant judges a rival on long before they read any individual complaint.
     for r in review_results:
-        text_lower = f"{r.title} {r.snippet}".lower()
+        combined = f"{r.title} {r.snippet}"
+        text_lower = combined.lower()
         named = [p for p in profiles.values() if p.brand_name.lower() in text_lower]
         if len(named) != 1:
             continue  # ambiguous page: a rating here could belong to any rival it lists
         profile = named[0]
-        if profile.rating is None:
-            rating = _extract_rating(r.snippet)
-            if rating:
+        rating = _extract_rating(combined)
+        count = _extract_review_count(combined)
+        if count and profile.review_count is None:
+            profile.review_count = count
+        if rating and profile.rating is None:
+            effective_count = count or profile.review_count
+            if effective_count is not None and effective_count >= 3:
                 profile.rating = rating
-        if profile.review_count is None:
-            count = _extract_review_count(r.snippet)
-            if count:
-                profile.review_count = count
+            elif effective_count is None:
+                try:
+                    if float(rating) not in (1.0, 5.0):
+                        profile.rating = rating
+                except ValueError:
+                    pass
 
     # Attach review/forum praise to the best-matching competitor the text names.
     for r in review_results:
@@ -438,21 +558,56 @@ def extract_preliminary_competitors(
         if r.url not in best.sources:
             best.sources.append(r.url)
 
-
-    discovered = list(profiles.values())
+    discovered = [
+        p for p in profiles.values()
+        if not is_merchant_identity(p.brand_name, p.sources, merchant_name_keys, merchant_hosts)
+        and not is_merchant_identity(p.product_name, p.sources, merchant_name_keys, merchant_hosts)
+    ]
     if not known_competitors:
         return discovered
 
     known = [_known_competitor_profile(n, discovered, search_results) for n in known_competitors if n.strip()]
+    known = [
+        k for k in known
+        if not is_merchant_identity(k.brand_name, k.sources, merchant_name_keys, merchant_hosts)
+    ]
     known_keys = {"".join(c for c in k.brand_name.lower() if c.isalnum()) for k in known}
     rest = [p for p in discovered if "".join(c for c in p.brand_name.lower() if c.isalnum()) not in known_keys]
     return known + rest
+
+
+def split_named(
+    competitors: list[CompetitorProfile],
+    named: list[str] | None,
+    cap: int,
+) -> tuple[list[CompetitorProfile], list[CompetitorProfile], list[CompetitorProfile]]:
+    """
+    (named within cap, named past cap, discovered), each in input order.
+
+    The merchant's own list and the agent's discoveries are two separate quotas. Cutting one
+    ranked list at N let named rivals (always ranked first) take every slot: name five and the
+    agent researched none of its own.
+    """
+    keys = {_norm_key(n) for n in (named or []) if n and n.strip()}
+    picked, overflow, discovered = [], [], []
+    for c in competitors:
+        brand = _norm_key(c.brand_name)
+        if keys and (brand in keys or _norm_key(c.product_name) in keys):
+            (picked if len(picked) < cap else overflow).append(c)
+        elif len(brand) >= 4 and any(k.startswith(brand) for k in keys):
+            # The parent company of a named product ("Logitech" when "Logitech Lift" was
+            # named) is already covered; it must not use up one of the discovery slots.
+            continue
+        else:
+            discovered.append(c)
+    return picked, overflow, discovered
 
 
 def rank_competitors(
     competitors: list[CompetitorProfile],
     search_results: list[TavilySearchResult],
     known_competitors: list[str] | None = None,
+    merchant_context: dict[str, Any] | None = None,
 ) -> list[CompetitorProfile]:
     """
     Orders discovered competitors strongest-first so deep crawl can spend its page budget on
@@ -464,8 +619,29 @@ def rank_competitors(
     complaints rather than in one lucky result; search relevance and corroborating source
     count break the remaining ties.
     """
+    from orchestrator.agents.market_research.discovery.source_types import (
+        is_never_a_brand,
+        is_merchant_identity,
+        merchant_identifiers,
+    )
+
+    merchant_name_keys, merchant_hosts = merchant_identifiers(merchant_context)
     competitors = merge_duplicate_competitors(competitors)
     known_keys = {_norm_key(n) for n in (known_competitors or []) if n.strip()}
+    # Directories, data aggregators and code hosts are never rivals. Ranked by mentions they
+    # top the list (every rival has a Clutch and a GitHub page), and the deep crawl then spent
+    # its page budget on them: one run crawled GitHub, Clutch and Crunchbase while three real
+    # rivals' own sites went unread. A rival the merchant named is always kept.
+    # The merchant itself is always excluded.
+    competitors = [
+        c for c in competitors
+        if not is_merchant_identity(c.brand_name, c.sources, merchant_name_keys, merchant_hosts)
+        and not is_merchant_identity(c.product_name, c.sources, merchant_name_keys, merchant_hosts)
+        and (
+            _norm_key(c.brand_name) in known_keys
+            or not (is_never_a_brand(c.brand_name) or (c.sources and is_never_a_brand(c.sources[0])))
+        )
+    ]
 
     vectors_by_host: dict[str, set[str]] = {}
     best_score_by_host: dict[str, float] = {}
@@ -541,6 +717,53 @@ def _extract_milestones(text: str) -> list[str]:
     return out
 
 
+_HQ_RE = re.compile(
+    r"\b(?:headquartered\s+(?:in|at)|headquarters(?:\s+in|:|\s+located\s+in)?|based\s+in|main\s+office\s+in)\s+([A-Z][A-Za-z0-9\s,.-]{2,40}?)(?=[.;\n]|and\b|\band\s+operat|\bwith|\bserve|\bemploy)",
+    re.IGNORECASE,
+)
+
+_LOC_RE = re.compile(
+    r"\b(?:operating\s+in|active\s+in|branches\s+in|presence\s+in|serving|available\s+in|locations\s+in|offices\s+in)\s+([A-Za-z0-9\s,.-]{3,60}?)(?=[.;\n]|\bwith\b|\band\s+has\b)",
+    re.IGNORECASE,
+)
+
+_CATALOG_COUNT_RE = re.compile(
+    r"\b(\d+)\s+(?:different\s+)?(?:products|models|systems|appliances|skus|product\s+lines|variants)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_headquarters(text: str) -> str | None:
+    match = _HQ_RE.search(text)
+    if not match:
+        return None
+    val = match.group(1).strip().rstrip(".,;:")
+    return val if len(val) >= 3 else None
+
+
+def _extract_operating_locations(text: str) -> list[str]:
+    out: list[str] = []
+    for match in _LOC_RE.finditer(text):
+        item = match.group(1).strip().rstrip(".,;:")
+        if len(item) >= 3 and item not in out:
+            out.append(item)
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _extract_catalog_count(text: str) -> int | None:
+    match = _CATALOG_COUNT_RE.search(text)
+    if match:
+        try:
+            val = int(match.group(1))
+            if 1 <= val <= 5000:
+                return val
+        except ValueError:
+            pass
+    return None
+
+
 def merge_duplicate_competitors(
     competitors: list[CompetitorProfile],
 ) -> list[CompetitorProfile]:
@@ -571,6 +794,23 @@ def merge_duplicate_competitors(
                 primary.pricing_model = c.pricing_model
             elif not primary.pricing_model:
                 primary.pricing_model = c.pricing_model
+
+        if not primary.rating and c.rating:
+            primary.rating = c.rating
+        if not primary.review_count and c.review_count:
+            primary.review_count = c.review_count
+        if not primary.founded and c.founded:
+            primary.founded = c.founded
+        if not primary.headquarters and c.headquarters:
+            primary.headquarters = c.headquarters
+        for loc in c.operating_locations:
+            if loc and loc not in primary.operating_locations:
+                primary.operating_locations.append(loc)
+        for prod in c.other_products:
+            if prod and prod not in primary.other_products:
+                primary.other_products.append(prod)
+        if not primary.product_catalog_count and c.product_catalog_count:
+            primary.product_catalog_count = c.product_catalog_count
 
         for claim in c.core_claims:
             if claim and claim not in primary.core_claims:
@@ -646,6 +886,18 @@ def enrich_competitors_from_pages(
             founded = _extract_founded(markdown)
             if founded:
                 comp.founded = founded
+        if not comp.headquarters:
+            hq = _extract_headquarters(markdown)
+            if hq:
+                comp.headquarters = hq
+        if not comp.operating_locations:
+            locs = _extract_operating_locations(markdown)
+            if locs:
+                comp.operating_locations = locs
+        if not comp.product_catalog_count:
+            cat_count = _extract_catalog_count(markdown)
+            if cat_count:
+                comp.product_catalog_count = cat_count
         if len(comp.milestones) < 6:
             for event in _extract_milestones(markdown):
                 if event not in comp.milestones:
@@ -780,7 +1032,10 @@ async def execute_research_loop(
         update_time_range = _time_range_since(prior_run_at)
 
     queries: list[SearchQuery] = build_search_queries(
-        merchant_context, taxonomy=initial_taxonomy, time_range_override=update_time_range
+        merchant_context,
+        taxonomy=initial_taxonomy,
+        time_range_override=update_time_range,
+        include_leap=True,
     )
     taxonomy = initial_taxonomy
 
@@ -833,12 +1088,15 @@ async def execute_research_loop(
         # can be aimed at the shortlist; selecting crawl targets from raw search results spread
         # it across every host that appeared and left each real rival with a single page.
         preliminary_competitors = extract_preliminary_competitors(
-            accumulated_search_results, merchant_context.get("known_competitors") or []
+            accumulated_search_results,
+            merchant_context.get("known_competitors") or [],
+            merchant_context=merchant_context,
         )
         preliminary_competitors = rank_competitors(
             preliminary_competitors,
             accumulated_search_results,
             merchant_context.get("known_competitors") or [],
+            merchant_context=merchant_context,
         )
 
         # The list is settled once, from the first search, before any deep work starts. Later
@@ -874,10 +1132,13 @@ async def execute_research_loop(
                 )
                 preliminary_competitors = rank_competitors(
                     extract_preliminary_competitors(
-                        accumulated_search_results, merchant_context.get("known_competitors") or []
+                        accumulated_search_results,
+                        merchant_context.get("known_competitors") or [],
+                        merchant_context=merchant_context,
                     ),
                     accumulated_search_results,
                     merchant_context.get("known_competitors") or [],
+                    merchant_context=merchant_context,
                 )
                 new_strong = {c.product_name for c in preliminary_competitors[:10]} - top_before
                 await _report(
@@ -900,8 +1161,15 @@ async def execute_research_loop(
                     for c in preliminary_competitors
                     if c.relevance_reason
                 }
+            # Named rivals are deep-researched on top of the usual discoveries, never instead
+            # of them (see split_named).
+            named_now, _, found_now = split_named(
+                preliminary_competitors,
+                merchant_context.get("merchant_named_competitors"),
+                settings.research_max_named_competitors,
+            )
             locked_names = [
-                c.product_name for c in preliminary_competitors[: settings.research_deep_crawl_competitors]
+                c.product_name for c in named_now + found_now[: settings.research_deep_crawl_competitors]
             ]
             await _report(
                 on_progress,

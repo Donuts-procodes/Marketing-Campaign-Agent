@@ -1,9 +1,10 @@
 """
 Crawl API client for deep search and ad-library pages. Fetches live pages, rendered in a
-headless browser, and returns them as markdown. Two providers are supported:
+headless browser, and returns them as markdown. Supported providers:
 
-  - Firecrawl  POST https://api.firecrawl.dev/v2/scrape         (FIRECRAWL_API_KEY; preferred)
-  - Crawlbase  GET  https://api.crawlbase.com/?token=..&url=..  (CRAWLAPI_TOKEN / CRAWLAPI_JS_TOKEN)
+  - Scrape.do  GET  https://api.scrape.do/?token=..&url=..&output=markdown (SCRAPEDO_API_KEY; preferred)
+  - Firecrawl  POST https://api.firecrawl.dev/v2/scrape                   (FIRECRAWL_API_KEY; legacy)
+  - Crawlbase  GET  https://api.crawlbase.com/?token=..&url=..            (CRAWLAPI_TOKEN / CRAWLAPI_JS_TOKEN)
 
 Every fetch either returns a real page body or raises CrawlAPIError; nothing is filled in.
 """
@@ -20,16 +21,28 @@ from orchestrator.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+SCRAPEDO_ENDPOINT = "https://api.scrape.do/"
 FIRECRAWL_ENDPOINT = "https://api.firecrawl.dev/v2/scrape"
 CRAWLBASE_ENDPOINT = "https://api.crawlbase.com/"
 
 # Target-site statuses that still carry a real page body.
 _OK_STATUSES = {200, 201, 203, 204}
 
-# Firecrawl plans are rate limited per minute: cap concurrency process-wide and retry on 429.
+# Retries on 429 rate limit
+_SCRAPEDO_RETRIES = 3
 _FIRECRAWL_RETRIES = 3
-# Keyed by (loop id, limit) so a settings change takes effect without a restart.
+_scrapedo_semaphores: dict[tuple[int, int], asyncio.Semaphore] = {}
 _firecrawl_semaphores: dict[tuple[int, int], asyncio.Semaphore] = {}
+
+
+def _scrapedo_semaphore() -> asyncio.Semaphore:
+    limit = max(get_settings().crawl_max_concurrent, 1)
+    key = (id(asyncio.get_running_loop()), limit)
+    sem = _scrapedo_semaphores.get(key)
+    if sem is None:
+        _scrapedo_semaphores.clear()
+        sem = _scrapedo_semaphores[key] = asyncio.Semaphore(limit)
+    return sem
 
 
 def _firecrawl_semaphore() -> asyncio.Semaphore:
@@ -64,8 +77,14 @@ class CrawlAPIClient:
         js_token: str | None = None,
         timeout: float | None = None,
         firecrawl_api_key: str | None = None,
+        scrapedo_api_key: str | None = None,
     ) -> None:
         settings = get_settings()
+        self.scrapedo_api_key = (
+            scrapedo_api_key
+            if scrapedo_api_key is not None
+            else getattr(settings, "scrapedo_api_key", "")
+        )
         self.firecrawl_api_key = (
             firecrawl_api_key if firecrawl_api_key is not None else settings.firecrawl_api_key
         )
@@ -75,6 +94,8 @@ class CrawlAPIClient:
 
     @property
     def provider(self) -> str | None:
+        if self.scrapedo_api_key:
+            return "scrapedo"
         if self.firecrawl_api_key:
             return "firecrawl"
         if self.token or self.js_token:
@@ -87,8 +108,7 @@ class CrawlAPIClient:
 
     @property
     def can_render_js(self) -> bool:
-        # Firecrawl always renders in a browser; Crawlbase needs its JavaScript token.
-        return bool(self.firecrawl_api_key or self.js_token)
+        return bool(self.scrapedo_api_key or self.firecrawl_api_key or self.js_token)
 
     async def fetch(
         self,
@@ -102,9 +122,15 @@ class CrawlAPIClient:
         country: str | None = None,
         provider: str | None = None,
     ) -> dict[str, Any]:
-        """`provider` forces "firecrawl" or "crawlbase"; by default Firecrawl is used when configured."""
-        use_firecrawl = provider == "firecrawl" or (provider is None and bool(self.firecrawl_api_key))
-        if use_firecrawl:
+        """`provider` forces "scrapedo", "firecrawl" or "crawlbase"; Scrape.do is preferred when configured."""
+        use_provider = provider or self.provider
+        if use_provider == "scrapedo":
+            if not self.scrapedo_api_key:
+                raise CrawlAPIError("SCRAPEDO_API_KEY not configured")
+            return await self._fetch_scrapedo(
+                url, javascript=javascript, country=country
+            )
+        if use_provider == "firecrawl":
             if not self.firecrawl_api_key:
                 raise CrawlAPIError("FIRECRAWL_API_KEY not configured")
             return await self._fetch_firecrawl(
@@ -119,6 +145,59 @@ class CrawlAPIClient:
             scroll=scroll,
             country=country,
         )
+
+    async def _fetch_scrapedo(
+        self,
+        url: str,
+        *,
+        javascript: bool = True,
+        country: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "token": self.scrapedo_api_key,
+            "url": url,
+            "output": "markdown",
+        }
+        if javascript:
+            params["render"] = "true"
+        if country:
+            params["geoCode"] = country.lower()
+
+        response: httpx.Response | None = None
+        for attempt in range(max(_SCRAPEDO_RETRIES, 0) + 1):
+            async with _scrapedo_semaphore(), httpx.AsyncClient(timeout=self.timeout + 15) as client:
+                response = await client.get(SCRAPEDO_ENDPOINT, params=params)
+            if response.status_code != 429 or attempt == _SCRAPEDO_RETRIES:
+                break
+            wait = _retry_after_seconds(response, attempt)
+            logger.info("Scrape.do rate limited; retrying %s in %.0fs", url, wait)
+            await asyncio.sleep(wait)
+
+        if response is None:
+            raise CrawlAPIError(f"Scrape.do made no request for {url}")
+
+        if response.status_code != 200:
+            raise CrawlAPIError(f"Scrape.do failed for {url} (HTTP {response.status_code}): {response.text[:200]}")
+
+        target_status = _int_header(
+            response.headers.get("scrape.do-initial-status-code")
+            or response.headers.get("sc-status")
+            or response.headers.get("original-status")
+        ) or 200
+
+        if target_status not in _OK_STATUSES and target_status != 200:
+            raise CrawlAPIError(f"Target returned HTTP {target_status} for {url}")
+
+        body = response.text or ""
+        if not body.strip():
+            raise CrawlAPIError(f"Empty page body for {url}")
+
+        resolved_url = response.headers.get("scrape.do-resolved-url") or url
+        return {
+            "url": resolved_url,
+            "status": target_status,
+            "body": body,
+        }
 
     async def _fetch_firecrawl(
         self,

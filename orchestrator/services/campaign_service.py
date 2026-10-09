@@ -21,6 +21,7 @@ from orchestrator.schemas.api import BYOKConfig, CampaignCreate, ReportEdit
 from orchestrator.schemas.research import CompetitorProfile, SWOTReportDelta
 from orchestrator.services.report_edits import ReportEditError, apply_report_edits
 from orchestrator.schemas.state import StrategyState
+from orchestrator.schemas.strategy import CampaignStrategyBrief
 from orchestrator.services.dossier import combine_documents
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,14 @@ class ResearchKeysMissingError(Exception):
     """Raised when live research is impossible; the service never substitutes sample data."""
 
 
+# Events after which a run is over; anything else as the last event means it was still going.
+_TERMINAL_EVENTS = frozenset({"RUN_COMPLETE", "RUN_FAILED"})
+# How long a run held by no process may stay silent before it is declared interrupted. Longer
+# than the slowest single pipeline step without a log line (a crawl batch, ~80s), so a run
+# alive in another worker is never cut off.
+_ORPHAN_QUIET_SECONDS = 120
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -85,6 +94,7 @@ class CampaignJob:
         self.is_started: bool = False
         self.is_finished: bool = False
         self.last_swot_report: SWOTReportDelta | None = None
+        self.strategy_brief: CampaignStrategyBrief | None = None
         self.task: asyncio.Task[None] | None = None
         self.report_lock: asyncio.Lock = asyncio.Lock()
         self.created_at: float = time.monotonic()
@@ -166,6 +176,9 @@ class CampaignService:
         raw_report = doc.get("report")
         if raw_report:
             restored.last_swot_report = SWOTReportDelta(**raw_report)
+        raw_brief = doc.get("strategy_brief")
+        if raw_brief:
+            restored.strategy_brief = CampaignStrategyBrief(**raw_brief)
         restored.bench_competitors = [
             CompetitorProfile(**c) for c in doc.get("bench_competitors") or []
         ]
@@ -235,6 +248,29 @@ class CampaignService:
                 for evt in events:
                     if evt["seq"] > after_seq:
                         yield self._format_frame(evt)
+                # A run that is not in this process's memory, never reached a final event, and
+                # has gone quiet was killed by a restart (a code reload or a crash): the pipeline
+                # runs in-process and does not resume. Without a final event the page waited on
+                # it forever, re-polling the same position every two seconds.
+                last = events[-1]
+                stamp = last.get("timestamp")
+                # No timestamp means no way to tell how long it has been quiet: never declare it.
+                quiet_s = (_now_ms() - int(stamp)) / 1000 if stamp else 0
+                if last.get("type") not in _TERMINAL_EVENTS and quiet_s >= _ORPHAN_QUIET_SECONDS:
+                    failed = {
+                        "type": "RUN_FAILED",
+                        "seq": int(last.get("seq", len(events) - 1)) + 1,
+                        "message": (
+                            "This run was interrupted: the server restarted while it was in progress, "
+                            "so it could not finish. Start the research again."
+                        ),
+                        "timestamp": _now_ms(),
+                    }
+                    # Stored so every later reconnect sees the same final answer.
+                    await storage.append_event(job_id, failed)
+                    logger.warning("Job %s was orphaned by a restart; marked as interrupted", job_id)
+                    if failed["seq"] > after_seq:
+                        yield self._format_frame(failed)
                 return
             err_frame = {
                 "type": "RUN_FAILED",
@@ -314,10 +350,10 @@ class CampaignService:
                     f"Live research needs {' and '.join(missing)}; no sample data is substituted."
                 )
             settings = get_settings()
-            if not (settings.firecrawl_api_key or settings.crawlapi_token or settings.crawlapi_js_token):
+            if not (settings.scrapedo_api_key or settings.firecrawl_api_key or settings.crawlapi_token or settings.crawlapi_js_token):
                 await self._log(
                     job,
-                    "[DEEP_SEARCH] No crawl API key (FIRECRAWL_API_KEY or CRAWLAPI_TOKEN) — deep search "
+                    "[DEEP_SEARCH] No crawl API key (SCRAPEDO_API_KEY, FIRECRAWL_API_KEY or CRAWLAPI_TOKEN) — deep search "
                     "uses Tavily Extract only; LinkedIn/Google ad libraries are skipped.",
                     level="WARN",
                 )
@@ -330,6 +366,7 @@ class CampaignService:
                         f"DuckDuckGo ({settings.duckduckgo_mode})",
                         settings.duckduckgo_mode.lower() != "off",
                     ),
+                    ("Scrape.do", settings.scrapedo_api_key),
                     ("Firecrawl", settings.firecrawl_api_key),
                     ("Crawlbase", settings.crawlapi_token or settings.crawlapi_js_token),
                     ("Meta Ad Library API", settings.meta_access_token),
@@ -351,12 +388,32 @@ class CampaignService:
                 },
             )
 
-            # Downstream agents are not implemented yet; report them as skipped pass-throughs.
-            for node in ("audience_persona", "campaign_strategy"):
-                await self._emit_event(job, {"type": "NODE_STARTED", "node": node, "timestamp": _now_ms()})
-                await self._log(job, f"[{node.upper()}] Agent not implemented yet — skipped.")
+            # Stage 2: Audience Persona (Reserved for Stage 2 expansion)
+            await self._emit_event(job, {"type": "NODE_STARTED", "node": "audience_persona", "timestamp": _now_ms()})
+            await self._log(job, "[AUDIENCE_PERSONA] Pass-through node; audience profiling reserved for stage 2 expansion.")
+            await self._emit_event(
+                job, {"type": "NODE_COMPLETE", "node": "audience_persona", "delta": {"persona_profiles": []}, "timestamp": _now_ms()}
+            )
+
+            # Stage 3: Campaign Strategy & Budget Decomposition (Loops 1-3)
+            await self._emit_event(job, {"type": "NODE_STARTED", "node": "campaign_strategy", "timestamp": _now_ms()})
+            try:
+                strategy_brief = await self._run_campaign_strategy_node(job, report_delta)
+                job.strategy_brief = strategy_brief
                 await self._emit_event(
-                    job, {"type": "NODE_COMPLETE", "node": node, "delta": {}, "timestamp": _now_ms()}
+                    job,
+                    {
+                        "type": "NODE_COMPLETE",
+                        "node": "campaign_strategy",
+                        "delta": {"strategy_brief": strategy_brief.model_dump()},
+                        "timestamp": _now_ms(),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("Campaign strategy node error for job %s: %s", job.job_id, exc)
+                await self._log(job, f"[STRATEGY] Non-fatal strategy generation error: {exc}", level="WARN")
+                await self._emit_event(
+                    job, {"type": "NODE_COMPLETE", "node": "campaign_strategy", "delta": {}, "timestamp": _now_ms()}
                 )
 
             await self._emit_event(
@@ -410,6 +467,7 @@ class CampaignService:
             "merchant_context": context,
             "dossier_chars": len(job.dossier_text or ""),
             "report": job.last_swot_report.model_dump() if job.last_swot_report else None,
+            "strategy_brief": job.strategy_brief.model_dump() if job.strategy_brief else None,
             # Kept so "find more competitors" can still serve the next in line after a restart.
             "bench_competitors": [c.model_dump() for c in job.bench_competitors],
             "events": job.history_events,
@@ -473,6 +531,19 @@ class CampaignService:
         if job is None and not deleted:
             raise CampaignJobNotFoundError(f"Job {job_id} not found")
 
+    async def _load_baseline(self, job: CampaignJob) -> tuple[SWOTReportDelta | None, str | None]:
+        """The last finished run for this product, as the reading momentum is measured from."""
+        product_name = job.merchant_context.get("product_name", "")
+        category = job.merchant_context.get("category", "")
+        try:
+            doc = await get_storage().find_latest_run_by_product(product_name, category)
+            if doc and doc.get("report"):
+                return SWOTReportDelta(**doc["report"]), str(doc.get("finished_at", "")) or None
+        except Exception as exc:
+            # A missing baseline only costs momentum on this run; never fail research over it.
+            logger.warning("Could not load baseline run for %r: %s", product_name, exc)
+        return None, None
+
     async def _run_market_research_node(self, job: CampaignJob) -> SWOTReportDelta:
         """Runs the market research agent in-process, forwarding its progress to the stream."""
         from orchestrator.agents.market_research.agent import execute_market_research
@@ -509,6 +580,13 @@ class CampaignService:
                 )
                 run_mode = "fresh"
 
+        # Momentum needs two readings. Load the last finished run on every run, not only on
+        # updates, so the threat watch can measure movement even on a fresh scan. It goes in its
+        # own state key: a fresh run must never merge old findings into the new report.
+        baseline_report, baseline_run_at = prior_report, prior_run_at
+        if baseline_report is None:
+            baseline_report, baseline_run_at = await self._load_baseline(job)
+
         state: StrategyState = {
             "merchant_context": job.merchant_context,
             "swot_report": None,
@@ -517,6 +595,8 @@ class CampaignService:
             "run_mode": run_mode,
             "prior_report": prior_report,
             "prior_run_at": prior_run_at,
+            "baseline_report": baseline_report,
+            "baseline_run_at": baseline_run_at,
         }
 
         async def on_progress(message: str, level: str = "INFO") -> None:
@@ -546,6 +626,57 @@ class CampaignService:
                 level="WARN",
             )
         return report
+
+    async def _run_campaign_strategy_node(
+        self, job: CampaignJob, report_delta: SWOTReportDelta
+    ) -> CampaignStrategyBrief:
+        """Runs the Campaign Strategy agent in-process, forwarding its progress to the stream."""
+        from orchestrator.agents.campaign_strategy.agent import execute_campaign_strategy
+
+        state: StrategyState = {
+            "merchant_context": job.merchant_context,
+            "swot_report": report_delta,
+            "persona_profiles": [],
+            "errors": [],
+        }
+
+        async def on_progress(message: str, level: str = "INFO") -> None:
+            await self._log(job, message, level=level)
+
+        delta = await execute_campaign_strategy(
+            state, llm_config=job.byok_config, on_progress=on_progress
+        )
+
+        brief = delta.get("strategy_brief")
+        if isinstance(brief, CampaignStrategyBrief):
+            return brief
+        if isinstance(delta.get("campaign_brief"), dict):
+            return CampaignStrategyBrief(**delta["campaign_brief"])
+        raise RuntimeError("Campaign strategy agent returned no strategy brief")
+
+    async def approve_strategy(self, job_id: str) -> CampaignStrategyBrief:
+        """Confirms founder approval on the strategy brief, preparing downstream execution."""
+        job = await self.get_or_restore_job(job_id)
+        if not job.strategy_brief:
+            if not job.last_swot_report:
+                raise CampaignJobConflictError(f"Job {job_id} does not have a research report yet.")
+            job.strategy_brief = await self._run_campaign_strategy_node(job, job.last_swot_report)
+
+        job.strategy_brief.approval_status = "APPROVED_AND_DISPATCHED"
+        await self._log(
+            job,
+            "[STRATEGY_APPROVED] Founder approval confirmed. Handing off to downstream execution engines.",
+        )
+        await self._emit_event(
+            job,
+            {
+                "type": "STRATEGY_APPROVED",
+                "brief": job.strategy_brief.model_dump(),
+                "timestamp": _now_ms(),
+            },
+        )
+        await get_storage().save_run(self._run_document(job))
+        return job.strategy_brief
 
     # ── On-demand competitor discovery ───────────────────────────────────────
 
@@ -608,6 +739,8 @@ class CampaignService:
             new_competitors = [
                 bench_by_name.get(_norm(n)) or CompetitorProfile(brand_name=n, product_name=n) for n in requested
             ]
+            for c in new_competitors:
+                c.named_by_merchant = True
             job.bench_competitors = [c for c in job.bench_competitors if _norm(c.brand_name) not in {_norm(n) for n in requested}]
             await self._log(
                 job,
@@ -848,6 +981,36 @@ class CampaignService:
 
             await get_storage().save_run(self._run_document(job))
             return report_delta
+
+    async def update_merchant_context(
+        self, job_id: str, field: str, value: Any, reasoning: str | None = None
+    ) -> tuple[dict[str, Any], str]:
+        """
+        Updates initial merchant brief parameters or campaign goal (Human-In-The-Loop).
+        Can update goal, category, target audience, price, value prop, or product name.
+        """
+        job = await self.get_or_restore_job(job_id)
+        old_val = job.merchant_context.get(field)
+        job.merchant_context[field] = value
+
+        msg = f"Updated merchant context '{field}' to '{value}'"
+        if reasoning:
+            msg += f" (Reasoning: {reasoning})"
+        await self._log(job, f"[HITL] {msg}")
+
+        await self._emit_event(
+            job,
+            {
+                "type": "TELEMETRY_LOG",
+                "level": "INFO",
+                "message": f"[HITL] {msg}",
+                "timestamp": _now_ms(),
+            },
+        )
+
+        await get_storage().save_run(self._run_document(job))
+        return job.merchant_context, f"Updated {field.replace('_', ' ')} from '{old_val}' to '{value}'"
+
 
 
 # Global singleton instance for Dependency Injection

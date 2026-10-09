@@ -4,10 +4,11 @@ Pydantic v2 DTOs for Campaign HTTP Ingress and Egress contracts.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.schemas.research import CompetitorProfile, SWOTReportDelta
+from orchestrator.schemas.strategy import CampaignStrategyBrief
 
 
 # Request size limits: the API is a trust boundary and every field ends up in memory and in LLM prompts.
@@ -98,6 +99,7 @@ class AutofillFields(BaseModel):
     price_usd: float | None = Field(default=None, description="Product price in USD, only if a USD price is stated")
     known_competitors: list[str] = Field(default_factory=list, description="Competitor names mentioned in the documents")
     existing_customer_profiles: list[str] = Field(default_factory=list, description="Target customer types mentioned")
+    target_geography: str | None = Field(default=None, description="Target market, city, region, or country (e.g. 'Delhi', 'Austin, TX', 'United States', or 'Global')")
 
 
 class AutofillResponse(BaseModel):
@@ -128,6 +130,7 @@ class SessionDetailResponse(BaseModel):
     finished_at: str | None = None
     merchant_context: dict = Field(default_factory=dict)
     swot_report: SWOTReportDelta | None = None
+    strategy_brief: CampaignStrategyBrief | None = None
     events: list[dict] = Field(default_factory=list)
 
 
@@ -156,7 +159,7 @@ EditableField = Literal[
 class ReportEdit(BaseModel):
     """One merchant correction to a finished report."""
 
-    op: Literal["remove_item", "set_price", "remove_competitor"]
+    op: Literal["remove_item", "set_price", "set_rating", "remove_competitor"]
     competitor: ShortText
     field: EditableField | None = None
     value: Annotated[str, Field(max_length=2000)] | None = None
@@ -229,3 +232,20 @@ class AgentListResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     agents: list[AgentDescriptor]
+
+
+class UpdateContextInput(BaseModel):
+    field: ShortText
+    value: Any
+    reasoning: LongText | None = None
+
+
+class UpdateContextResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    status: str = "ACCEPTED"
+    field: str
+    value: Any
+    applied: str
+    merchant_context: dict[str, Any]
+

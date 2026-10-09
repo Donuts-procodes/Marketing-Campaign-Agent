@@ -178,6 +178,7 @@ declare module "lucide-react" {
   export const Sparkles: any;
   export const BarChart3: any;
   export const TrendingUp: any;
+  export const TrendingDown: any;
   export const DollarSign: any;
   export const Users: any;
   export const Target: any;

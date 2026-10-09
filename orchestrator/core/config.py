@@ -23,7 +23,13 @@ class Settings(BaseSettings):
             "you_api_key", "you_api", "YOU_API_KEY", "YOU_API"
         ),
     )
-    # Crawl API for deep search: Firecrawl (preferred when set) or Crawlbase tokens below
+    # Crawl API for deep search: Scrape.do (preferred when set), Firecrawl or Crawlbase tokens below
+    scrapedo_api_key: str = Field(
+        default="79715dda747943419a8e6fc08dcfad52e24de495001",
+        validation_alias=AliasChoices(
+            "scrapedo_api_key", "scrapedo_token", "SCRAPEDO_API_KEY", "SCRAPEDO_TOKEN",
+        ),
+    )
     firecrawl_api_key: str = Field(
         default="",
         validation_alias=AliasChoices(
@@ -107,11 +113,28 @@ class Settings(BaseSettings):
     # saved, but not deep-crawled until the merchant asks for more. 0 means no limit, which also
     # leaves the bench permanently empty.
     research_max_competitors: int = 5
+    # Rivals the merchant names are researched IN ADDITION to the research_max_competitors the
+    # agent discovers itself; they never use up discovery slots. Capped so a 20-name list
+    # cannot multiply the cost of a run; names past the cap wait on the bench for "find more".
+    research_max_named_competitors: int = 10
     # Deep crawl is competitor-targeted, not URL-targeted. Spraying one page each across every
     # host that appeared in search left pricing at 0/48, because a competitor's single scraped
     # page was almost never their pricing page. These concentrate the same page budget on the
     # shortlist: 5 competitors x 4 pages fetches each one's home, pricing and feature pages.
     research_deep_crawl_competitors: int = 5
+    # Tier 1 wedge scan: a cheap, broad sweep for every player in the merchant's niche,
+    # including brands that launched recently and only show up on launch platforms and forums.
+    # Costs three searches and one light LLM call per run. Off skips the scan entirely.
+    wedge_scan_enabled: bool = True
+    wedge_max_candidates: int = 25
+    # Tier 2 threat watch: how many peer-scale rivals get momentum tracking between scans.
+    threat_watch_size: int = 5
+    # Profile completion: searches for each rival's missing facts (price, rating, reviews,
+    # founded, HQ, team size, revenue, funding) and keeps only values whose source sentence is
+    # verified on a fetched page. Per round: up to 4 searches and N page fetches per rival.
+    profile_completion_enabled: bool = True
+    profile_completion_rounds: int = 2
+    profile_pages_per_competitor: int = 3
     # Max "alternatives to the leaders" search passes before the shortlist is locked; stops
     # earlier once a pass adds no new name to the top 10.
     research_discovery_iterations: int = 3

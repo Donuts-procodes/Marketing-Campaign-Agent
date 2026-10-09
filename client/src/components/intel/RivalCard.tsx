@@ -1,7 +1,24 @@
 import { memo } from "react";
 import { RivalView, relevanceLabel } from "@/lib/rivalMetrics";
 import { cn } from "@/lib/utils";
-import { ArrowRight, Megaphone, ThumbsDown, ThumbsUp, TrendingUp } from "lucide-react";
+import { ArrowRight, Megaphone, ThumbsDown, ThumbsUp, TrendingUp, Clock, MapPin, Layers } from "lucide-react";
+
+/** Why this rival matters to a small merchant; each label is set only with evidence. */
+const COHORTS: Record<string, { label: string; cls: string; hint: string }> = {
+  leapfrog: {
+    label: "Grew from your level",
+    cls: "bg-indigo-50 text-indigo-800 border-indigo-200",
+    hint: "Sells what you sell, and its stated founding year and size show how far it grew.",
+  },
+  catching_up: {
+    label: "Catching up",
+    cls: "bg-rose-50 text-rose-700 border-rose-200",
+    hint: "Your size, and measurably accelerating since the last scan.",
+  },
+  peer: { label: "Your size", cls: "bg-sky-50 text-sky-800 border-sky-200", hint: "Sized from its own stated team, funding or founding facts." },
+  larger: { label: "Larger", cls: "bg-violet-50 text-violet-800 border-violet-200", hint: "Clearly bigger, by stated funding or size." },
+  incumbent: { label: "Category giant", cls: "bg-zinc-100 text-zinc-700 border-zinc-200", hint: "A budget you are not competing with head-on." },
+};
 
 interface RivalCardProps {
   rival: RivalView;
@@ -78,7 +95,10 @@ function Line({ icon: Icon, tone, text }: { icon: typeof ThumbsUp; tone: string;
 
 function RivalCardImpl({ rival, onOpen }: RivalCardProps) {
   const rel = relevanceLabel(rival.relevance);
+  const cohort = COHORTS[rival.comp.cohort ?? ""];
   const reason = rival.comp.relevance_reason;
+  const comp = rival.comp;
+  const hasFootprint = !!(comp.founded || comp.headquarters || (comp.operating_locations && comp.operating_locations.length > 0) || (comp.other_products && comp.other_products.length > 0) || comp.product_catalog_count);
 
   return (
     <button
@@ -99,6 +119,23 @@ function RivalCardImpl({ rival, onOpen }: RivalCardProps) {
             )}
           </div>
           <p className="text-[11px] text-ink-faint truncate">{rival.host ?? rival.subtitle ?? "Own website not found"}</p>
+          {(cohort || rival.comp.named_by_merchant) && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {rival.comp.named_by_merchant && (
+                <span
+                  className="inline-flex px-1.5 py-0.5 rounded-md border text-[10px] font-semibold bg-canvas text-ink-soft border-line"
+                  title="You listed this rival. It was researched in addition to the ones the agent found."
+                >
+                  You named
+                </span>
+              )}
+              {cohort && (
+                <span className={cn("inline-flex px-1.5 py-0.5 rounded-md border text-[10px] font-semibold", cohort.cls)} title={cohort.hint}>
+                  {cohort.label}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -120,6 +157,29 @@ function RivalCardImpl({ rival, onOpen }: RivalCardProps) {
           <RatingBadge rating={rival.rating} reviews={rival.reviewCount} />
         </div>
       </div>
+
+      {hasFootprint && (
+        <div className="mx-4 mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-ink-soft">
+          {comp.founded && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 font-medium">
+              <Clock className="w-2.5 h-2.5" />
+              Est. {comp.founded}
+            </span>
+          )}
+          {(comp.headquarters || (comp.operating_locations && comp.operating_locations.length > 0)) && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 font-medium max-w-[140px] truncate" title={`HQ: ${comp.headquarters ?? comp.operating_locations?.join(", ")}`}>
+              <MapPin className="w-2.5 h-2.5 shrink-0" />
+              <span className="truncate">{comp.headquarters ?? comp.operating_locations?.[0]}</span>
+            </span>
+          )}
+          {((comp.other_products && comp.other_products.length > 0) || comp.product_catalog_count) && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-100 text-zinc-700 font-medium">
+              <Layers className="w-2.5 h-2.5" />
+              {comp.product_catalog_count ? `${comp.product_catalog_count} models` : `${comp.other_products?.length} other models`}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="p-4 space-y-2.5 flex-1">
         <div className="space-y-1">

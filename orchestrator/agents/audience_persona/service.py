@@ -8,12 +8,12 @@ Run with:
 
 from __future__ import annotations
 
+from orchestrator.agents.audience_persona.agent import execute_audience_persona
 from orchestrator.agents.microservice import create_agent_microservice
-from orchestrator.agents.stubs import stub_audience_persona_agent
 
 app = create_agent_microservice(
     agent_name="audience_persona",
-    execute_fn=stub_audience_persona_agent,
+    execute_fn=execute_audience_persona,
     description="Autonomous Audience Persona & ICP Profiling Agent Microservice",
     version="1.0.0",
     service_endpoint="http://agent_audience_persona:8002",
