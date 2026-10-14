@@ -73,7 +73,7 @@ def test_meta_api_errors_never_contain_the_token(monkeypatch):
 
     import httpx
 
-    from orchestrator.agents.market_research.ads import ad_intelligence
+    from orchestrator.agents.market_research.ingestion import ad_intelligence
 
     monkeypatch.setattr(get_settings(), "meta_access_token", "TOKEN_ABC")
     transport = httpx.MockTransport(lambda r: httpx.Response(400, json={"error": {"message": "bad request"}}))

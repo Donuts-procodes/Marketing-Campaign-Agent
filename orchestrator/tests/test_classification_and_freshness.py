@@ -6,18 +6,18 @@ from datetime import date, timedelta
 
 import pytest
 
-from orchestrator.agents.market_research.analysis.classification import (
+from orchestrator.agents.market_research.intelligence.market_mapping.classification import (
     classify_campaign_context,
     classify_heuristically,
 )
-from orchestrator.agents.market_research.analysis.freshness import (
+from orchestrator.agents.market_research.intelligence.validation.freshness import (
     extract_dates,
     extract_publication_date,
     parse_iso_date,
     score_recency,
 )
-from orchestrator.agents.market_research.analysis.scoring import W_RECENCY, calculate_dqs
-from orchestrator.agents.market_research.pipeline.loop import is_research_converged
+from orchestrator.agents.market_research.intelligence.validation.scoring import W_RECENCY, calculate_dqs
+from orchestrator.agents.market_research.workflow.research_loop import is_research_converged
 from orchestrator.schemas.research import CampaignClassification, CompetitorProfile
 
 
@@ -301,7 +301,7 @@ class TestConversationalGoalDisambiguation:
         assert enriched["goal"] == "Scale to 10 clients"
 
     def test_conversational_detection_function(self):
-        from orchestrator.agents.market_research.analysis.classification import is_conversational_statement
+        from orchestrator.agents.market_research.intelligence.market_mapping.classification import is_conversational_statement
 
         assert is_conversational_statement("i want to increase my connections to attract more customers") is True
         assert is_conversational_statement("how to grow my online store sales") is True

@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from orchestrator.agents.market_research.ads import ad_intelligence
-from orchestrator.agents.market_research.ads.ad_intelligence import parse_ad_cards, search_competitor_ad_hooks
-from orchestrator.agents.market_research.discovery.crawlapi import CrawlAPIClient, CrawlAPIError
-from orchestrator.agents.market_research.analysis.grounding import validate_information_grounding
+from orchestrator.agents.market_research.ingestion import ad_intelligence
+from orchestrator.agents.market_research.ingestion.ad_intelligence import parse_ad_cards, search_competitor_ad_hooks
+from orchestrator.agents.market_research.ingestion.web_crawler import CrawlAPIClient, CrawlAPIError
+from orchestrator.agents.market_research.intelligence.validation.grounding import validate_information_grounding
 from orchestrator.schemas.research import CompetitorProfile, SWOTReportDelta
 
 META_PAGE = """
@@ -142,7 +142,7 @@ async def test_crawlapi_client_sends_token_and_rejects_blocked_pages(monkeypatch
     transport = httpx.MockTransport(handler)
     real_client = httpx.AsyncClient
     monkeypatch.setattr(
-        "orchestrator.agents.market_research.discovery.crawlapi.httpx.AsyncClient",
+        "orchestrator.agents.market_research.ingestion.web_crawler.httpx.AsyncClient",
         lambda **kw: real_client(transport=transport, **kw),
     )
     client = CrawlAPIClient(token="normal", js_token="js")
@@ -177,7 +177,7 @@ async def test_crawlapi_client_uses_firecrawl_when_key_set(monkeypatch):
     transport = httpx.MockTransport(handler)
     real_client = httpx.AsyncClient
     monkeypatch.setattr(
-        "orchestrator.agents.market_research.discovery.crawlapi.httpx.AsyncClient",
+        "orchestrator.agents.market_research.ingestion.web_crawler.httpx.AsyncClient",
         lambda **kw: real_client(transport=transport, **kw),
     )
     client = CrawlAPIClient(firecrawl_api_key="fc-test", token="", js_token="")
@@ -194,8 +194,80 @@ async def test_crawlapi_client_uses_firecrawl_when_key_set(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_crawlapi_client_uses_brightdata_when_key_set(monkeypatch):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["auth"] = request.headers.get("Authorization")
+        seen["body"] = _json.loads(request.content)
+        if "blocked" in seen["body"]["url"]:
+            return httpx.Response(200, text="denied", headers={"x-response-code": "403"})
+        return httpx.Response(200, text="# Pricing\n$99/month", headers={"x-response-code": "200"})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "orchestrator.agents.market_research.ingestion.web_crawler.httpx.AsyncClient",
+        lambda **kw: real_client(transport=transport, **kw),
+    )
+    client = CrawlAPIClient(
+        brightdata_api_key="bd-test",
+        brightdata_zone="test_zone",
+        scrapedo_api_key="",
+        firecrawl_api_key="",
+        token="",
+        js_token="",
+    )
+    assert client.provider == "brightdata" and client.can_render_js
+
+    page = await client.fetch("https://acme.com/pricing", country="us")
+    assert page["body"] == "# Pricing\n$99/month"
+    assert seen["auth"] == "Bearer bd-test"
+    assert seen["body"]["zone"] == "test_zone"
+    assert seen["body"]["url"] == "https://acme.com/pricing"
+    assert seen["body"]["country"] == "us"
+
+    with pytest.raises(CrawlAPIError):
+        await client.fetch("https://blocked.example")
+
+
+@pytest.mark.asyncio
+async def test_crawlapi_client_brightdata_falls_back_to_scrapedo(monkeypatch):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "brightdata.com" in str(request.url):
+            seen.append("brightdata")
+            return httpx.Response(400, text="Bad Request: zone not found")
+        if "scrape.do" in str(request.url):
+            seen.append("scrapedo")
+            return httpx.Response(200, text="# Fallback Content", headers={"scrape.do-initial-status-code": "200"})
+        return httpx.Response(500, text="Unknown")
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "orchestrator.agents.market_research.ingestion.web_crawler.httpx.AsyncClient",
+        lambda **kw: real_client(transport=transport, **kw),
+    )
+    client = CrawlAPIClient(
+        brightdata_api_key="bd-test",
+        scrapedo_api_key="sd-test",
+        firecrawl_api_key="",
+        token="",
+        js_token="",
+    )
+    page = await client.fetch("https://acme.com")
+    assert page["body"] == "# Fallback Content"
+    assert seen == ["brightdata", "scrapedo"]
+
+
+
+@pytest.mark.asyncio
 async def test_search_merges_tavily_and_you_results_without_duplicates():
-    from orchestrator.agents.market_research.discovery.search import SearchQuery, execute_tavily_search
+    from orchestrator.agents.market_research.ingestion.search_client import SearchQuery, execute_tavily_search
 
     tavily = AsyncMock()
     tavily.search = AsyncMock(
@@ -226,7 +298,7 @@ async def test_search_merges_tavily_and_you_results_without_duplicates():
 
 
 def test_parse_google_activity_reports_real_advertiser_and_ad_count():
-    from orchestrator.agents.market_research.ads.ad_intelligence import parse_google_activity
+    from orchestrator.agents.market_research.ingestion.ad_intelligence import parse_google_activity
 
     page = "Ads In United States\npipedrive.com\n~2K ads\n_chevron_\n![](x)\nPipedrive Inc.\nVerified\nPipedrive Inc.\nVerified\n"
     assert parse_google_activity(page, "Pipedrive", "US") == "Pipedrive Inc. (Verified) — ~2K ads in US"
@@ -234,8 +306,8 @@ def test_parse_google_activity_reports_real_advertiser_and_ad_count():
 
 
 def test_listicles_are_evidence_and_known_competitors_come_first():
-    from orchestrator.agents.market_research.pipeline.loop import extract_preliminary_competitors
-    from orchestrator.agents.market_research.discovery.search import TavilySearchResult as R
+    from orchestrator.agents.market_research.workflow.research_loop import extract_preliminary_competitors
+    from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult as R
 
     results = [
         R("alternative_discovery", "Best CRM for Small Business in 2026: Our Top Picks", "https://blog.example.com/best-crm",
@@ -277,7 +349,7 @@ def _tavily_returning(n):
 
 @pytest.mark.asyncio
 async def test_duckduckgo_fills_in_when_primary_engines_are_thin(monkeypatch):
-    from orchestrator.agents.market_research.discovery.search import SearchQuery, execute_tavily_search, get_settings
+    from orchestrator.agents.market_research.ingestion.search_client import SearchQuery, execute_tavily_search, get_settings
 
     monkeypatch.setattr(get_settings(), "duckduckgo_mode", "fallback")
     ddg = _ddg_client([{"title": "D", "href": "https://ddg.com", "body": "duck result"}, {"title": "T0", "href": "https://t0.com", "body": "dup"}])
@@ -292,7 +364,7 @@ async def test_duckduckgo_fills_in_when_primary_engines_are_thin(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_duckduckgo_skipped_when_primary_engines_have_enough(monkeypatch):
-    from orchestrator.agents.market_research.discovery.search import SearchQuery, execute_tavily_search, get_settings
+    from orchestrator.agents.market_research.ingestion.search_client import SearchQuery, execute_tavily_search, get_settings
 
     monkeypatch.setattr(get_settings(), "duckduckgo_mode", "fallback")
     ddg = _ddg_client([{"title": "D", "href": "https://ddg.com", "body": "x"}])
@@ -307,7 +379,7 @@ async def test_duckduckgo_skipped_when_primary_engines_have_enough(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_duckduckgo_takes_over_when_primary_engines_fail(monkeypatch):
-    from orchestrator.agents.market_research.discovery.search import SearchQuery, execute_tavily_search, get_settings
+    from orchestrator.agents.market_research.ingestion.search_client import SearchQuery, execute_tavily_search, get_settings
 
     monkeypatch.setattr(get_settings(), "duckduckgo_mode", "fallback")
     broken = AsyncMock()
@@ -327,7 +399,7 @@ async def test_duckduckgo_takes_over_when_primary_engines_fail(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_duckduckgo_always_and_off_modes(monkeypatch):
-    from orchestrator.agents.market_research.discovery.search import SearchQuery, execute_tavily_search, get_settings
+    from orchestrator.agents.market_research.ingestion.search_client import SearchQuery, execute_tavily_search, get_settings
 
     settings = get_settings()
     ddg = _ddg_client([{"title": "D", "href": "https://ddg.com", "body": "x"}])
@@ -344,7 +416,7 @@ async def test_duckduckgo_always_and_off_modes(monkeypatch):
 
 
 def test_ddg_queries_are_plain_keywords_with_shorter_retry():
-    from orchestrator.agents.market_research.discovery.search import _ddg_queries
+    from orchestrator.agents.market_research.ingestion.search_client import _ddg_queries
 
     full, short = _ddg_queries('"DealFlow CRM" OR ("Pipedrive" OR "HubSpot") pricing OR price OR cost OR tiers OR plans OR pricing')
     assert full == "DealFlow CRM Pipedrive HubSpot pricing price cost tiers plans"
@@ -353,7 +425,7 @@ def test_ddg_queries_are_plain_keywords_with_shorter_retry():
 
 @pytest.mark.asyncio
 async def test_duckduckgo_drops_ad_click_urls(monkeypatch):
-    from orchestrator.agents.market_research.discovery.search import SearchQuery, execute_duckduckgo_search
+    from orchestrator.agents.market_research.ingestion.search_client import SearchQuery, execute_duckduckgo_search
 
     ddg = _ddg_client([
         {"title": "Ad", "href": "https://www.bing.com/aclick?ld=abc", "body": "sponsored"},
@@ -364,7 +436,7 @@ async def test_duckduckgo_drops_ad_click_urls(monkeypatch):
 
 
 def test_grounding_rejects_negated_or_reworded_claims():
-    from orchestrator.agents.market_research.analysis.grounding import _document, _is_supported
+    from orchestrator.agents.market_research.intelligence.validation.grounding import _document, _is_supported
 
     page = ("Pipedrive pricing for small teams. Plans start at $14 per seat. Customer support is available by email. "
             "Reporting tools help managers. Many teams switch from spreadsheets.") * 3

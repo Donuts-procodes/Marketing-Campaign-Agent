@@ -8,9 +8,9 @@ were re-attached by exact product name.
 
 import pytest
 
-from orchestrator.agents.market_research.ads import ad_intelligence
+from orchestrator.agents.market_research.ingestion import ad_intelligence
 from orchestrator.agents.market_research.agent import attach_ad_hooks
-from orchestrator.agents.market_research.analysis.grounding import validate_information_grounding
+from orchestrator.agents.market_research.intelligence.validation.grounding import validate_information_grounding
 from orchestrator.schemas.research import CompetitorProfile, SWOTReportDelta
 
 

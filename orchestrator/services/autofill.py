@@ -65,6 +65,68 @@ def _verify(fields: AutofillFields, text: str) -> AutofillFields:
     return fields
 
 
+def _heuristic_extract_from_text(text: str) -> AutofillFields:
+    """Best-effort heuristic parser for dossiers when LLM is unavailable or fails."""
+    fields = AutofillFields()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return fields
+
+    # Attempt to extract product/brand name from first lines or headers
+    for line in lines[:10]:
+        clean = re.sub(r"^[#\*\-=\s]+", "", line).strip()
+        if not clean or clean.lower().startswith("sheet:") or len(clean) > 80:
+            continue
+        # Check brand patterns like "Brand: XYZ" or "Product: XYZ" or "Dossier: XYZ"
+        match_brand = re.search(r"(?:brand|product|company|client|dossier)\s*[:\-–]\s*([A-Za-z0-9\s&'\.]+)", clean, re.I)
+        if match_brand:
+            fields.product_name = match_brand.group(1).strip()
+            break
+        # Or a standalone capitalized title like "Aurelius Footwear Dossier"
+        if not fields.product_name and 3 <= len(clean.split()) <= 6:
+            fields.product_name = clean
+            break
+
+    # Target geography
+    geo_patterns = [
+        r"(?:geography|target market|region|country|territory|market)\s*[:\-–]\s*([A-Za-z\s,]+)",
+        r"\b(India|United States|USA|UK|Europe|Australia|Canada|Global)\b"
+    ]
+    for pat in geo_patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            fields.target_geography = m.group(1).strip()
+            break
+
+    # Value proposition / Goal
+    goal_patterns = [
+        r"(?:goal|objective|mission|value prop|value proposition|positioning)\s*[:\-–]\s*([^\n\r]+)",
+        r"(?:overview|summary)\s*[:\-–]\s*([^\n\r]+)"
+    ]
+    for pat in goal_patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            fields.goal = m.group(1).strip()
+            fields.primary_value_prop = fields.goal
+            break
+
+    if not fields.goal and len(lines) > 1:
+        # Fallback to first non-title paragraph
+        for line in lines[1:5]:
+            if len(line) > 30 and not line.startswith("#"):
+                fields.goal = line[:300].strip()
+                fields.primary_value_prop = fields.goal
+                break
+
+    # Competitors
+    comp_match = re.search(r"(?:competitors|rivals|competing brands)\s*[:\-–]\s*([^\n\r]+)", text, re.I)
+    if comp_match:
+        comps = [c.strip() for c in re.split(r"[,;|]", comp_match.group(1)) if c.strip()]
+        fields.known_competitors = comps[:10]
+
+    return fields
+
+
 async def autofill_from_text(text: str, llm: Any = None, byok_config: BYOKConfig | None = None) -> AutofillFields:
     settings = get_settings()
     text = text[: settings.max_autofill_chars]

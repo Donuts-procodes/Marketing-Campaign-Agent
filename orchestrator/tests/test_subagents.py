@@ -8,8 +8,8 @@ import pytest
 
 from orchestrator.agents.market_research.agent import execute_market_research
 from orchestrator.tests.mock_clients import create_standalone_mock_clients
-from orchestrator.agents.market_research.discovery.search import SearchQuery
-from orchestrator.agents.market_research.pipeline.subagents import (
+from orchestrator.agents.market_research.ingestion.search_client import SearchQuery
+from orchestrator.agents.market_research.workflow.subagents import (
     AdIntelSubagent,
     CrawlSubagent,
     ResearchCrew,
@@ -82,7 +82,7 @@ async def test_search_subagent_logs_tagged_progress():
 
 @pytest.mark.asyncio
 async def test_ad_intel_subagent_contains_failures(monkeypatch):
-    import orchestrator.agents.market_research.pipeline.subagents as subagents
+    import orchestrator.agents.market_research.workflow.subagents as subagents
 
     async def _boom(**kwargs):
         raise ConnectionError("tavily down")

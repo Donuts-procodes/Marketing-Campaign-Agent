@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from orchestrator.agents.market_research.discovery.search import TavilySearchResult
+from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult
 from orchestrator.schemas.research import (
     CompetitorProfile,
     DynamicParameterTaxonomy,

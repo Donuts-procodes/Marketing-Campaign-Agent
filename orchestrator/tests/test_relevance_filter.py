@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.agents.market_research.analysis.relevance_filter import apply_relevance_scores
+from orchestrator.agents.market_research.intelligence.market_mapping.relevance_filter import apply_relevance_scores
 from orchestrator.schemas.research import (
     CompetitorProfile,
     CompetitorRelevance,

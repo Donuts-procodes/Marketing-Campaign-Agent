@@ -1,7 +1,7 @@
 import pytest
 
-from orchestrator.agents.market_research.analysis.grounding import find_support_excerpt
-from orchestrator.agents.market_research.analysis.validator import (
+from orchestrator.agents.market_research.intelligence.validation.grounding import find_support_excerpt
+from orchestrator.agents.market_research.intelligence.validation.claim_validator import (
     Gap,
     Rejection,
     ValidatorVerdict,
@@ -98,7 +98,7 @@ async def test_validator_failure_leaves_the_grounded_report_untouched():
 @pytest.mark.asyncio
 async def test_gap_round_fills_missing_pricing_from_targeted_search():
     from orchestrator.agents.market_research.agent import _fill_validator_gaps
-    from orchestrator.agents.market_research.discovery.search import TavilySearchResult
+    from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult
     from orchestrator.schemas.research import DynamicParameterTaxonomy
 
     class _Search:

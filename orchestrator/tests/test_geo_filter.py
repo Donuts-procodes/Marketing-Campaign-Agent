@@ -11,7 +11,7 @@ result is simply wrong, while software crosses borders and must not be filtered 
 
 from __future__ import annotations
 
-from orchestrator.agents.market_research.discovery.search import (
+from orchestrator.agents.market_research.ingestion.search_client import (
     TavilySearchResult,
     derive_geo_signals,
     filter_out_of_area_results,
@@ -126,3 +126,33 @@ def test_multi_part_geography_is_split():
         {"target_geography": "Delhi NCR, India", "category": "interior design services"}
     )
     assert "india" in geo.terms
+
+
+def test_search_market_follows_target_geography_and_reaches_engines():
+    import asyncio
+
+    from orchestrator.agents.market_research.ingestion.search_client import (
+        SearchQuery, _execute_tavily_only, current_search_market, query_key, reset_search_market, set_search_market,
+    )
+
+    seen = {}
+
+    class Tavily:
+        async def search(self, **kwargs):
+            seen.update(kwargs)
+            return {"results": []}
+
+    q = SearchQuery(vector="v", query="formal shoes")
+    us_key = query_key(q)
+    token = set_search_market({"target_geography": "Delhi NCR, India"})
+    try:
+        assert current_search_market()[0] == "IN"
+        assert query_key(q) != us_key  # an India run never reuses a US run's cached results
+        asyncio.run(_execute_tavily_only([q], tavily_client=Tavily()))
+        assert seen["country"] == "india"
+    finally:
+        reset_search_market(token)
+
+
+def test_ecommerce_drops_foreign_market_results():
+    assert derive_geo_signals({"target_geography": "India", "business_model": "d2c_ecommerce"}).strict is True

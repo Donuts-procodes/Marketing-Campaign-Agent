@@ -28,6 +28,8 @@ export interface RivalView {
   changes: NonNullable<CompetitorProfile["change_history"]>;
   completeness: { score: number; have: string[]; missing: string[] };
   relevance: number | null;
+  logoUrl: string | null;
+  productImageUrl: string | null;
 }
 
 const AVATAR_TONES = [
@@ -126,6 +128,14 @@ export function priceUnit(pricing: string | null | undefined): PriceUnit {
   return "other";
 }
 
+export function formatPriceLabel(raw: string, parsed?: any): string {
+  const trimmed = raw.trim();
+  if (parsed?.period === "project" && !/project|fixed|min|from|build|start/i.test(trimmed)) {
+    return `${trimmed} min. project`;
+  }
+  return trimmed;
+}
+
 export function profileCompleteness(comp: CompetitorProfile) {
   const checks: Array<[string, boolean]> = [
     // "detected" means a page mentioned pricing without an amount; the quality score refuses it too.
@@ -160,10 +170,10 @@ export function toRivalView(comp: CompetitorProfile, index: number): RivalView {
     initials: initialsOf(name),
     tone: AVATAR_TONES[hashOf(name) % AVATAR_TONES.length],
     priceLabel: !comp.pricing_model
-      ? "Not published"
+      ? "—"
       : comp.pricing_model === "detected"
         ? "On request"
-        : comp.pricing_model,
+        : formatPriceLabel(comp.pricing_model, comp.pricing_parsed),
     priceValue: parsePrice(comp.pricing_model),
     hasRealPrice,
     rating: Number.isFinite(rating) && rating > 0 && rating <= 5 ? rating : null,
@@ -176,6 +186,8 @@ export function toRivalView(comp: CompetitorProfile, index: number): RivalView {
     changes: [...(comp.change_history ?? [])].reverse(),
     completeness: profileCompleteness(comp),
     relevance: typeof comp.relevance_score === "number" ? comp.relevance_score : null,
+    logoUrl: comp.logo_url || (hostOf(siteUrl) ? `https://www.google.com/s2/favicons?domain=${hostOf(siteUrl)}&sz=128` : null),
+    productImageUrl: comp.product_image_url || null,
   };
 }
 

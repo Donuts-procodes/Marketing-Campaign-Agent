@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.agents.market_research.analysis.freshness import score_recency
-from orchestrator.agents.market_research.analysis.grounding import validate_information_grounding
+from orchestrator.agents.market_research.intelligence.validation.freshness import score_recency
+from orchestrator.agents.market_research.intelligence.validation.grounding import validate_information_grounding
 from orchestrator.core import clock
 from orchestrator.schemas.research import CompetitorProfile, SWOTReportDelta
 
@@ -68,7 +68,7 @@ class TestPromptsCarryLiveDate:
 
     @pytest.mark.asyncio
     async def test_classifier_prompt_includes_today(self):
-        from orchestrator.agents.market_research.analysis.classification import (
+        from orchestrator.agents.market_research.intelligence.market_mapping.classification import (
             classify_campaign_context,
         )
 
@@ -87,7 +87,7 @@ class TestPromptsCarryLiveDate:
 
     @pytest.mark.asyncio
     async def test_synthesis_prompt_includes_today(self):
-        from orchestrator.agents.market_research.analysis.synthesis import (
+        from orchestrator.agents.market_research.intelligence.advisory.synthesis import (
             synthesize_swot_with_llm,
         )
 

@@ -28,6 +28,8 @@ services:
       - .env
     environment:
       - MARKET_RESEARCH_SERVICE_URL=http://agent_market_research:8001
+      - AUDIENCE_PERSONA_SERVICE_URL=http://agent_audience_persona:8002
+      - CAMPAIGN_STRATEGY_SERVICE_URL=http://agent_campaign_strategy:8003
       - MONGO_URL=mongodb://mongo:27017
       - REDIS_URL=redis://redis:6379/0
       # Colorized [TAG] log output even though container stdout is not a TTY
@@ -41,6 +43,10 @@ services:
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --log-config log_config.json
     depends_on:
       agent_market_research:
+        condition: service_started
+      agent_audience_persona:
+        condition: service_started
+      agent_campaign_strategy:
         condition: service_started
       mongo:
         condition: service_healthy
@@ -64,6 +70,38 @@ services:
     volumes:
       - ./orchestrator:/app/orchestrator
     command: uvicorn agents.market_research.service:app --host 0.0.0.0 --port 8001 --reload
+    restart: unless-stopped
+
+  agent_audience_persona:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: marketing_agent_audience_persona
+    env_file:
+      - .env
+    environment:
+      - FORCE_COLOR=1
+    expose:
+      - "8002"
+    volumes:
+      - ./orchestrator:/app/orchestrator
+    command: uvicorn agents.audience_persona.service:app --host 0.0.0.0 --port 8002 --reload
+    restart: unless-stopped
+
+  agent_campaign_strategy:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: marketing_agent_campaign_strategy
+    env_file:
+      - .env
+    environment:
+      - FORCE_COLOR=1
+    expose:
+      - "8003"
+    volumes:
+      - ./orchestrator:/app/orchestrator
+    command: uvicorn agents.campaign_strategy.service:app --host 0.0.0.0 --port 8003 --reload
     restart: unless-stopped
 
   # Finished research runs (reports + event history), collection marketing.campaign_runs

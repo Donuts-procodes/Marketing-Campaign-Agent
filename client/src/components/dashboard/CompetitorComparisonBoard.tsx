@@ -308,7 +308,7 @@ export const CompetitorComparisonBoard: React.FC<CompetitorComparisonBoardProps>
                                     {attrVal}
                                   </span>
                                 ) : (
-                                  <span className="text-zinc-400 text-[11px] italic">Not disclosed</span>
+                                  <span className="text-zinc-400 text-[11px]" title="Not stated on their pages">—</span>
                                 )}
                               </td>
                             );

@@ -214,7 +214,7 @@ export function ComparisonTable({ rivals, taxonomy, merchantName, merchantPrice,
                             {v}
                           </span>
                         ) : (
-                          <span className="text-ink-faint italic">Not disclosed</span>
+                          <span className="text-ink-faint" title="Not stated on their pages">—</span>
                         )}
                       </td>
                     );

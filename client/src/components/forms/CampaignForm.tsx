@@ -5,6 +5,7 @@ import {
   BYOKProvider,
   CampaignInitPayload,
   MerchantContext,
+  MerchantProduct,
 } from "@/types/api";
 import { DossierUpload } from "./DossierUpload";
 import { autofillFromFiles } from "@/lib/api-client";
@@ -44,6 +45,23 @@ function loadSavedByok(): { provider: BYOKProvider; model: string; apiKey: strin
   return null;
 }
 
+/** "Name | category | price" per line -> products; blank lines and bad prices are skipped. */
+function parseProductLine(input: string): MerchantProduct[] {
+  return input
+    .split("\n")
+    .map((line) => line.split("|").map((part) => part.trim()))
+    .filter(([name]) => name)
+    .slice(0, 20)
+    .map(([name, category, price]) => {
+      const amount = price ? parseFloat(price.replace(/[^\d.]/g, "")) : NaN;
+      return {
+        name,
+        category: category || undefined,
+        price: Number.isFinite(amount) ? amount : undefined,
+      };
+    });
+}
+
 export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
   // Merchant State
   const [productName, setProductName] = useState("");
@@ -53,6 +71,7 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
   const [goal, setGoal] = useState("");
   const [priceUsd, setPriceUsd] = useState<string>("");
   const [knownCompetitorsInput, setKnownCompetitorsInput] = useState("");
+  const [productLineInput, setProductLineInput] = useState("");
   const [customerProfilesInput, setCustomerProfilesInput] = useState("");
 
   // BYOK State
@@ -165,6 +184,8 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
       .map((p) => p.trim())
       .filter((p) => p.length > 0);
 
+    const products = parseProductLine(productLineInput);
+
     const merchant_context: MerchantContext = {
       product_name: productName.trim(),
       category: category.trim(),
@@ -172,6 +193,7 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
       primary_value_prop: primaryValueProp.trim(),
       goal: goal.trim() || undefined,
       price_usd: priceUsd ? parseFloat(priceUsd) : undefined,
+      products: products.length > 0 ? products : undefined,
       known_competitors: competitorsList.length > 0 ? competitorsList : undefined,
       existing_customer_profiles: profilesList.length > 0 ? profilesList : undefined,
     };
@@ -350,6 +372,23 @@ export function CampaignForm({ onSubmit, isLoading }: CampaignFormProps) {
               className="w-full px-4 py-2.5 rounded-2xl bg-[#FAF7EE] border border-[#EDE7D8] text-[#19191B] placeholder:text-zinc-400 text-xs font-medium focus:outline-none focus:border-[#19191B] focus:ring-1 focus:ring-[#19191B] transition"
             />
           </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label htmlFor="product-line" className="text-xs font-bold text-[#19191B]">
+            Product line (optional, one per line: name | category | price)
+          </label>
+          <textarea
+            id="product-line"
+            rows={3}
+            value={productLineInput}
+            onChange={(e) => setProductLineInput(e.target.value)}
+            placeholder={"Oxford Classic | formal leather shoes | 2499\nCity Runner | casual sneakers | 1799"}
+            className="w-full px-4 py-2.5 rounded-2xl bg-[#FAF7EE] border border-[#EDE7D8] text-[#19191B] placeholder:text-zinc-400 text-xs font-medium focus:outline-none focus:border-[#19191B] focus:ring-1 focus:ring-[#19191B] transition resize-y"
+          />
+          <p className="text-[11px] text-zinc-500">
+            Competitor prices are looked up and compared for each product you list.
+          </p>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

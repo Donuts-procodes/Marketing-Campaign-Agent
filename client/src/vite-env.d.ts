@@ -211,6 +211,7 @@ declare module "lucide-react" {
   export const ChevronUp: any;
   export const Sliders: any;
   export const SlidersHorizontal: any;
+  export const Pencil: any;
   export const CirclePlus: any;
   export const PlusCircle: any;
   export const Plus: any;

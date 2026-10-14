@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from orchestrator.agents.market_research.analysis.synthesis import _select_within_budget
+from orchestrator.agents.market_research.intelligence.advisory.synthesis import _select_within_budget
 
 
 @dataclass

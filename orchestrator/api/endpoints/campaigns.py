@@ -10,6 +10,8 @@ import json
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 
+from pydantic import BaseModel, Field
+
 from orchestrator.core.config import get_settings
 from orchestrator.core.storage import get_storage
 from orchestrator.schemas.api import (
@@ -38,7 +40,11 @@ from orchestrator.schemas.api import (
     UpdateContextResponse,
     UploadedFileInfo,
 )
-from orchestrator.schemas.strategy import CampaignStrategyBrief
+from orchestrator.schemas.content import ContentAsset, ContentPack
+from orchestrator.schemas.strategy import (
+    CampaignStrategyBrief,
+    StrategyCustomizeRequest,
+)
 from orchestrator.services.campaign_service import (
     CampaignInterruptNotFoundError,
     CampaignJobConflictError,
@@ -56,6 +62,10 @@ from orchestrator.services.dossier import DossierFormatError, combine_documents
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 
+# Takes: None (HTTP GET /api/v1/campaigns/agents)
+# Returns: AgentListResponse (metadata list of all registered microservice agents, models, and tools)
+# Called by: Frontend agent registry inspector / dashboard client
+# Points to / Calls: AgentDescriptor, AgentListResponse
 @router.get(
     "/agents",
     response_model=AgentListResponse,
@@ -150,6 +160,13 @@ async def list_agents() -> AgentListResponse:
     return AgentListResponse(agents=agents)
 
 
+# Takes:
+#   - payload (CampaignCreate: product_name, category, value_prop, goals, budget)
+#   - request (Request: incoming HTTP request for IP-based rate limiting)
+#   - service (CampaignService: injected service for background job orchestration)
+# Returns: CampaignCreateResponse (job_id, status="PENDING")
+# Called by: Frontend 'Generate Campaign' form submission (POST /api/v1/campaigns)
+# Points to / Calls: get_storage().allow_job_creation, service.create_campaign_job
 @router.post(
     "",
     response_model=CampaignCreateResponse,
@@ -172,6 +189,10 @@ async def create_campaign(
     return CampaignCreateResponse(job_id=job_id, status="PENDING")
 
 
+# Takes: files (list[UploadFile]: uploaded dossier documents from multipart form)
+# Returns: list[tuple[str, bytes]] (list of filename and raw bytes pairs)
+# Called by: autofill_campaign_form
+# Points to / Calls: upload.read, get_settings().max_dossier_bytes
 async def _read_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
     """Reads at most max_upload_files + 1 files and one byte past the total limit, so oversized
     uploads are rejected by check_upload_limits without buffering them whole."""
@@ -187,6 +208,13 @@ async def _read_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
     return out
 
 
+# Takes:
+#   - request (Request: incoming HTTP request for rate limiting)
+#   - files (list[UploadFile]: multipart file uploads e.g. brand dossiers, pdfs, txt)
+#   - byok_config (str | None: optional JSON-encoded custom LLM keys)
+# Returns: AutofillResponse (inferred merchant brief fields, list of filled field keys, uploaded file metadata)
+# Called by: Frontend 'Upload Dossier' button (POST /api/v1/campaigns/autofill)
+# Points to / Calls: _read_uploads, check_upload_limits, combine_documents, autofill_from_text
 @router.post(
     "/autofill",
     response_model=AutofillResponse,
@@ -227,6 +255,12 @@ async def autofill_campaign_form(
     )
 
 
+# Takes:
+#   - request (Request: incoming HTTP request for rate limiting)
+#   - payload (InterpretQueryInput: raw natural language text string)
+# Returns: AutofillResponse (extracted product_name, category, value_prop, and goal)
+# Called by: Frontend search-bar query pre-fill (POST /api/v1/campaigns/interpret)
+# Points to / Calls: services.query_interpreter.interpret_query
 @router.post(
     "/interpret",
     response_model=AutofillResponse,
@@ -254,6 +288,12 @@ async def interpret_user_query(
     return AutofillResponse(fields=fields, filled=filled_field_names(fields), files=[])
 
 
+# Takes:
+#   - product_name (str: query param)
+#   - category (str: optional query param)
+# Returns: PriorRunInfo (metadata on previous run finished_at, dqs_score, competitor_count)
+# Called by: Frontend research modal before launch (GET /api/v1/campaigns/prior-run)
+# Points to / Calls: get_storage().find_latest_run_by_product
 @router.get(
     "/prior-run",
     response_model=PriorRunInfo,
@@ -283,6 +323,14 @@ async def get_prior_run(
     )
 
 
+# Takes:
+#   - job_id (str: path parameter identifying the pending campaign job)
+#   - files (list[UploadFile] | None: multipart upload files)
+#   - file (UploadFile | None: legacy single-file fallback)
+#   - service (CampaignService: injected campaign service)
+# Returns: DossierUploadResponse (status="ATTACHED", characters count, list of files)
+# Called by: Frontend dossier upload handler (POST /api/v1/campaigns/{job_id}/dossier)
+# Points to / Calls: _read_uploads, service.attach_dossiers
 @router.post(
     "/{job_id}/dossier",
     response_model=DossierUploadResponse,
@@ -315,6 +363,14 @@ async def upload_dossier(
     )
 
 
+# Takes:
+#   - job_id (str: path parameter identifying the running campaign job)
+#   - after (int: sequence offset for replaying events after network reconnect)
+#   - last_event_id (str | None: standard SSE header)
+#   - service (CampaignService: injected service)
+# Returns: StreamingResponse (text/event-stream delivering live agent progress logs and SWOT deltas)
+# Called by: Frontend EventSource listener (GET /api/v1/campaigns/{job_id}/stream)
+# Points to / Calls: service.stream_job_events
 @router.get(
     "/{job_id}/stream",
     response_class=StreamingResponse,
@@ -589,10 +645,48 @@ async def chat_about_report(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
     return StreamingResponse(
-        stream_report_chat(llm, job.last_swot_report, job.merchant_context, payload.messages, job.bench_competitors),
+        stream_report_chat(
+            llm,
+            job.last_swot_report,
+            job.merchant_context,
+            payload.messages,
+            job.bench_competitors,
+            strategy_brief=job.strategy_brief,
+            content_pack=job.content_pack,
+            step=payload.step,
+            focus_asset_id=payload.focus_asset_id,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post(
+    "/{job_id}/strategy/customize",
+    response_model=CampaignStrategyBrief,
+    status_code=status.HTTP_200_OK,
+    summary="Customizes strategy brief: dynamically recalculates channel spends and options based on user budget",
+)
+async def customize_campaign_strategy(
+    job_id: str,
+    payload: StrategyCustomizeRequest,
+    service: CampaignService = Depends(get_campaign_service),
+) -> CampaignStrategyBrief:
+    try:
+        return await service.customize_strategy(
+            job_id,
+            budget=payload.budget,
+            selected_option_id=payload.selected_option_id,
+            custom_goal=payload.custom_goal,
+            campaign_days=payload.campaign_days,
+            sub_goals=payload.sub_goals,
+            campaign_type=payload.campaign_type,
+            custom_option=payload.custom_option,
+        )
+    except CampaignJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CampaignJobConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post(
@@ -603,11 +697,138 @@ async def chat_about_report(
 )
 async def approve_campaign_strategy(
     job_id: str,
+    payload: StrategyCustomizeRequest | None = None,
     service: CampaignService = Depends(get_campaign_service),
 ) -> CampaignStrategyBrief:
     try:
-        return await service.approve_strategy(job_id)
+        budget = payload.budget if payload else None
+        selected_option_id = payload.selected_option_id if payload else None
+        campaign_days = payload.campaign_days if payload else None
+        sub_goals = payload.sub_goals if payload else None
+        campaign_type = payload.campaign_type if payload else None
+        return await service.approve_strategy(
+            job_id,
+            budget=budget,
+            selected_option_id=selected_option_id,
+            campaign_days=campaign_days,
+            sub_goals=sub_goals,
+            campaign_type=campaign_type,
+        )
     except CampaignJobNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except CampaignJobConflictError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+# ── Campaign content ─────────────────────────────────────────────────────────
+
+
+class AssetEdit(BaseModel):
+    name: str | None = None
+    subject: str | None = Field(default=None, max_length=200)
+    preview_text: str | None = Field(default=None, max_length=300)
+    body: str | None = Field(default=None, max_length=10_000)
+    headlines: list[str] | None = Field(default=None, max_length=15)
+    descriptions: list[str] | None = Field(default=None, max_length=4)
+    cta: str | None = Field(default=None, max_length=100)
+    landing_url: str | None = Field(default=None, max_length=2000)
+    creative_brief: str | None = Field(default=None, max_length=2000)
+    hashtags: list[str] | None = Field(default=None, max_length=30)
+    scheduled_for: str | None = Field(default=None, max_length=40, description="ISO datetime of the planned send")
+
+
+class AssetRewrite(BaseModel):
+    instruction: str | None = Field(default=None, max_length=1000)
+
+
+class Reschedule(BaseModel):
+    shift_days: int = Field(default=0, ge=-60, le=120)
+    time_of_day: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    channel: str | None = Field(default=None, max_length=40)
+    asset_ids: list[str] | None = Field(default=None, max_length=50)
+
+
+class ChannelApproval(BaseModel):
+    channel: str = Field(max_length=40)
+    approved: bool = True
+
+
+def _content_errors(exc: Exception) -> HTTPException:
+    if isinstance(exc, CampaignJobNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.get("/{job_id}/content", response_model=ContentPack | None, summary="Content written from the approved strategy")
+async def get_campaign_content(job_id: str, service: CampaignService = Depends(get_campaign_service)) -> ContentPack | None:
+    try:
+        return await service.get_content(job_id)
+    except (CampaignJobNotFoundError, CampaignJobConflictError) as exc:
+        raise _content_errors(exc) from exc
+
+
+@router.post("/{job_id}/content/generate", status_code=status.HTTP_202_ACCEPTED, summary="(Re)write all content")
+async def generate_campaign_content(job_id: str, service: CampaignService = Depends(get_campaign_service)) -> dict:
+    try:
+        await service.generate_content(job_id)
+    except (CampaignJobNotFoundError, CampaignJobConflictError) as exc:
+        raise _content_errors(exc) from exc
+    return {"status": "writing"}
+
+
+@router.patch("/{job_id}/content/{asset_id}", response_model=ContentAsset, summary="Edit one asset")
+async def edit_campaign_asset(
+    job_id: str, asset_id: str, payload: AssetEdit, service: CampaignService = Depends(get_campaign_service)
+) -> ContentAsset:
+    try:
+        return await service.edit_asset(job_id, asset_id, payload.model_dump(exclude_none=True))
+    except (CampaignJobNotFoundError, CampaignJobConflictError) as exc:
+        raise _content_errors(exc) from exc
+
+
+@router.post("/{job_id}/content/{asset_id}/regenerate", response_model=ContentAsset, summary="Rewrite one asset")
+async def regenerate_campaign_asset(
+    job_id: str, asset_id: str, payload: AssetRewrite | None = None,
+    service: CampaignService = Depends(get_campaign_service),
+) -> ContentAsset:
+    try:
+        return await service.regenerate_asset(job_id, asset_id, payload.instruction if payload else None)
+    except (CampaignJobNotFoundError, CampaignJobConflictError) as exc:
+        raise _content_errors(exc) from exc
+    except Exception as exc:  # the model call failed: say so instead of a bare 500
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Rewrite failed: {type(exc).__name__}") from exc
+
+
+@router.post("/{job_id}/content/approval", response_model=ContentPack, summary="Approve or reopen one channel")
+async def approve_campaign_channel(
+    job_id: str, payload: ChannelApproval, service: CampaignService = Depends(get_campaign_service)
+) -> ContentPack:
+    try:
+        return await service.set_channel_approval(job_id, payload.channel, payload.approved)
+    except (CampaignJobNotFoundError, CampaignJobConflictError) as exc:
+        raise _content_errors(exc) from exc
+
+
+@router.post("/{job_id}/content/reschedule", response_model=ContentPack, summary="Move planned dates or times")
+async def reschedule_campaign_content(
+    job_id: str, payload: Reschedule, service: CampaignService = Depends(get_campaign_service)
+) -> ContentPack:
+    try:
+        return await service.reschedule_assets(job_id, **payload.model_dump())
+    except (CampaignJobNotFoundError, CampaignJobConflictError) as exc:
+        raise _content_errors(exc) from exc
+
+
+@router.get("/{job_id}/chat/opening", summary="What the agent says first on a step, from this campaign's data")
+async def chat_opening(
+    job_id: str,
+    step: str = Query(default="research", max_length=20),
+    service: CampaignService = Depends(get_campaign_service),
+) -> dict:
+    from orchestrator.services.chat_openers import opening
+
+    try:
+        job = await service.get_or_restore_job(job_id)
+    except CampaignJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return opening(job, step)

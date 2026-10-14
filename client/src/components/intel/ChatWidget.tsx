@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChatAction, ChatTurn, SourceCheck, streamReportChat } from "@/lib/api-client";
+import {
+  ChatAction,
+  ChatTurn,
+  fetchChatOpening,
+  SourceCheck,
+  streamReportChat,
+} from "@/lib/api-client";
 import { countTokens, addLiveTokens } from "@/lib/tiktokenTracker";
 import { RivalView } from "@/lib/rivalMetrics";
 import { cn, safeHref } from "@/lib/utils";
@@ -22,6 +28,15 @@ interface ChatWidgetProps {
   jobId: string;
   rivals: RivalView[];
   merchantName?: string;
+  /** The workspace step the merchant is on; tailors context and available tools. */
+  step?: string;
+  /** The content asset currently open on screen, so "this" / "it" refers to it. */
+  focusAssetId?: string;
+  /** Optional controlled open state */
+  isOpen?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  /** Prefill or inject a draft into the chat */
+  initialDraft?: string;
   onOpenRival: (index: number) => void;
   /** Runs a confirmed action against the API and resolves with a one-line result for the card. */
   onAction: (action: ChatAction) => Promise<string>;
@@ -128,16 +143,53 @@ function suggestionsFor(rivals: RivalView[], merchantName?: string): string[] {
   return out.slice(0, 4);
 }
 
-export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction }: ChatWidgetProps) {
-  const [open, setOpen] = useState(false);
+export function ChatWidget({
+  jobId,
+  rivals,
+  merchantName,
+  step,
+  focusAssetId,
+  isOpen,
+  onOpenChange,
+  initialDraft,
+  onOpenRival,
+  onAction,
+}: ChatWidgetProps) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = isOpen !== undefined ? isOpen : internalOpen;
+  const setOpen = useCallback(
+    (next: boolean | ((prev: boolean) => boolean)) => {
+      const val = typeof next === "function" ? next(open) : next;
+      setInternalOpen(val);
+      onOpenChange?.(val);
+    },
+    [open, onOpenChange]
+  );
   const [messages, setMessages] = useState<Message[]>(() => loadMessages(jobId));
   const [draft, setDraft] = useState("");
+
+  useEffect(() => {
+    if (initialDraft) {
+      setDraft(initialDraft);
+    }
+  }, [initialDraft]);
   const [streaming, setStreaming] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const suggestions = useMemo(() => suggestionsFor(rivals, merchantName), [rivals, merchantName]);
+
+  // Fetch step-aware opening message when the chat opens empty on a new step.
+  const [opener, setOpener] = useState<{ message: string; suggestions: string[] } | null>(null);
+  const lastOpenerStep = useRef<string | undefined>();
+  useEffect(() => {
+    if (!open || messages.length > 0 || !step || step === lastOpenerStep.current) return;
+    lastOpenerStep.current = step;
+    fetchChatOpening(jobId, step)
+      .then(setOpener)
+      .catch(() => {});
+  }, [open, jobId, step, messages.length]);
 
   useEffect(() => {
     if (!streaming) saveMessages(jobId, messages);
@@ -203,7 +255,9 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
             onAction: (action) =>
               patch((m) => ({ ...m, actions: [...(m.actions ?? []), { ...action, state: "pending" }] })),
           },
-          controller.signal
+          controller.signal,
+          step,
+          focusAssetId,
         );
         if (offTopic) {
           setMessages((all) => all.map((m) => (m.id === replyId || m.id === user.id ? { ...m, offTopic: true } : m)));
@@ -297,8 +351,10 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
           <Sparkles className="w-4 h-4 text-emerald-300" />
         </span>
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-bold">Research assistant</div>
-          <div className="text-[11px] text-zinc-400">Answers only from this report</div>
+         <div className="text-sm font-bold">Campaign assistant</div>
+          <div className="text-[11px] text-zinc-400">
+            {step ? `Step: ${step}` : "Answers only from this report"}
+          </div>
         </div>
         {messages.length > 0 && (
           <button
@@ -324,7 +380,9 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
         {messages.length === 0 && (
           <div className="space-y-3 animate-fade-up">
             <div className="rounded-2xl bg-white border border-line p-3.5 text-[13px] text-ink-soft leading-relaxed">
-              {rivals.length > 0 ? (
+              {opener?.message ? (
+                <RichText text={opener.message} />
+              ) : rivals.length > 0 ? (
                 <>
                   Ask anything about the {rivals.length} rivals in this report — prices, what customers say, their ads, or where{" "}
                   {merchantName || "you"} could stand out. I only use what the research found.
@@ -336,7 +394,7 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
               )}
             </div>
             <div className="space-y-1.5">
-              {suggestions.map((s) => (
+              {(opener?.suggestions ?? suggestions).map((s) => (
                 <button
                   key={s}
                   type="button"
@@ -448,8 +506,17 @@ export function ChatWidget({ jobId, rivals, merchantName, onOpenRival, onAction 
                     )}
                     {a.state === "running" && (
                       <div className="inline-flex items-center gap-1.5 text-[12px] text-ink-soft">
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        {a.kind === "refresh" ? "Re-running the research — this takes a few minutes…" : "Working on it…"}
+                        {a.kind === "refresh"
+                          ? "Re-running the research — this takes a few minutes…"
+                          : a.kind === "rewrite_asset" || a.kind === "regenerate_content"
+                            ? "Rewriting copy with your instructions…"
+                            : a.kind === "customize_strategy"
+                              ? "Updating campaign strategy…"
+                              : a.kind === "channel_approval"
+                                ? "Updating channel approvals…"
+                                : a.kind === "reschedule"
+                                  ? "Updating schedule…"
+                                  : "Working on it…"}
                       </div>
                     )}
                     {a.state === "done" && (

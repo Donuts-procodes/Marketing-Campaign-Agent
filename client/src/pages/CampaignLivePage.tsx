@@ -1,7 +1,19 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useCampaignStream } from "@/hooks/useCampaignStream";
-import { ChatAction, applyReportEdits, fetchMoreCompetitors, reResearchCampaign, updateMerchantContext } from "@/lib/api-client";
+import {
+  ChatAction,
+  applyReportEdits,
+  fetchMoreCompetitors,
+  reResearchCampaign,
+  updateMerchantContext,
+  customizeCampaignStrategy,
+  regenerateCampaignAsset,
+  setChannelApproval,
+  rescheduleCampaignContent,
+  generateCampaignContent,
+} from "@/lib/api-client";
+import type { ChannelKey } from "@/types/content";
 import { exportToCSV, printDashboardReport } from "@/lib/exportReport";
 import { parseRunProgress } from "@/lib/runProgress";
 import { RivalView, confidenceOf, keyFacts, toRivalView } from "@/lib/rivalMetrics";
@@ -177,6 +189,18 @@ export function CampaignLivePage() {
   const runChatAction = async (action: ChatAction): Promise<string> => {
     if (!jobId) throw new Error("No research run is open.");
     if (busy) throw new Error("Another update is already running — try again when it finishes.");
+    if (action.kind === "customize_strategy") {
+      const payload = action.payload;
+      await customizeCampaignStrategy(jobId, {
+        budget: payload.budget,
+        campaign_days: payload.campaign_days,
+        sub_goals: payload.sub_goals,
+        campaign_type: payload.campaign_type,
+        selected_option_id: payload.selected_option_id,
+        custom_goal: payload.custom_goal,
+      });
+      return "Campaign strategy parameters updated.";
+    }
     if (action.kind === "edit") {
       const res = await applyReportEdits(jobId, action.payload.edits ?? []);
       applyReport(res.swot_report);
@@ -200,6 +224,32 @@ export function CampaignLivePage() {
       } finally {
         setBusy(null);
       }
+    }
+    if (action.kind === "rewrite_asset") {
+      const payload = action.payload;
+      if (!payload.asset_id) throw new Error("No asset specified.");
+      await regenerateCampaignAsset(jobId, payload.asset_id, payload.instruction);
+      return `Asset ${payload.asset_id} updated with new copy.`;
+    }
+    if (action.kind === "channel_approval") {
+      const payload = action.payload;
+      if (!payload.channel) throw new Error("No channel specified.");
+      await setChannelApproval(jobId, payload.channel as ChannelKey, payload.approved ?? true);
+      return `${payload.channel} ${payload.approved === false ? "unapproved" : "approved"}.`;
+    }
+    if (action.kind === "reschedule") {
+      const payload = action.payload;
+      await rescheduleCampaignContent(jobId, {
+        shift_days: payload.shift_days,
+        time_of_day: payload.time_of_day,
+        channel: payload.channel,
+        asset_ids: payload.asset_ids,
+      });
+      return `Publishing schedule updated${payload.shift_days ? ` by ${payload.shift_days} days` : ""}.`;
+    }
+    if (action.kind === "regenerate_content") {
+      await generateCampaignContent(jobId);
+      return "Content generation re-triggered.";
     }
     setBusy("rerun");
     try {
@@ -455,6 +505,7 @@ export function CampaignLivePage() {
           jobId={jobId}
           rivals={rivals}
           merchantName={merchantName}
+          step="research"
           onOpenRival={setOpenRival}
           onAction={runChatAction}
         />

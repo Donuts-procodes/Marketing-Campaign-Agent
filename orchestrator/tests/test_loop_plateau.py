@@ -15,10 +15,18 @@ from typing import Any
 
 import pytest
 
-from orchestrator.agents.market_research.discovery.search import TavilySearchResult
-from orchestrator.agents.market_research.pipeline.loop import execute_research_loop
+from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult
+from orchestrator.agents.market_research.workflow.research_loop import execute_research_loop
 from orchestrator.schemas.research import DynamicParameterTaxonomy
 
+
+
+@pytest.fixture(autouse=True)
+def _deep_research(monkeypatch):
+    """These tests exercise the multi-round retry loop, which only deep research runs."""
+    from orchestrator.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "research_depth", "deep")
 
 class _StubSearch:
     """Returns a controllable number of distinct competitor-bearing results per round.

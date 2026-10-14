@@ -23,7 +23,7 @@ const FACTS: Array<{ key: string; label: string; value: (c: CompetitorProfile) =
 ];
 
 const MISSING_LABEL: Record<string, string> = {
-  not_stated: "Not stated anywhere we looked",
+  not_stated: "Not published",
   removed: "Found, but removed",
   not_searched: "Not searched yet",
 };
@@ -74,20 +74,36 @@ function Row({ label, value, status }: { label: string; value: string | null; st
 
 export function FactSheet({ comp }: { comp: CompetitorProfile }) {
   const status = comp.fact_status ?? {};
-  const found = FACTS.filter((f) => f.value(comp)).length;
+  const known = FACTS.filter((f) => f.value(comp));
+  const unknown = FACTS.filter((f) => !f.value(comp));
   return (
     <section className="rounded-xl bg-white border border-line p-3.5">
       <div className="flex items-baseline justify-between gap-2">
         <div className="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Company facts</div>
-        <div className="text-[11px] text-ink-faint tabular-nums">
-          {found} of {FACTS.length} found · never estimated
-        </div>
+        <div className="text-[11px] text-ink-faint">Each one linked to its source</div>
       </div>
-      <dl className="mt-1">
-        {FACTS.map((f) => (
-          <Row key={f.key} label={f.label} value={f.value(comp)} status={status[f.key]} />
-        ))}
-      </dl>
+      {known.length > 0 && (
+        <dl className="mt-1">
+          {known.map((f) => (
+            <Row key={f.key} label={f.label} value={f.value(comp)} status={status[f.key]} />
+          ))}
+        </dl>
+      )}
+      {unknown.length > 0 && (
+        // Gaps are real (private firms rarely publish revenue) but they are not the headline.
+        <details className="mt-2 group">
+          <summary className="cursor-pointer list-none text-[11px] text-ink-faint hover:text-ink">
+            {known.length ? "Not public: " : "No company facts published: "}
+            {unknown.map((f) => f.label.toLowerCase()).join(", ")}
+            <span className="ml-1 underline-offset-2 group-open:hidden hover:underline">why?</span>
+          </summary>
+          <dl className="mt-1">
+            {unknown.map((f) => (
+              <Row key={f.key} label={f.label} value={null} status={status[f.key]} />
+            ))}
+          </dl>
+        </details>
+      )}
     </section>
   );
 }

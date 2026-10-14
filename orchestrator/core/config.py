@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
@@ -23,7 +24,20 @@ class Settings(BaseSettings):
             "you_api_key", "you_api", "YOU_API_KEY", "YOU_API"
         ),
     )
-    # Crawl API for deep search: Scrape.do (preferred when set), Firecrawl or Crawlbase tokens below
+    # Crawl API for deep search: Bright Data, Scrape.do, Firecrawl or Crawlbase tokens below
+    brightdata_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "brightdata_api_key", "brightdata_token", "BRIGHTDATA_API_KEY", "BRIGHTDATA_TOKEN",
+            "BRIGHT_DATA_API_KEY", "BRIGHT_DATA_TOKEN",
+        ),
+    )
+    brightdata_zone: str = Field(
+        default="web_unlocker",
+        validation_alias=AliasChoices(
+            "brightdata_zone", "BRIGHTDATA_ZONE", "BRIGHT_DATA_ZONE",
+        ),
+    )
     scrapedo_api_key: str = Field(
         default="79715dda747943419a8e6fc08dcfad52e24de495001",
         validation_alias=AliasChoices(
@@ -78,6 +92,18 @@ class Settings(BaseSettings):
 
     tavily_search_depth: str = "advanced"
     tavily_max_results: int = 15
+    # Paid engines run as a cascade: Tavily first, You.com only when Tavily fails or returns
+    # fewer than duckduckgo_min_results. True restores the old "query both every time" fan-out.
+    search_paid_fanout: bool = False
+    # In-flight caps per paid engine; bursts past these drew 429s that tripped the breaker.
+    tavily_max_concurrent: int = 5
+    you_max_concurrent: int = 5
+    # Broad-discovery vectors tried on DuckDuckGo (free) first; paid engines only top up when it
+    # returns fewer than duckduckgo_min_results. Comma-separated; empty sends everything paid-first.
+    search_free_first_vectors: str = "alternative_discovery,leap_discovery"
+    # Search results reused across runs for this many hours (MongoDB, TTL-indexed); 0 disables.
+    # Recency-bound queries (day/week/month windows) and volatile vectors are never cached.
+    search_cache_ttl_hours: int = 24
 
     # DuckDuckGo (no key): "fallback" runs it for queries where Tavily/You.com fail or return
     # fewer than duckduckgo_min_results; "always" adds it to every query; "off" disables it.
@@ -85,6 +111,14 @@ class Settings(BaseSettings):
     duckduckgo_min_results: int = 5
     duckduckgo_max_results: int = 10
     duckduckgo_region: str = "us-en"
+
+    # Circuit breaker threshold for search engines: disabled and redistributed after N failures
+    search_circuit_breaker_max_failures: int = Field(
+        default=2,
+        validation_alias=AliasChoices(
+            "search_circuit_breaker_max_failures", "SEARCH_CIRCUIT_BREAKER_MAX_FAILURES"
+        ),
+    )
     # Deep search: pages scraped per research round (CrawlAPI first, Tavily Extract fallback)
     # Pages deep-scraped per run. At 10, a run that discovers ~100 URLs across ~10
     # competitor sites gets roughly one page each -- rarely the one carrying pricing,
@@ -95,11 +129,17 @@ class Settings(BaseSettings):
     # gate and Firecrawl's process-wide one, whichever is lower binds. Raise to match your
     # Firecrawl plan's per-minute allowance; 429s are retried (_FIRECRAWL_RETRIES) so an
     # overshoot degrades into backoff rather than failure.
-    crawl_max_concurrent: int = 10
+    # ponytail: tune concurrency from 10 to 15, timeout from 30s to 12s, and discovery iterations to 2
+    # to eliminate tail latency and prevent dead sockets/botwalls from stalling crawl waves.
+    crawl_max_concurrent: int = 15
     # Per-page limit for competitor page crawls (ad-library fetches keep crawlapi_timeout_seconds).
-    crawl_page_timeout_seconds: float = 30.0
-    firecrawl_max_concurrent: int = 10
+    crawl_page_timeout_seconds: float = 12.0
+    firecrawl_max_concurrent: int = 15
 
+    # "simple": one light fact-gathering pass; an extra research round runs only to close a
+    # real gap (too few competitors). Analysis steps (SWOT, wedge, leaps, reviews) still run in
+    # full. "deep": the knobs below as written, re-running research until DQS clears threshold.
+    research_depth: Literal["simple", "deep"] = "simple"
     dqs_threshold: float = 0.90
     dqs_max_retries: int = 3
     # Targeted research rounds the validator may send back for the gaps it names. Each costs a
@@ -133,11 +173,33 @@ class Settings(BaseSettings):
     # founded, HQ, team size, revenue, funding) and keeps only values whose source sentence is
     # verified on a fetched page. Per round: up to 4 searches and N page fetches per rival.
     profile_completion_enabled: bool = True
+    # Channel listings: each rival's own-site and marketplace listings (price, MRP, offers, rating,
+    # returns, COD) for the merchant's market. One site-restricted search per rival plus up to N
+    # listing-page fetches per rival. Off skips the step.
+    channel_listings_enabled: bool = True
+    channel_listings_per_competitor: int = 4
+    # When a rival's listing pages and search excerpts carry no price, ask a web-search model
+    # (OpenAI Responses `web_search`) and keep only listings it cites. Needs openai_api_key.
+    # Category search-interest trend and rising searches from Google Trends (no key; rate-limited).
+    # Structured data sources, each optional (used when its key is set):
+    # SerpApi Google Shopping (prices from every store in a country), Keepa (Amazon price history and
+    # sales rank), DataForSEO (Google Ads monthly search volume, CPC, competition).
+    serpapi_api_key: str = Field(default="", validation_alias=AliasChoices("serpapi_api_key", "SERPAPI_API_KEY", "SERPAPI_KEY"))
+    keepa_api_key: str = Field(default="", validation_alias=AliasChoices("keepa_api_key", "KEEPA_API_KEY", "KEEPA_KEY"))
+    dataforseo_login: str = Field(default="", validation_alias=AliasChoices("dataforseo_login", "DATAFORSEO_LOGIN"))
+    dataforseo_password: str = Field(default="", validation_alias=AliasChoices("dataforseo_password", "DATAFORSEO_PASSWORD"))
+    # Reads scraping accounts' status (free endpoints) at the start of each run and logs problems.
+    provider_health_check: bool = True
+    demand_trends_enabled: bool = True
+    # Converts rival prices in other currencies to the merchant's (ECB rates, frankfurter.dev, no key).
+    fx_conversion_enabled: bool = True
+    ai_price_search_enabled: bool = True
+    ai_price_search_model: str = "gpt-4o-mini"
     profile_completion_rounds: int = 2
     profile_pages_per_competitor: int = 3
     # Max "alternatives to the leaders" search passes before the shortlist is locked; stops
     # earlier once a pass adds no new name to the top 10.
-    research_discovery_iterations: int = 3
+    research_discovery_iterations: int = 2
     research_pages_per_competitor: int = 4
 
     # Dated evidence older than this counts as stale in the DQS recency dimension.
@@ -190,12 +252,46 @@ class Settings(BaseSettings):
     max_autofill_chars: int = 40000
 
     # Shared secret required by agent microservices on /execute (empty disables the check)
-    agent_service_token: str = ""
+    agent_service_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("agent_service_token", "AGENT_SERVICE_TOKEN"),
+    )
 
     # Agent Microservice URLs (empty string triggers in-process execution fallback)
-    market_research_service_url: str = ""
-    audience_persona_service_url: str = ""
-    campaign_strategy_service_url: str = ""
+    market_research_service_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "market_research_service_url", "MARKET_RESEARCH_SERVICE_URL"
+        ),
+    )
+    audience_persona_service_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "audience_persona_service_url", "AUDIENCE_PERSONA_SERVICE_URL"
+        ),
+    )
+    campaign_strategy_service_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "campaign_strategy_service_url", "CAMPAIGN_STRATEGY_SERVICE_URL"
+        ),
+    )
+
+
+#: Ceilings applied in simple research mode; deep mode uses the configured values.
+_SIMPLE_LIMITS = {
+    "research_discovery_iterations": 1,
+    "deep_search_max_pages": 12,
+    "research_pages_per_competitor": 2,
+    "profile_completion_rounds": 1,
+    "dqs_max_retries": 1,
+}
+
+
+def research_limit(settings: "Settings", name: str) -> int:
+    """A research-effort knob, capped in simple mode."""
+    value = getattr(settings, name)
+    return min(value, _SIMPLE_LIMITS[name]) if settings.research_depth == "simple" else value
 
 
 @lru_cache

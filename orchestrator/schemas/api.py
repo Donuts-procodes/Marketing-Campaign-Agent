@@ -25,12 +25,27 @@ class BYOKConfig(BaseModel):
     custom_endpoint: Annotated[str, Field(max_length=500)] | None = None
 
 
+class MerchantProduct(BaseModel):
+    """One product in the merchant's line. Competitor prices are looked up and compared per product."""
+
+    name: ShortText
+    category: ShortText | None = Field(default=None, description="e.g. 'formal leather shoes', 'running sneakers'")
+    price: float | None = Field(default=None, ge=0, description="Planned selling price, in `currency`")
+    mrp: float | None = Field(default=None, ge=0, description="List/MRP price, in `currency`")
+
+
 class MerchantContextInput(BaseModel):
     product_name: ShortText
     category: ShortText
     primary_value_prop: LongText
     goal: LongText | None = None
     price_usd: float | None = None
+    price: float | None = Field(default=None, ge=0, description="Product selling price, in `currency`")
+    products: list[MerchantProduct] = Field(
+        default_factory=list,
+        max_length=MAX_LIST_ITEMS,
+        description="The product line being launched. Empty means the single product above.",
+    )
     known_competitors: list[ShortText] = Field(default_factory=list, max_length=MAX_LIST_ITEMS)
     existing_customer_profiles: list[ShortText] = Field(default_factory=list, max_length=MAX_LIST_ITEMS)
     dossier: Annotated[str, Field(max_length=MAX_DOSSIER_CHARS)] | None = None
@@ -49,6 +64,35 @@ class MerchantContextInput(BaseModel):
     price_model: ShortText | None = Field(
         default=None,
         description="Pricing structure: e.g. monthly_subscription, one_time, hourly_rate, retainer, usage_based, free_quote",
+    )
+    budget: float | None = Field(
+        default=None,
+        description="Campaign budget, in `currency`",
+    )
+    currency: Annotated[str, Field(max_length=3)] | None = Field(
+        default=None,
+        description="ISO currency code of the budget and prices, e.g. 'INR'. Inferred from the market when omitted.",
+    )
+    launch_stage: Literal["pre_launch", "launched_few_sales", "regular_orders"] | None = Field(
+        default=None, description="Where the business is today; decides validate vs scale planning"
+    )
+    sales_channel: ShortText | None = Field(
+        default=None, description="Where customers buy: own site, Instagram/WhatsApp, marketplace, offline"
+    )
+    unit_cost: float | None = Field(
+        default=None, ge=0, description="Product + fulfilment cost per unit, in `currency`; enables break-even"
+    )
+    stock_ready: bool | None = Field(default=None, description="Inventory and sizes ready to sell")
+    campaign_days: int | None = Field(
+        default=None,
+        ge=3,
+        le=365,
+        description="Desired campaign duration in days (e.g. 14, 30, 60, 90, 180)",
+    )
+    sub_goals: list[ShortText] = Field(
+        default_factory=list,
+        max_length=MAX_LIST_ITEMS,
+        description="Specific target sub-goals or milestones",
     )
 
 
@@ -97,6 +141,8 @@ class AutofillFields(BaseModel):
     primary_value_prop: str | None = Field(default=None, description="Main value proposition, close to the documents' wording")
     goal: str | None = Field(default=None, description="Stated business or campaign goal")
     price_usd: float | None = Field(default=None, description="Product price in USD, only if a USD price is stated")
+    price: float | None = Field(default=None, description="Flagship product price as stated, in `currency`")
+    currency: str | None = Field(default=None, description="ISO code of the stated price, e.g. 'INR' for ₹")
     known_competitors: list[str] = Field(default_factory=list, description="Competitor names mentioned in the documents")
     existing_customer_profiles: list[str] = Field(default_factory=list, description="Target customer types mentioned")
     target_geography: str | None = Field(default=None, description="Target market, city, region, or country (e.g. 'Delhi', 'Austin, TX', 'United States', or 'Global')")
@@ -149,6 +195,12 @@ class ReportChatInput(BaseModel):
     """A conversation about one run's report; the last message is the user's question."""
 
     messages: Annotated[list[ChatMessage], Field(min_length=1, max_length=40)]
+    step: Literal["brief", "research", "strategy", "content", "schedule", "live"] | None = Field(
+        default=None, description="The workspace step the merchant is on; answers follow it"
+    )
+    focus_asset_id: Annotated[str, Field(max_length=40)] | None = Field(
+        default=None, description="The content asset open on screen, if any"
+    )
 
 
 EditableField = Literal[

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { memo } from "react";
 import { RivalView, relevanceLabel } from "@/lib/rivalMetrics";
 import { cn } from "@/lib/utils";
@@ -26,6 +27,22 @@ interface RivalCardProps {
 }
 
 export function Avatar({ rival, size = "md" }: { rival: RivalView; size?: "md" | "lg" }) {
+  const [logoFailed, setLogoFailed] = useState(false);
+  const box = size === "lg" ? "w-12 h-12" : "w-10 h-10";
+  if (rival.logoUrl && !logoFailed) {
+    return (
+      <span aria-hidden className={cn("rounded-xl bg-white border border-line flex items-center justify-center shrink-0 overflow-hidden", box)}>
+        <img
+          src={rival.logoUrl}
+          alt=""
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setLogoFailed(true)}
+          className="w-3/4 h-3/4 object-contain"
+        />
+      </span>
+    );
+  }
   return (
     <span
       aria-hidden
@@ -41,7 +58,7 @@ export function Avatar({ rival, size = "md" }: { rival: RivalView; size?: "md" |
 }
 
 export function RatingBadge({ rating, reviews }: { rating: number | null; reviews: number | null }) {
-  if (rating == null) return <span className="text-[11px] text-ink-faint">No rating found</span>;
+  if (rating == null) return <span className="text-[11px] text-ink-faint" title="No rating found">—</span>;
   return (
     <span className="inline-flex items-center gap-1 text-xs font-semibold text-ink">
       <span className="text-amber-500" aria-hidden>

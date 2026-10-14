@@ -14,14 +14,17 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
 
-from orchestrator.core.config import get_settings
+from orchestrator.agents.campaign_strategy.money import fmt_money
+from orchestrator.core.config import get_settings, research_limit
 from orchestrator.core.llm import has_llm_credentials
 from orchestrator.core.storage import get_storage
 from orchestrator.schemas.api import BYOKConfig, CampaignCreate, ReportEdit
 from orchestrator.schemas.research import CompetitorProfile, SWOTReportDelta
 from orchestrator.services.report_edits import ReportEditError, apply_report_edits
 from orchestrator.schemas.state import StrategyState
-from orchestrator.schemas.strategy import CampaignStrategyBrief
+from orchestrator.schemas.strategy import CampaignStrategyBrief, CampaignStrategyOption
+from orchestrator.schemas.content import ContentAsset, ContentPack
+from orchestrator.agents.market_research.ingestion.search_client import reset_search_market, set_search_market
 from orchestrator.services.dossier import combine_documents
 
 logger = logging.getLogger(__name__)
@@ -95,11 +98,16 @@ class CampaignJob:
         self.is_finished: bool = False
         self.last_swot_report: SWOTReportDelta | None = None
         self.strategy_brief: CampaignStrategyBrief | None = None
+        # Audience/Persona Agent output for this run. Empty until that agent is wired in; the
+        # strategy agent then derives provisional personas from the research instead.
+        self.persona_profiles: list = []
         self.task: asyncio.Task[None] | None = None
         self.report_lock: asyncio.Lock = asyncio.Lock()
         self.created_at: float = time.monotonic()
         self.finished_at: float | None = None
         self.bench_competitors: list[CompetitorProfile] = []
+        self.content_pack: ContentPack | None = None
+        self.content_task: asyncio.Task[None] | None = None
 
 
 class CampaignService:
@@ -182,6 +190,8 @@ class CampaignService:
         restored.bench_competitors = [
             CompetitorProfile(**c) for c in doc.get("bench_competitors") or []
         ]
+        if doc.get("content_pack"):
+            restored.content_pack = ContentPack(**doc["content_pack"])
         restored.history_events = list(doc.get("events", []))
         self._jobs[job_id] = restored
         return restored
@@ -256,7 +266,10 @@ class CampaignService:
                 stamp = last.get("timestamp")
                 # No timestamp means no way to tell how long it has been quiet: never declare it.
                 quiet_s = (_now_ms() - int(stamp)) / 1000 if stamp else 0
-                if last.get("type") not in _TERMINAL_EVENTS and quiet_s >= _ORPHAN_QUIET_SECONDS:
+                # Approval and content events come after RUN_COMPLETE, so "finished" means any
+                # terminal event, not the last one; otherwise a restart marked approved runs as failed.
+                finished = any(e.get("type") in _TERMINAL_EVENTS for e in events)
+                if not finished and quiet_s >= _ORPHAN_QUIET_SECONDS:
                     failed = {
                         "type": "RUN_FAILED",
                         "seq": int(last.get("seq", len(events) - 1)) + 1,
@@ -339,7 +352,10 @@ class CampaignService:
     # ── Pipeline ─────────────────────────────────────────────────────────────
 
     async def _execute_pipeline(self, job: CampaignJob) -> None:
+        # Runs in its own task, so the market pinned here covers this job's searches only.
+        set_search_market(job.merchant_context)
         try:
+            await self._log_provider_health(job)
             await self._emit_event(
                 job, {"type": "NODE_STARTED", "node": "market_research", "timestamp": _now_ms()}
             )
@@ -388,11 +404,13 @@ class CampaignService:
                 },
             )
 
-            # Stage 2: Audience Persona (Reserved for Stage 2 expansion)
+            # Stage 2: Audience Persona — personas built from the research's grounded audience read
             await self._emit_event(job, {"type": "NODE_STARTED", "node": "audience_persona", "timestamp": _now_ms()})
-            await self._log(job, "[AUDIENCE_PERSONA] Pass-through node; audience profiling reserved for stage 2 expansion.")
+            job.persona_profiles = await self._run_audience_persona_node(job, report_delta)
             await self._emit_event(
-                job, {"type": "NODE_COMPLETE", "node": "audience_persona", "delta": {"persona_profiles": []}, "timestamp": _now_ms()}
+                job,
+                {"type": "NODE_COMPLETE", "node": "audience_persona",
+                 "delta": {"persona_profiles": job.persona_profiles}, "timestamp": _now_ms()},
             )
 
             # Stage 3: Campaign Strategy & Budget Decomposition (Loops 1-3)
@@ -458,11 +476,12 @@ class CampaignService:
     def _run_document(job: CampaignJob) -> dict:
         """The persisted run: no BYOK key, and the dossier text stays out (it can approach Mongo's 16 MB cap)."""
         context = {k: v for k, v in job.merchant_context.items() if k != "dossier"}
-        last = job.history_events[-1]["type"] if job.history_events else None
+        # Approval and content events follow RUN_COMPLETE, so "complete" means it ever completed.
+        completed = any(e.get("type") == "RUN_COMPLETE" for e in job.history_events)
         return {
             "job_id": job.job_id,
             "finished_at": datetime.now(timezone.utc),
-            "status": "complete" if last == "RUN_COMPLETE" else "failed",
+            "status": "complete" if completed else "failed",
             "label": job.label,
             "merchant_context": context,
             "dossier_chars": len(job.dossier_text or ""),
@@ -470,6 +489,7 @@ class CampaignService:
             "strategy_brief": job.strategy_brief.model_dump() if job.strategy_brief else None,
             # Kept so "find more competitors" can still serve the next in line after a restart.
             "bench_competitors": [c.model_dump() for c in job.bench_competitors],
+            "content_pack": job.content_pack.model_dump() if job.content_pack else None,
             "events": job.history_events,
         }
 
@@ -478,7 +498,7 @@ class CampaignService:
     def _summary(self, job: CampaignJob) -> dict:
         status = "running" if (job.is_started and not job.is_finished) else (
             "pending" if not job.is_started else (
-                "complete" if job.history_events and job.history_events[-1]["type"] == "RUN_COMPLETE" else "failed"
+                "complete" if any(e.get("type") == "RUN_COMPLETE" for e in job.history_events) else "failed"
             )
         )
         ctx = job.merchant_context
@@ -627,6 +647,37 @@ class CampaignService:
             )
         return report
 
+    async def _log_provider_health(self, job: CampaignJob) -> None:
+        """Says up front when a scraping account is broken, instead of failing page by page."""
+        from orchestrator.agents.market_research.ingestion.provider_health import check_providers
+
+        if not get_settings().provider_health_check:
+            return
+        try:
+            for p in await check_providers():
+                if p["configured"] and not p["ok"]:
+                    await self._log(job, f"[PROVIDERS] {p['provider']}: {p['detail']}", "WARNING")
+        except Exception as exc:  # a status check must never block a run
+            logger.info("Provider health check skipped: %s", exc)
+
+    async def _run_audience_persona_node(self, job: CampaignJob, report_delta: SWOTReportDelta) -> list:
+        from orchestrator.agents.audience_persona.agent import execute_audience_persona
+
+        async def on_progress(message: str, level: str = "INFO") -> None:
+            await self._log(job, message, level=level)
+
+        try:
+            delta = await execute_audience_persona(
+                {"merchant_context": job.merchant_context, "swot_report": report_delta, "errors": []},
+                llm_config=job.byok_config, on_progress=on_progress,
+            )
+            return list(delta.get("persona_profiles") or [])
+        except Exception as exc:
+            # Strategy derives personas from the research itself when this step has none.
+            logger.warning("Audience persona node failed: %s", exc)
+            await self._log(job, f"[AUDIENCE_PERSONA] Failed ({type(exc).__name__}); strategy will derive personas.", "WARNING")
+            return []
+
     async def _run_campaign_strategy_node(
         self, job: CampaignJob, report_delta: SWOTReportDelta
     ) -> CampaignStrategyBrief:
@@ -636,7 +687,7 @@ class CampaignService:
         state: StrategyState = {
             "merchant_context": job.merchant_context,
             "swot_report": report_delta,
-            "persona_profiles": [],
+            "persona_profiles": job.persona_profiles,
             "errors": [],
         }
 
@@ -654,7 +705,83 @@ class CampaignService:
             return CampaignStrategyBrief(**delta["campaign_brief"])
         raise RuntimeError("Campaign strategy agent returned no strategy brief")
 
-    async def approve_strategy(self, job_id: str) -> CampaignStrategyBrief:
+    async def customize_strategy(
+        self,
+        job_id: str,
+        budget: float | None = None,
+        selected_option_id: str | None = None,
+        custom_goal: str | None = None,
+        campaign_days: int | None = None,
+        sub_goals: list[str] | None = None,
+        campaign_type: str | None = None,
+        custom_option: CampaignStrategyOption | None = None,
+    ) -> CampaignStrategyBrief:
+        """
+        Re-scales strategy options and channel spend based on custom user budget,
+        duration in days, sub-goals, campaign type, and optional custom strategy option.
+        """
+        job = await self.get_or_restore_job(job_id)
+        if not job.last_swot_report:
+            raise CampaignJobConflictError(f"Job {job_id} does not have a research report yet.")
+
+        if budget is not None:
+            job.merchant_context["budget"] = str(budget)
+        if custom_goal is not None:
+            job.merchant_context["goal"] = custom_goal
+        if campaign_days is not None:
+            job.merchant_context["campaign_days"] = campaign_days
+        if sub_goals is not None:
+            job.merchant_context["sub_goals"] = sub_goals
+        if campaign_type is not None:
+            job.merchant_context["campaign_type"] = campaign_type
+
+        # Re-run strategy node with the updated parameters
+        job.strategy_brief = await self._run_campaign_strategy_node(job, job.last_swot_report)
+
+        if custom_option is not None:
+            existing_idx = next(
+                (i for i, opt in enumerate(job.strategy_brief.campaign_options) if opt.option_id == custom_option.option_id),
+                None,
+            )
+            if existing_idx is not None:
+                job.strategy_brief.campaign_options[existing_idx] = custom_option
+            else:
+                job.strategy_brief.campaign_options.insert(0, custom_option)
+            job.strategy_brief.selected_option_id = custom_option.option_id
+            if custom_option.channel_matrix:
+                job.strategy_brief.channel_matrix = custom_option.channel_matrix
+        elif selected_option_id:
+            job.strategy_brief.selected_option_id = selected_option_id
+            for opt in job.strategy_brief.campaign_options:
+                if opt.option_id == selected_option_id:
+                    job.strategy_brief.channel_matrix = opt.channel_matrix
+                    break
+
+
+        await self._log(
+            job,
+            f"[STRATEGY_CUSTOMIZED] User updated budget to {fmt_money(job.strategy_brief.user_budget or 0, job.strategy_brief.currency)}, duration to {job.strategy_brief.campaign_days} days, and selected option '{job.strategy_brief.selected_option_id}'.",
+        )
+        await self._emit_event(
+            job,
+            {
+                "type": "STRATEGY_UPDATED",
+                "brief": job.strategy_brief.model_dump(),
+                "timestamp": _now_ms(),
+            },
+        )
+        await get_storage().save_run(self._run_document(job))
+        return job.strategy_brief
+
+    async def approve_strategy(
+        self,
+        job_id: str,
+        budget: float | None = None,
+        selected_option_id: str | None = None,
+        campaign_days: int | None = None,
+        sub_goals: list[str] | None = None,
+        campaign_type: str | None = None,
+    ) -> CampaignStrategyBrief:
         """Confirms founder approval on the strategy brief, preparing downstream execution."""
         job = await self.get_or_restore_job(job_id)
         if not job.strategy_brief:
@@ -662,10 +789,29 @@ class CampaignService:
                 raise CampaignJobConflictError(f"Job {job_id} does not have a research report yet.")
             job.strategy_brief = await self._run_campaign_strategy_node(job, job.last_swot_report)
 
+        if budget is not None:
+            job.merchant_context["budget"] = str(budget)
+            job.strategy_brief.user_budget = budget
+        if campaign_days is not None:
+            job.merchant_context["campaign_days"] = campaign_days
+            job.strategy_brief.campaign_days = campaign_days
+        if sub_goals is not None:
+            job.merchant_context["sub_goals"] = sub_goals
+            job.strategy_brief.sub_goals = sub_goals
+        if campaign_type is not None:
+            job.merchant_context["campaign_type"] = campaign_type
+            job.strategy_brief.campaign_type = campaign_type
+        if selected_option_id:
+            job.strategy_brief.selected_option_id = selected_option_id
+            for opt in job.strategy_brief.campaign_options:
+                if opt.option_id == selected_option_id:
+                    job.strategy_brief.channel_matrix = opt.channel_matrix
+                    break
+
         job.strategy_brief.approval_status = "APPROVED_AND_DISPATCHED"
         await self._log(
             job,
-            "[STRATEGY_APPROVED] Founder approval confirmed. Handing off to downstream execution engines.",
+            f"[STRATEGY_APPROVED] Founder approval confirmed (Option: '{job.strategy_brief.selected_option_id}'). Handing off to downstream execution engines.",
         )
         await self._emit_event(
             job,
@@ -676,7 +822,161 @@ class CampaignService:
             },
         )
         await get_storage().save_run(self._run_document(job))
+        # Content is written from the approved strategy, in the background: approval returns now.
+        if job.content_pack is None and (job.content_task is None or job.content_task.done()):
+            job.content_task = asyncio.create_task(self._generate_content(job))
         return job.strategy_brief
+
+    # ── Campaign content: written from the approved strategy, approved per channel ───────
+
+    def _content_llm(self, job: CampaignJob) -> Any:
+        from orchestrator.core.llm import build_chat_model
+
+        return build_chat_model(byok=job.byok_config) if has_llm_credentials(job.byok_config) else None
+
+    async def _generate_content(self, job: CampaignJob) -> None:
+        from orchestrator.agents.content.writer import write_content
+
+        await self._emit_event(job, {"type": "CONTENT_STARTED", "timestamp": _now_ms()})
+        try:
+            await self._log(job, "[CONTENT_WRITER] Writing assets for each channel in the approved plan")
+            pack = await write_content(
+                job.strategy_brief, job.last_swot_report, job.merchant_context, self._content_llm(job)
+            )
+            await self._log(job, f"[CONTENT_WRITER] {len(pack.assets)} asset(s) across {len(pack.channels())} channel(s)")
+            self._qa_and_schedule(job, pack)
+            flagged = sum(bool(a.qa_issues) for a in pack.assets)
+            await self._log(job, f"[CONTENT_QA] {flagged} of {len(pack.assets)} asset(s) have something to check")
+            planned = sum(bool(a.scheduled_for) for a in pack.assets)
+            await self._log(job, f"[SCHEDULER] {planned} asset(s) given a planned date")
+        except Exception as exc:
+            logger.exception("Content generation failed for %s", job.job_id)
+            pack = ContentPack(notes=[f"Content generation failed ({type(exc).__name__})."])
+        job.content_pack = pack
+        await self._emit_event(job, {"type": "CONTENT_READY", "content": pack.model_dump(), "timestamp": _now_ms()})
+        await get_storage().save_run(self._run_document(job))
+
+    def _qa_and_schedule(self, job: CampaignJob, pack: ContentPack) -> None:
+        from orchestrator.agents.content.qa import review_pack
+        from orchestrator.agents.content.scheduler import plan_schedule
+
+        rivals = [c.brand_name for c in (job.last_swot_report.competitors if job.last_swot_report else [])]
+        review_pack(pack, job.merchant_context, rivals)
+        if job.strategy_brief:
+            plan_schedule(pack, job.strategy_brief, job.merchant_context)
+
+    async def get_content(self, job_id: str) -> ContentPack | None:
+        job = await self.get_or_restore_job(job_id)
+        return job.content_pack
+
+    async def generate_content(self, job_id: str) -> None:
+        """(Re)writes the whole pack; only allowed once the strategy is approved."""
+        job = await self.get_or_restore_job(job_id)
+        if not job.strategy_brief or job.strategy_brief.approval_status == "PENDING_APPROVAL":
+            raise CampaignJobConflictError("Approve the strategy before writing content.")
+        if job.content_task is not None and not job.content_task.done():
+            raise CampaignJobConflictError("Content is already being written.")
+        job.content_pack = None
+        job.content_task = asyncio.create_task(self._generate_content(job))
+
+    def _asset(self, job: CampaignJob, asset_id: str) -> ContentAsset:
+        if not job.content_pack:
+            raise CampaignJobConflictError("No content has been written for this campaign yet.")
+        asset = next((a for a in job.content_pack.assets if a.asset_id == asset_id), None)
+        if asset is None:
+            raise CampaignJobNotFoundError(f"Asset {asset_id} not found")
+        return asset
+
+    async def edit_asset(self, job_id: str, asset_id: str, fields: dict[str, Any]) -> ContentAsset:
+        """Merchant edits; an edit to an approved channel sends that channel back to review."""
+        job = await self.get_or_restore_job(job_id)
+        asset = self._asset(job, asset_id)
+        if asset.status in ("scheduled", "published"):
+            raise CampaignJobConflictError("This asset is already scheduled or published; unschedule it first.")
+        editable = {"name", "subject", "preview_text", "body", "headlines", "descriptions", "cta", "scheduled_for",
+                    "landing_url", "creative_brief", "hashtags"}
+        updated = asset.model_copy(update={k: v for k, v in fields.items() if k in editable})
+        updated = ContentAsset.model_validate(updated.model_dump() | {"status": "draft"})
+        updated.qa_issues = self._qa(job, updated)
+        self._replace_asset(job, updated)
+        await get_storage().save_run(self._run_document(job))
+        return updated
+
+    async def regenerate_asset(self, job_id: str, asset_id: str, instruction: str | None = None) -> ContentAsset:
+        from orchestrator.agents.content.writer import rewrite_asset
+
+        job = await self.get_or_restore_job(job_id)
+        asset = self._asset(job, asset_id)
+        llm = self._content_llm(job)
+        if llm is None:
+            raise CampaignJobConflictError("Rewriting needs a language model; none is configured.")
+        new = await rewrite_asset(asset, job.strategy_brief, job.last_swot_report, job.merchant_context, llm, instruction)
+        new.scheduled_for = asset.scheduled_for
+        new.qa_issues = self._qa(job, new)
+        self._replace_asset(job, new)
+        await get_storage().save_run(self._run_document(job))
+        return new
+
+    def _qa(self, job: CampaignJob, asset: ContentAsset) -> list[str]:
+        from orchestrator.agents.content.qa import check_asset
+
+        rivals = [c.brand_name for c in (job.last_swot_report.competitors if job.last_swot_report else [])]
+        return check_asset(asset, job.merchant_context, rivals)
+
+    async def reschedule_assets(
+        self,
+        job_id: str,
+        shift_days: int = 0,
+        time_of_day: str | None = None,
+        channel: str | None = None,
+        asset_ids: list[str] | None = None,
+    ) -> ContentPack:
+        """Moves planned dates/times; published or already-booked assets are left alone."""
+        from datetime import datetime, timedelta
+
+        job = await self.get_or_restore_job(job_id)
+        pack = job.content_pack
+        if not pack:
+            raise CampaignJobConflictError("No content has been written for this campaign yet.")
+        hh, mm = (int(x) for x in time_of_day.split(":")) if time_of_day else (None, None)
+        moved = 0
+        for a in pack.assets:
+            if a.status in ("scheduled", "published") or not a.scheduled_for:
+                continue
+            if channel and a.channel != channel or asset_ids and a.asset_id not in asset_ids:
+                continue
+            when = datetime.fromisoformat(a.scheduled_for) + timedelta(days=shift_days)
+            if hh is not None:
+                when = when.replace(hour=hh, minute=mm)
+            a.scheduled_for = when.isoformat()
+            moved += 1
+        if not moved:
+            raise CampaignJobConflictError("No planned asset matched; nothing was moved.")
+        await self._emit_event(job, {"type": "SCHEDULE_CHANGED", "moved": moved, "timestamp": _now_ms()})
+        await get_storage().save_run(self._run_document(job))
+        return pack
+
+    def _replace_asset(self, job: CampaignJob, asset: ContentAsset) -> None:
+        pack = job.content_pack
+        assert pack is not None
+        pack.assets = [asset if a.asset_id == asset.asset_id else a for a in pack.assets]
+        if asset.status == "draft" and asset.channel in pack.approved_channels:
+            pack.approved_channels = [c for c in pack.approved_channels if c != asset.channel]
+
+    async def set_channel_approval(self, job_id: str, channel: str, approved: bool) -> ContentPack:
+        job = await self.get_or_restore_job(job_id)
+        pack = job.content_pack
+        if not pack or channel not in pack.channels():
+            raise CampaignJobNotFoundError(f"No content for channel {channel}")
+        for a in pack.assets:
+            if a.channel == channel and a.status in ("draft", "approved"):
+                a.status = "approved" if approved else "draft"
+        others = [c for c in pack.approved_channels if c != channel]
+        pack.approved_channels = others + ([channel] if approved else [])  # type: ignore[list-item]
+        await self._emit_event(job, {"type": "CONTENT_APPROVAL", "channel": channel, "approved": approved,
+                                     "timestamp": _now_ms()})
+        await get_storage().save_run(self._run_document(job))
+        return pack
 
     # ── On-demand competitor discovery ───────────────────────────────────────
 
@@ -697,6 +997,15 @@ class CampaignService:
     ) -> tuple[SWOTReportDelta, list[CompetitorProfile]]:
         current_report = job.last_swot_report
         assert current_report is not None
+        token = set_search_market(job.merchant_context)
+        try:
+            return await self._find_more_competitors_in_market(job, current_report, names)
+        finally:
+            reset_search_market(token)
+
+    async def _find_more_competitors_in_market(
+        self, job: CampaignJob, current_report: SWOTReportDelta, names: list[str] | None
+    ) -> tuple[SWOTReportDelta, list[CompetitorProfile]]:
         existing_names = [c.brand_name for c in current_report.competitors]
         existing_keys = {_norm(c.brand_name) for c in current_report.competitors} | {
             _norm(f"{c.brand_name} {c.product_name}") for c in current_report.competitors
@@ -704,8 +1013,8 @@ class CampaignService:
 
         category = job.merchant_context.get("category", "General")
 
-        from orchestrator.agents.market_research.ads.ad_intelligence import search_competitor_ad_hooks
-        from orchestrator.agents.market_research.discovery.search import (
+        from orchestrator.agents.market_research.ingestion.ad_intelligence import search_competitor_ad_hooks
+        from orchestrator.agents.market_research.ingestion.search_client import (
             SearchQuery,
             build_missing_data_queries,
             build_search_queries,
@@ -713,7 +1022,7 @@ class CampaignService:
             execute_tavily_search,
             filter_out_of_scale_results,
         )
-        from orchestrator.agents.market_research.pipeline.loop import extract_preliminary_competitors
+        from orchestrator.agents.market_research.workflow.research_loop import extract_preliminary_competitors
 
         # Every branch below feeds the same follow-up searches, which need these; they used to
         # be defined only on the fresh-search branch, so promoting from the bench crashed.
@@ -801,11 +1110,11 @@ class CampaignService:
         # shortlist. Now that the merchant has asked for them, crawl their own pages so they
         # arrive with the same pricing and evidence depth as the originals.
         if new_competitors:
-            from orchestrator.agents.market_research.discovery.crawler import (
+            from orchestrator.agents.market_research.ingestion.page_extractor import (
                 extract_competitor_target_urls,
                 extract_pages,
             )
-            from orchestrator.agents.market_research.pipeline.loop import (
+            from orchestrator.agents.market_research.workflow.research_loop import (
                 enrich_competitors_from_pages,
                 merge_duplicate_competitors,
             )
@@ -839,8 +1148,8 @@ class CampaignService:
             crawl_urls = extract_competitor_target_urls(
                 new_competitors,
                 [],
-                pages_per_competitor=settings.research_pages_per_competitor,
-                max_urls=settings.research_pages_per_competitor * len(new_competitors),
+                pages_per_competitor=research_limit(settings, "research_pages_per_competitor"),
+                max_urls=research_limit(settings, "research_pages_per_competitor") * len(new_competitors),
             )
             if crawl_urls:
                 await self._log(
@@ -871,7 +1180,7 @@ class CampaignService:
         new_sources = [u for c in new_competitors for u in c.sources] + [d["url"] for d in ad_intel.documents]
         current_report.competitors.extend(new_competitors)
         current_report.source_urls = list(dict.fromkeys(current_report.source_urls + new_sources))
-        from orchestrator.agents.market_research.analysis.taxonomy import calculate_attribute_density
+        from orchestrator.agents.market_research.intelligence.market_mapping.taxonomy import calculate_attribute_density
 
         current_report.attribute_density = calculate_attribute_density(
             current_report.competitors, current_report.dynamic_taxonomy
@@ -916,8 +1225,8 @@ class CampaignService:
         async with job.report_lock:
             report, applied = apply_report_edits(job.last_swot_report.model_copy(deep=True), edits)
 
-            from orchestrator.agents.market_research.analysis.scoring import calculate_dqs
-            from orchestrator.agents.market_research.analysis.taxonomy import calculate_attribute_density
+            from orchestrator.agents.market_research.intelligence.validation.scoring import calculate_dqs
+            from orchestrator.agents.market_research.intelligence.market_mapping.taxonomy import calculate_attribute_density
 
             settings = get_settings()
             report.dqs_score = calculate_dqs(

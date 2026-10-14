@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.agents.market_research.analysis import archetype
-from orchestrator.agents.market_research.analysis.taxonomy import reason_dynamic_parameters
-from orchestrator.agents.market_research.discovery.search import (
+from orchestrator.agents.market_research.intelligence.advisory import archetype
+from orchestrator.agents.market_research.intelligence.market_mapping.taxonomy import reason_dynamic_parameters
+from orchestrator.agents.market_research.ingestion.search_client import (
     build_missing_data_queries,
     build_search_queries,
 )

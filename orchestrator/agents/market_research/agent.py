@@ -21,13 +21,18 @@ _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from orchestrator.agents.market_research.analysis.classification import classify_campaign_context
-from orchestrator.agents.market_research.pipeline.loop import ResearchLoopResult, execute_research_loop, split_named
+from orchestrator.agents.market_research.intelligence.market_mapping.classification import classify_campaign_context
+from orchestrator.agents.market_research.ingestion.search_client import current_search_market, set_search_market
+from orchestrator.agents.market_research.workflow.research_loop import (
+    ResearchLoopResult,
+    execute_research_loop,
+    split_named,
+)
 from orchestrator.agents.market_research.progress import ProgressFn, _report
-from orchestrator.agents.market_research.analysis.relevance_filter import rank_by_category_fit
-from orchestrator.agents.market_research.analysis.scoring import calculate_dqs
-from orchestrator.agents.market_research.pipeline.subagents import ResearchCrew
-from orchestrator.agents.market_research.analysis.taxonomy import (
+from orchestrator.agents.market_research.intelligence.market_mapping.relevance_filter import rank_by_category_fit
+from orchestrator.agents.market_research.intelligence.validation.scoring import calculate_dqs
+from orchestrator.agents.market_research.workflow.subagents import ResearchCrew
+from orchestrator.agents.market_research.intelligence.market_mapping.taxonomy import (
     calculate_attribute_density,
     revise_taxonomy_from_evidence,
 )
@@ -45,14 +50,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Takes: name (str: raw brand/product name)
+# Returns: str (lowercase string with normalized whitespace)
+# Called by: execute_market_research, attach_ad_hooks
+# Points to / Calls: str.split, str.lower
 def _norm_brand(name: str) -> str:
     return " ".join((name or "").lower().split())
 
 
+# Takes: name (str: brand name with potential parentheses or punctuation)
+# Returns: str (alphanumeric lowercase string stripped of parenthetical suffixes)
+# Called by: _fill_validator_gaps, attach_ad_hooks
+# Points to / Calls: re.sub
 def _compact(name: str) -> str:
     return "".join(ch for ch in re.sub(r"\(.*?\)", "", (name or "").lower()) if ch.isalnum())
 
 
+# Takes:
+#   - crew (ResearchCrew container with search, crawl, and validator subagents)
+#   - report (SWOTReportDelta: current working intelligence report)
+#   - gaps (list[Gap]: missing attributes flagged by the validator, e.g. pricing_model)
+#   - merchant_context (dict: product name, category, and brief)
+#   - taxonomy (DynamicParameterTaxonomy: JTBD drivers and specifications)
+#   - round_number (int: current validator retry iteration index)
+# Returns: tuple[list[str], list[str]] (newly retrieved evidence markdown texts, newly crawled source URLs)
+# Called by: execute_market_research (Phase 6b validator loop)
+# Points to / Calls:
+#   - ingestion.search_client.build_missing_data_queries
+#   - ingestion.page_extractor.extract_competitor_target_urls
+#   - workflow.research_loop.enrich_competitors_from_pages
+#   - workflow.research_loop.merge_duplicate_competitors
+#   - workflow.research_loop.extract_preliminary_competitors
 async def _fill_validator_gaps(
     crew: Any,
     report: Any,
@@ -67,9 +95,9 @@ async def _fill_validator_gaps(
     Returns the new evidence texts and URLs, which the grounding gate must see before anything
     from them is kept.
     """
-    from orchestrator.agents.market_research.discovery.crawler import extract_competitor_target_urls
-    from orchestrator.agents.market_research.discovery.search import build_missing_data_queries
-    from orchestrator.agents.market_research.pipeline.loop import (
+    from orchestrator.agents.market_research.ingestion.page_extractor import extract_competitor_target_urls
+    from orchestrator.agents.market_research.ingestion.search_client import build_missing_data_queries
+    from orchestrator.agents.market_research.workflow.research_loop import (
         _extract_price,
         enrich_competitors_from_pages,
         extract_preliminary_competitors,
@@ -110,6 +138,20 @@ async def _fill_validator_gaps(
     return texts, new_urls
 
 
+# Takes: report (SWOTReportDelta or any object)
+# Returns: tuple[Any, list[str]] (report object, empty diagnostic notes list)
+# Called by: execute_market_research when crew.listings is disabled
+# Points to / Calls: None
+async def _no_notes(report: Any) -> tuple[Any, list[str]]:
+    return report, []
+
+
+# Takes:
+#   - competitors (list[CompetitorProfile]: list of target competitor objects to enrich)
+#   - hooks_by_comp (dict[str, list[str]]: mapping of competitor names to discovered ad copy hooks)
+# Returns: None (mutates competitors list in-place by appending comp.ad_hooks)
+# Called by: execute_market_research (Phase 4 ad intel completion)
+# Points to / Calls: _compact
 def attach_ad_hooks(competitors: list[Any], hooks_by_comp: dict[str, list[str]]) -> None:
     """
     Merges collected ad hooks into the final profiles, matched by brand rather than exact
@@ -125,6 +167,27 @@ def attach_ad_hooks(competitors: list[Any], hooks_by_comp: dict[str, list[str]])
                 comp.ad_hooks = list(dict.fromkeys([*comp.ad_hooks, *hooks]))
 
 
+# Takes:
+#   - state (StrategyState: graph dictionary containing merchant_context, dqs_retries, prior_report)
+#   - tavily_client (optional search client override)
+#   - crawl_client (optional web scraper client override)
+#   - llm (optional primary LLM instance)
+#   - llm_config (optional BYOKConfig for custom API endpoints / keys)
+#   - on_progress (optional async callback for streaming progress events)
+# Returns: dict[str, Any] (LangGraph state update delta containing "swot_report", "errors", "dqs_retries")
+# Called by: LangGraph orchestration node, CampaignService background task runner
+# Points to / Calls:
+#   - intelligence.market_mapping.classification.classify_campaign_context
+#   - workflow.ResearchCrew.build
+#   - workflow.research_loop.execute_research_loop
+#   - intelligence.market_mapping.relevance_filter.rank_by_category_fit
+#   - intelligence.market_mapping.wedge_finder.scan_wedge
+#   - intelligence.market_mapping.threat_monitor.build_threat_watch
+#   - intelligence.advisory.synthesis.synthesize_swot_with_llm
+#   - intelligence.advisory.dossier_auditor.audit_merchant_dossier
+#   - intelligence.advisory.dossier_auditor.build_unit_economics_model
+#   - intelligence.advisory.dossier_auditor.generate_launch_roadmap
+#   - normalizers.merge.merge_reports
 async def execute_market_research(
     state: StrategyState,
     *,
@@ -151,6 +214,9 @@ async def execute_market_research(
     """
     settings = get_settings()
     merchant_context = state.get("merchant_context", {})
+    if current_search_market() is None:
+        # Direct callers (tests, scripts) get the same market pinning the campaign service sets.
+        set_search_market(merchant_context)
     dqs_retries = state.get("dqs_retries", 0)
     errors: list[str] = list(state.get("errors", []))
     prior_report: SWOTReportDelta | None = state.get("prior_report")
@@ -413,7 +479,7 @@ async def execute_market_research(
             completion_docs: list[tuple[str, str]] = [
                 (r.url or "", f"{r.title}\n{r.snippet}") for r in loop_result.search_results if r.snippet
             ] + [(p.get("url") or "", p["markdown"]) for p in evidence_pages if p.get("markdown")]
-            report_delta, notes = await crew.profile_completer.run(report_delta, completion_docs)
+            report_delta, notes = await crew.profile_completer.run(report_delta, completion_docs, merchant_context)
             _note(notes)
             raw_text_corpus.extend(crew.profile_completer.new_texts)
             all_source_urls = list(dict.fromkeys(all_source_urls + crew.profile_completer.new_urls))
@@ -447,27 +513,74 @@ async def execute_market_research(
         # Phase 7d: Review Context — reads the review evidence a second time to synthesize why
         # customers praise or complain, who they are, and the counter-angle each theme opens up.
         # Runs on the final display set, so it never spends tokens on a competitor that was cut.
-        report_delta = await crew.review_context.run(
-            report_delta, raw_text_corpus, merchant_context
-        )
-
         # Phase 7e: Breakout Leap Benchmark — compares merchant against breakout peers who started
         # in the same wedge but scaled to high net worth, enterprise client rosters, and partner deals.
-        report_delta, notes = await crew.leap_benchmark.run(
-            report_delta, raw_text_corpus, merchant_context
+        # Phase 7e2: Commercial Buying Patterns & Channel Reverse-Engineering
+        # Deduces real sales channels (Amazon, D2C, Marketplaces), unit economics, velocity, and buyer triggers
+        # 7d/7e/7e2 run concurrently: each mutates the same report in place but writes only its own
+        # fields (review_context / leap_benchmark(s) / buying_patterns) and reads none of the others'.
+        # Phase 7e3: Channel listings (own site + marketplaces: price, offers, terms) runs in the
+        # same group; it writes only channel_listings.
+        listing_docs = [(p.get("url") or "", p["markdown"]) for p in evidence_pages if p.get("markdown")]
+        _, (_, leap_notes), (_, buying_notes), (_, listing_notes) = await asyncio.gather(
+            crew.review_context.run(report_delta, raw_text_corpus, merchant_context),
+            crew.leap_benchmark.run(report_delta, raw_text_corpus, merchant_context),
+            crew.buying_patterns.run(report_delta, raw_text_corpus, merchant_context),
+            crew.listings.run(report_delta, merchant_context, listing_docs)
+            if crew.listings is not None else _no_notes(report_delta),
         )
-        _note(notes)
+        _note(leap_notes)
+        _note(buying_notes)
+        _note(listing_notes)
 
         # Phase 7f: Executive summary — rewritten last among the analysis steps, so it can cite
-        # repaired prices, review themes, and leap benchmarks the relevance filter's draft never saw.
+        # repaired prices, review themes, leap benchmarks, and buying patterns the relevance filter's draft never saw.
         report_delta, notes = await crew.exec_summary.run(report_delta, merchant_context)
         _note(notes)
+
+        # Phase 7f2: Market & audience — the marketing half: trends, openings, ICP, segments,
+        # pains and channels, read from market searches, rival reviews and the merchant's brief.
+        # Demand (search-interest trend) runs alongside it; each writes only its own field.
+        from orchestrator.agents.market_research.intelligence.market_mapping.demand import read_demand
+
+        async def _demand() -> list[str]:
+            if not settings.demand_trends_enabled:
+                return []
+            try:
+                return (await read_demand(report_delta, merchant_context))[1]
+            except Exception as exc:  # a trend signal must never sink the report
+                logger.warning("Demand read failed: %s", exc)
+                return [f"[DEMAND] Failed ({type(exc).__name__})."]
+
+        (_, audience_notes), demand_notes = await asyncio.gather(
+            crew.market_audience.run(report_delta, merchant_context)
+            if crew.market_audience is not None else _no_notes(report_delta),
+            _demand(),
+        )
+        _note(audience_notes)
+        _note(demand_notes)
+
+        # Phase 7g: Strategic Advisory — Dossier Audit, Unit Economics & 30-60-90 Day Launch Roadmap
+        try:
+            from orchestrator.agents.market_research.intelligence.advisory.dossier_auditor import (
+                audit_merchant_dossier,
+                build_unit_economics_model,
+                generate_launch_roadmap,
+            )
+            report_delta.dossier_audit = audit_merchant_dossier(merchant_context)
+            report_delta.unit_economics = build_unit_economics_model(merchant_context)
+            product_name = str(merchant_context.get("product_name") or "Flagship Product")
+            geo_name = str(merchant_context.get("target_geography") or "")
+            report_delta.launch_roadmap = generate_launch_roadmap(product_name, geo_name)
+        except Exception as exc:
+            logger.warning("Strategic advisory analysis failed: %s", exc)
+
 
         # Phase 8 (update runs only): merge prior run's findings into the new report.
         # Competitors not re-found in recent data are carried forward so the report
         # stays complete; enriched competitors get the union of old + new evidence.
         if is_update and prior_report:
-            from orchestrator.agents.market_research.analysis.merge import merge_reports
+            from orchestrator.agents.market_research.normalizers.merge import merge_reports
             report_delta = merge_reports(report_delta, prior_report, prior_run_at)
             await _report(
                 on_progress,
@@ -562,7 +675,7 @@ async def execute_market_research(
             fallback_docs: list[tuple[str, str]] = [
                 (r.url or "", f"{r.title}\n{r.snippet}") for r in loop_result.search_results if r.snippet
             ] + [(p.get("url") or "", p["markdown"]) for p in evidence_pages if p.get("markdown")]
-            report_delta, completion_notes = await crew.profile_completer.run(report_delta, fallback_docs)
+            report_delta, completion_notes = await crew.profile_completer.run(report_delta, fallback_docs, merchant_context)
             report_delta.validation_diagnostics = (report_delta.validation_diagnostics or []) + completion_notes
             raw_text_corpus.extend(crew.profile_completer.new_texts)
 

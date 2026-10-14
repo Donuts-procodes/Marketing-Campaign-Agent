@@ -1,6 +1,6 @@
 from datetime import date
 
-from orchestrator.agents.market_research.discovery.search import (
+from orchestrator.agents.market_research.ingestion.search_client import (
     TavilySearchResult,
     build_search_queries,
     rank_by_recency,

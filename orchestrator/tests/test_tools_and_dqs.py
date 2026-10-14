@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.agents.market_research.analysis.scoring import (
+from orchestrator.agents.market_research.intelligence.validation.scoring import (
     DQSResult,
     W_COMPETITORS,
     W_PRICING,
@@ -13,8 +13,8 @@ from orchestrator.agents.market_research.analysis.scoring import (
     W_VULNERABILITIES,
     calculate_dqs,
 )
-from orchestrator.agents.market_research.discovery.crawler import extract_target_urls
-from orchestrator.agents.market_research.discovery.search import (
+from orchestrator.agents.market_research.ingestion.page_extractor import extract_target_urls
+from orchestrator.agents.market_research.ingestion.search_client import (
     SearchQuery,
     TavilySearchResult,
     build_search_queries,
@@ -216,9 +216,11 @@ class TestQueryGeneration:
         assert self.MOCK_CONTEXT["category"] in pricing_q.query
         assert self.MOCK_CONTEXT["product_name"] not in pricing_q.query
 
-    def test_all_queries_use_advanced_depth(self):
-        queries = build_search_queries(self.MOCK_CONTEXT)
-        assert all(q.search_depth == "advanced" for q in queries)
+    def test_discovery_uses_basic_depth_and_fact_queries_advanced(self):
+        queries = build_search_queries(self.MOCK_CONTEXT, include_leap=True)
+        broad = {"alternative_discovery", "leap_discovery"}
+        assert all(q.search_depth == "basic" for q in queries if q.vector in broad)
+        assert all(q.search_depth == "advanced" for q in queries if q.vector not in broad)
 
 
 class TestQueryRefinement:

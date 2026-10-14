@@ -90,9 +90,10 @@ async def test_edit_paths_for_missing_job_and_missing_report():
 
 def _stub_research(monkeypatch):
     """No network: search returns the named rival plus an unrelated company, crawl and ads return nothing."""
-    from orchestrator.agents.market_research.ads import ad_intelligence
-    from orchestrator.agents.market_research.discovery import crawler, search
-    from orchestrator.agents.market_research.discovery.search import TavilySearchResult
+    from orchestrator.agents.market_research.ingestion import ad_intelligence
+    from orchestrator.agents.market_research.ingestion import page_extractor as crawler
+    from orchestrator.agents.market_research.ingestion import search_client as search
+    from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult
 
     async def _search(queries, tavily_client=None):
         return [

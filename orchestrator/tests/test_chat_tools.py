@@ -74,11 +74,42 @@ async def test_edit_is_proposed_as_a_card_and_the_report_is_not_touched():
         "propose_research_competitors",
         "propose_edit",
         "propose_update_merchant_context",
+        "propose_customize_strategy",
+        "propose_rewrite_asset",
+        "propose_channel_approval",
+        "propose_reschedule",
+        "propose_regenerate_content",
     }
     action = next(f["action"] for f in frames if "action" in f)
     assert action["kind"] == "edit" and action["payload"]["edits"][0]["op"] == "remove_item"
     assert "Onboarding was slow" in action["detail"]
     assert report.competitors[0].weaknesses_mined, "a proposal must never change the report"
+    assert _tool_results(llm)[0]["status"] == "awaiting_confirmation"
+    assert frames[-1] == {"done": True}
+
+
+@pytest.mark.asyncio
+async def test_customize_strategy_is_proposed_as_card():
+    llm = _ScriptedLLM([
+        [_call("propose_customize_strategy", {
+            "budget": 15000,
+            "campaign_days": 45,
+            "add_sub_goal": "Acquire 50 enterprise pilots",
+            "selected_option_id": "opt_search_harvester",
+            "reasoning": "Accelerate inbound conversions within Q2"
+        })],
+        ["I've prepared the strategy update with $15k budget and 45 days duration — confirm the card to apply."],
+    ])
+    report = REPORT.model_copy(deep=True)
+    frames = [json.loads(f.removeprefix("data: ").strip()) async for f in stream_report_chat(
+        llm, report, MERCHANT, [ChatMessage(role="user", content="change budget to 15k for 45 days")])]
+
+    action = next(f["action"] for f in frames if "action" in f)
+    assert action["kind"] == "customize_strategy"
+    assert action["payload"]["budget"] == 15000
+    assert action["payload"]["campaign_days"] == 45
+    assert action["payload"]["add_sub_goal"] == "Acquire 50 enterprise pilots"
+    assert action["payload"]["selected_option_id"] == "opt_search_harvester"
     assert _tool_results(llm)[0]["status"] == "awaiting_confirmation"
     assert frames[-1] == {"done": True}
 
@@ -109,8 +140,8 @@ async def test_research_and_refresh_cards():
 
 @pytest.mark.asyncio
 async def test_verify_claim_refetches_only_the_reports_own_secure_sources(monkeypatch):
-    from orchestrator.agents.market_research.discovery import crawler
-    from orchestrator.agents.market_research.discovery.crawler import ExtractedPage
+    from orchestrator.agents.market_research.ingestion import page_extractor as crawler
+    from orchestrator.agents.market_research.ingestion.page_extractor import ExtractedPage
 
     fetched = []
 
@@ -144,4 +175,48 @@ async def test_tool_loop_is_bounded():
     frames = await _run(llm)
     assert len(llm.prompts) == 4, "a reply may not call tools forever"
     assert frames[-1] == {"done": True}
+
+
+@pytest.mark.asyncio
+async def test_content_and_schedule_proposal_cards():
+    from orchestrator.schemas.content import ContentAsset, ContentPack
+    pack = ContentPack(
+        assets=[
+            ContentAsset(
+                asset_id="em_01",
+                channel="email",
+                kind="email",
+                name="Email 1",
+                body="Hello world",
+                scheduled_for="2026-10-20T09:00:00Z",
+            )
+        ]
+    )
+    llm = _ScriptedLLM([
+        [_call("propose_rewrite_asset", {"asset_id": "em_01", "instruction": "Make the subject shorter and bolder"}),
+         _call("propose_channel_approval", {"channel": "email", "approved": True}, "ca1"),
+         _call("propose_reschedule", {"shift_days": 7, "channel": "email"}, "rs1")],
+        ["I've prepared the content proposals for you to confirm."],
+    ])
+    frames = [
+        json.loads(f.removeprefix("data: ").strip())
+        async for f in stream_report_chat(
+            llm,
+            REPORT.model_copy(deep=True),
+            MERCHANT,
+            [ChatMessage(role="user", content="update email 1")],
+            content_pack=pack,
+            step="content",
+        )
+    ]
+    cards = [f["action"] for f in frames if "action" in f]
+    assert len(cards) == 3
+    assert cards[0]["kind"] == "rewrite_asset"
+    assert cards[0]["payload"]["asset_id"] == "em_01"
+    assert cards[1]["kind"] == "channel_approval"
+    assert cards[1]["payload"]["channel"] == "email"
+    assert cards[2]["kind"] == "reschedule"
+    assert cards[2]["payload"]["shift_days"] == 7
+    assert frames[-1] == {"done": True}
+
 

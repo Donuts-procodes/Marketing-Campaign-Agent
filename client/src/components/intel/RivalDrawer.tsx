@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { DynamicParameterTaxonomy, CompetitorChange, ReviewAspect } from "@/types/research";
+import { ChannelListing, DynamicParameterTaxonomy, CompetitorChange, ReviewAspect } from "@/types/research";
 import { RivalView, attributeFor, hostOf, relevanceLabel } from "@/lib/rivalMetrics";
 import { safeHref, cn } from "@/lib/utils";
 import { FactSheet } from "@/components/intel/FactSheet";
@@ -35,6 +35,99 @@ interface RivalDrawerProps {
 }
 
 const H = "text-[10px] font-bold uppercase tracking-wider text-ink-faint";
+
+const SOURCE_LABEL: Record<NonNullable<ChannelListing["source"]>, { text: string; title: string; cls: string }> = {
+  page: { text: "Page", title: "Read off the listing page", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
+  search_snippet: {
+    text: "Excerpt",
+    title: "Read from the search engine's excerpt of the page (the page itself was blocked)",
+    cls: "bg-amber-50 text-amber-700 border-amber-200",
+  },
+  shopping_api: {
+    text: "Google Shopping",
+    title: "Offer data from Google Shopping (SerpApi)",
+    cls: "bg-violet-50 text-violet-700 border-violet-200",
+  },
+  ai_search: {
+    text: "AI cited",
+    title: "Found by AI web search with this page as its citation; not re-read by us",
+    cls: "bg-sky-50 text-sky-700 border-sky-200",
+  },
+};
+
+function money(value: number | null | undefined, currency: string | null | undefined): string {
+  if (value == null) return "—";
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: currency || "USD", maximumFractionDigits: 0 }).format(value);
+  } catch {
+    return `${currency ?? ""} ${value.toLocaleString()}`.trim();
+  }
+}
+
+function ListingImage({ url }: { url?: string | null }) {
+  const [failed, setFailed] = useState(false);
+  const href = safeHref(url);
+  if (!href || failed) return <div className="aspect-square bg-zinc-50" aria-hidden />;
+  return (
+    <img
+      src={href}
+      alt=""
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      onError={() => setFailed(true)}
+      className="aspect-square w-full object-contain bg-white"
+    />
+  );
+}
+
+/** Rival prices grouped by the merchant product they compare against, each with where it came from. */
+function ListingPrices({ listings }: { listings: ChannelListing[] }) {
+  const priced = listings.filter((l) => l.selling_price != null || l.mrp != null);
+  if (!priced.length) return null;
+  const groups = new Map<string, ChannelListing[]>();
+  for (const l of priced) {
+    const key = l.matched_product || "";
+    groups.set(key, [...(groups.get(key) ?? []), l]);
+  }
+  return (
+    <section className="rounded-xl bg-white border border-line p-4 space-y-3 shadow-2xs">
+      <div className={cn(H, "flex items-center gap-1.5")}>
+        <DollarSign className="w-3 h-3 text-emerald-600" /> Catalogue & prices
+      </div>
+      {[...groups.entries()].map(([product, rows]) => (
+        <div key={product || "_"} className="space-y-1.5">
+          {product && <div className="text-[11px] font-semibold text-ink-soft">vs your {product}</div>}
+          <ul className="grid grid-cols-2 gap-2">
+            {rows.map((l, i) => {
+              const src = SOURCE_LABEL[l.source ?? "page"];
+              return (
+                <li key={i} className="rounded-lg border border-line overflow-hidden flex flex-col text-xs">
+                  <ListingImage url={l.image_url} />
+                  <div className="p-2 space-y-1 min-w-0">
+                    <div className="line-clamp-2 text-ink-soft leading-snug" title={l.product}>{l.product || "Listing"}</div>
+                    <div className="flex flex-wrap items-baseline gap-x-1.5">
+                      <span className="font-bold text-ink">{money(l.selling_price, l.currency)}</span>
+                      {l.mrp != null && <span className="text-ink-faint line-through">{money(l.mrp, l.currency)}</span>}
+                      {l.discount_pct != null && <span className="text-emerald-700">{l.discount_pct}% off</span>}
+                    </div>
+                    <div className="flex items-center justify-between gap-1">
+                      <a href={safeHref(l.url)} target="_blank" rel="noreferrer" className="truncate text-ink-faint underline-offset-2 hover:underline">
+                        {l.site}
+                      </a>
+                      <span title={src.title} className={cn("shrink-0 px-1.5 py-px rounded border text-[10px] font-semibold", src.cls)}>
+                        {src.text}
+                      </span>
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ))}
+    </section>
+  );
+}
 
 function Empty({ children }: { children: string }) {
   return <p className="text-xs text-ink-faint italic py-1">{children}</p>;
@@ -322,14 +415,14 @@ export function RivalDrawer({ rivals, openIndex, taxonomy, onClose, onNavigate }
                         })()}
                       </>
                     ) : (
-                      <span className="text-ink-faint font-normal">Not stated</span>
+                      <span className="text-ink-faint font-normal" title="Not stated on any page we read">—</span>
                     )}
                   </div>
                 </div>
                 <div className="rounded-xl bg-white border border-line p-3">
                   <div className={H}>Headquarters</div>
                   <div className="mt-0.5 text-sm font-semibold text-ink truncate" title={comp.headquarters ?? comp.operating_locations?.join(", ")}>
-                    {comp.headquarters ?? (comp.operating_locations?.[0] ? comp.operating_locations[0] : <span className="text-ink-faint font-normal">Not stated</span>)}
+                    {comp.headquarters ?? (comp.operating_locations?.[0] ? comp.operating_locations[0] : <span className="text-ink-faint font-normal" title="Not stated on any page we read">—</span>)}
                   </div>
                 </div>
                 <div className="rounded-xl bg-white border border-line p-3">
@@ -340,7 +433,7 @@ export function RivalDrawer({ rivals, openIndex, taxonomy, onClose, onNavigate }
                     ) : comp.other_products?.length ? (
                       `${comp.other_products.length} other models`
                     ) : (
-                      <span className="text-ink-faint font-normal">Single model</span>
+                      <span className="text-ink-faint font-normal" title="Catalogue size not stated">—</span>
                     )}
                   </div>
                 </div>
@@ -357,10 +450,58 @@ export function RivalDrawer({ rivals, openIndex, taxonomy, onClose, onNavigate }
 
               <FactSheet comp={comp} />
 
-              {rival.completeness.missing.length > 0 && (
-                <p className="text-[11px] text-ink-faint">
-                  Not found publicly: {rival.completeness.missing.join(", ").toLowerCase()}.
-                </p>
+
+              <ListingPrices listings={comp.channel_listings ?? []} />
+
+              {comp.buying_patterns && (
+                <div className="rounded-xl bg-[#FAF6EE] border border-[#E9DFC7] p-3.5 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-[#C7431F]">
+                      Commercial Buying Patterns & Sales Channels
+                    </span>
+                    {comp.buying_patterns.sales_velocity_signals && comp.buying_patterns.sales_velocity_signals.length > 0 && (
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-white border border-[#E1D7C8] text-[#1F1A17]">
+                        {comp.buying_patterns.sales_velocity_signals[0]}
+                      </span>
+                    )}
+                  </div>
+
+                  {comp.buying_patterns.reverse_engineered_strategy && (
+                    <p className="text-xs text-[#2E2822] leading-relaxed italic border-l-2 border-[#C7431F] pl-2.5">
+                      "{comp.buying_patterns.reverse_engineered_strategy}"
+                    </p>
+                  )}
+
+                  {comp.buying_patterns.sales_channels && comp.buying_patterns.sales_channels.length > 0 && (
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-bold uppercase text-[#8A8176] block">Active Sales Channels:</span>
+                      <div className="flex flex-wrap gap-1">
+                        {comp.buying_patterns.sales_channels.map((ch, idx) => (
+                          <span key={idx} className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-white border border-[#E1D7C8] text-[#1F1A17]">
+                            {ch}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {(comp.buying_patterns.promotional_incentives?.length || comp.buying_patterns.buying_triggers?.length) ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] pt-1">
+                      {comp.buying_patterns.promotional_incentives && comp.buying_patterns.promotional_incentives.length > 0 && (
+                        <div className="p-2 rounded-lg bg-white border border-[#EFE7DB]">
+                          <span className="text-[9px] font-bold uppercase text-[#8A8176] block mb-0.5">Pricing & Offers</span>
+                          <span className="text-[#1F1A17] font-medium leading-tight">{comp.buying_patterns.promotional_incentives.join(" • ")}</span>
+                        </div>
+                      )}
+                      {comp.buying_patterns.buying_triggers && comp.buying_patterns.buying_triggers.length > 0 && (
+                        <div className="p-2 rounded-lg bg-white border border-[#EFE7DB]">
+                          <span className="text-[9px] font-bold uppercase text-[#8A8176] block mb-0.5">Conversion Triggers</span>
+                          <span className="text-[#1F1A17] font-medium leading-tight">{comp.buying_patterns.buying_triggers.join(" • ")}</span>
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
               )}
 
               <div className="rounded-xl bg-white border border-line overflow-hidden">
@@ -374,8 +515,8 @@ export function RivalDrawer({ rivals, openIndex, taxonomy, onClose, onNavigate }
                     {driverRows.map(([d, v]) => (
                       <div key={d} className="grid grid-cols-5 gap-3 px-3.5 py-2">
                         <dt className="col-span-2 text-xs font-semibold text-ink">{d.split(":")[0].replace(/_/g, " ")}</dt>
-                        <dd className={cn("col-span-3 text-xs", v ? "text-ink-soft" : "text-ink-faint italic")}>
-                          {v ?? "Not disclosed"}
+                        <dd className={cn("col-span-3 text-xs", v ? "text-ink-soft" : "text-ink-faint")} title={v ? undefined : "Not stated on their pages"}>
+                          {v ?? "—"}
                         </dd>
                       </div>
                     ))}

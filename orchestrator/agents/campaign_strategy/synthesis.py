@@ -84,45 +84,66 @@ def synthesize_strategic_angles(
 def derive_channel_matrix(
     merchant_context: dict[str, Any],
     swot_report: SWOTReportDelta | None,
+    user_budget: float | None = None,
 ) -> list[ChannelAllocation]:
     """
     Loop 2: Derives optimal channel allocations based on audience behavior,
-    category price points, and competitor blind spots.
+    category price points, and competitor blind spots, scaled to user budget.
     """
+    from orchestrator.agents.campaign_strategy.promotions import get_static_promotions
+
     category = (merchant_context.get("category") or "").lower()
+    business_model = (merchant_context.get("business_model") or "").lower()
+    campaign_type = (merchant_context.get("campaign_type") or "").lower()
     is_b2b_or_enterprise = (
         "enterprise" in category or "b2b" in category or "agency" in category or "development" in category
     )
+    base_budget = user_budget if user_budget is not None else 10000.0
+
+    promos = get_static_promotions(business_model, campaign_type, category)
+    tactics = promos.get("tactics_by_channel", {})
 
     if is_b2b_or_enterprise:
         return [
             ChannelAllocation(
                 channel="linkedin",
                 budget_percentage=40,
-                recommended_spend_usd=4000.0,
+                recommended_spend_usd=round(base_budget * 0.40, 2),
                 rationale="Primary decision-maker dwell channel. High-conviction thought leadership and sponsored InMail.",
-                projected_roi="3.4x Pipeline Return",
+                payee_platform="LinkedIn Ads (Microsoft Advertising)",
+                purchased_inventory="Sponsored Document & InMail impressions delivered to verified CTO/VP decision-makers",
+                spend_type="ad_spend",
+                promotion_tactics=tactics.get("linkedin", []),
             ),
             ChannelAllocation(
                 channel="email",
                 budget_percentage=25,
-                recommended_spend_usd=2500.0,
+                recommended_spend_usd=round(base_budget * 0.25, 2),
                 rationale="Direct account-based outreach to evaluated wedge accounts migrating off legacy tools.",
-                projected_roi="4.8x Pipeline Return",
+                payee_platform="Apollo.io / Clay & Secondary Domains (Instantly/Smartlead)",
+                purchased_inventory="Verified B2B contact records, secondary sending domains, and mailbox warmup infrastructure",
+                spend_type="data_tooling",
+                promotion_tactics=tactics.get("email", []),
             ),
             ChannelAllocation(
                 channel="retarget",
                 budget_percentage=20,
-                recommended_spend_usd=2000.0,
+                recommended_spend_usd=round(base_budget * 0.20, 2),
                 rationale="High-intent capture of visitors viewing competitor comparisons and pricing case studies.",
-                projected_roi="3.1x Conversion Return",
+                payee_platform="Meta Ads & Google Display Network",
+                purchased_inventory="Dynamic retargeting ad impressions shown to comparison landing page drop-offs",
+                spend_type="ad_spend",
+                promotion_tactics=tactics.get("retarget", []),
             ),
             ChannelAllocation(
                 channel="search",
                 budget_percentage=15,
-                recommended_spend_usd=1500.0,
+                recommended_spend_usd=round(base_budget * 0.15, 2),
                 rationale="Targeting high-intent brand-alternative search queries ('rival alternative', 'switch from rival').",
-                projected_roi="2.9x Conversion Return",
+                payee_platform="Google Ads (Alphabet)",
+                purchased_inventory="PPC keyword auction bids on competitor brand and alternative search queries",
+                spend_type="ad_spend",
+                promotion_tactics=tactics.get("search", []),
             ),
         ]
     else:
@@ -130,29 +151,41 @@ def derive_channel_matrix(
             ChannelAllocation(
                 channel="search",
                 budget_percentage=35,
-                recommended_spend_usd=3500.0,
+                recommended_spend_usd=round(base_budget * 0.35, 2),
                 rationale="Captures active category search demand with targeted solution keywords.",
-                projected_roi="3.2x ROAS",
+                payee_platform="Google Ads (Alphabet)",
+                purchased_inventory="High-intent search ad clicks for category problem terms",
+                spend_type="ad_spend",
+                promotion_tactics=tactics.get("search", []),
             ),
             ChannelAllocation(
                 channel="retarget",
                 budget_percentage=25,
-                recommended_spend_usd=2500.0,
+                recommended_spend_usd=round(base_budget * 0.25, 2),
                 rationale="Multi-touch retargeting across Meta and Display to reduce funnel abandonment.",
-                projected_roi="3.8x ROAS",
+                payee_platform="Meta Ads & Google Display Network",
+                purchased_inventory="Multi-touch retargeting banner and video ad impressions for website visitors",
+                spend_type="ad_spend",
+                promotion_tactics=tactics.get("retarget", []),
             ),
             ChannelAllocation(
                 channel="email",
                 budget_percentage=25,
-                recommended_spend_usd=2500.0,
+                recommended_spend_usd=round(base_budget * 0.25, 2),
                 rationale="Lifecycle nurturing sequences to convert trials and warm leads into paid contracts.",
-                projected_roi="5.0x LTV Return",
+                payee_platform="Marketing Automation (Klaviyo / Customer.io / ConvertKit)",
+                purchased_inventory="Email dispatch bandwidth, automated lead nurturing drip workflows, and engagement analytics",
+                spend_type="data_tooling",
+                promotion_tactics=tactics.get("email", []),
             ),
             ChannelAllocation(
                 channel="content",
                 budget_percentage=15,
-                recommended_spend_usd=1500.0,
+                recommended_spend_usd=round(base_budget * 0.15, 2),
                 rationale="Educational guides and migration benchmarks driving compounding organic discovery.",
-                projected_roi="2.5x Organic Return",
+                payee_platform="Technical Research & Content Tooling (Webflow/Vercel/Design)",
+                purchased_inventory="Interactive calculator software, ungated benchmark PDF production, and case study teardowns",
+                spend_type="asset_production",
+                promotion_tactics=tactics.get("content", []),
             ),
         ]

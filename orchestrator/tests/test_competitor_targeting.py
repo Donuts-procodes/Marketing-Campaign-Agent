@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from orchestrator.agents.market_research.discovery.crawler import (
+from orchestrator.agents.market_research.ingestion.page_extractor import (
     extract_competitor_target_urls,
 )
-from orchestrator.agents.market_research.discovery.search import TavilySearchResult
-from orchestrator.agents.market_research.pipeline.loop import (
+from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult
+from orchestrator.agents.market_research.workflow.research_loop import (
     enrich_competitors_from_pages,
     extract_preliminary_competitors,
     merge_duplicate_competitors,
@@ -169,7 +169,7 @@ def test_enrichment_only_matches_pages_from_the_competitors_own_domain():
 
 def test_extracted_price_keeps_the_whole_amount():
     """The detector regex stops after one digit; extraction must not reuse it ($49 -> $4)."""
-    from orchestrator.agents.market_research.pipeline.loop import _extract_price
+    from orchestrator.agents.market_research.workflow.research_loop import _extract_price
 
     assert _extract_price("Pro plan is $49/month per seat.") == "$49/month"
     assert _extract_price("Plans start at $1,299 per year.") == "$1,299 per year"
@@ -178,7 +178,7 @@ def test_extracted_price_keeps_the_whole_amount():
 
 
 def test_no_price_is_reported_when_the_page_states_none():
-    from orchestrator.agents.market_research.pipeline.loop import _extract_price
+    from orchestrator.agents.market_research.workflow.research_loop import _extract_price
 
     assert _extract_price("Pricing available on request") is None
     assert _extract_price("Contact us for plans") is None
@@ -197,3 +197,18 @@ def test_max_urls_is_respected():
         ranked, results, pages_per_competitor=4, max_urls=12
     )
     assert len(urls) <= 12
+
+
+def test_enrichment_extracts_logo_and_product_image():
+    comp = CompetitorProfile(
+        brand_name="Aurelius", product_name="Oxford", sources=["https://aureliusfootwear.com/"]
+    )
+    pages = [{
+        "url": "https://aureliusfootwear.com/products/oxford",
+        "markdown": "# Sovereign Oxford\n\n![Sovereign Oxford Handcrafted Leather Shoe](https://cdn.aureliusfootwear.com/oxford_hero.webp)\n\nPrice: ₹ 7,499. Handcrafted buff calf leather.",
+    }]
+
+    enrich_competitors_from_pages([comp], pages)
+
+    assert comp.logo_url == "https://www.google.com/s2/favicons?domain=aureliusfootwear.com&sz=128"
+    assert comp.product_image_url == "https://cdn.aureliusfootwear.com/oxford_hero.webp"

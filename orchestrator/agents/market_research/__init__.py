@@ -1,36 +1,41 @@
 """
 Market Research & Competitive Intelligence Agent Package.
 
-Modular Architecture:
-  - agent.py: Top-level agent orchestrator coordinating research crew and DAG nodes.
-  - service.py: HTTP microservice wrapper for autonomous container deployment.
-  - loop.py: Multi-iteration DQS convergence search loop.
-  - subagents.py: Specialised crew members (taxonomy, search, crawler, ad intel, synthesis, grounding).
-  - tools/engines:
-      * search.py (Tavily, You.com, DuckDuckGo)
-      * crawlapi.py & crawler.py (Firecrawl, Crawlbase, Tavily Extract)
-      * ad_intelligence.py (Meta, LinkedIn, Google ad libraries)
-  - evaluation & synthesis:
-      * taxonomy.py (Dynamic JTBD and minor specs reasoning)
-      * scoring.py (DQS 4-dimension composite formula)
-      * synthesis.py (Evidence-grounded SWOT and positioning matrix)
-      * grounding.py (Anti-hallucination verbatim check)
+Modular Clean Architecture:
+  - ingestion/: Web search, crawling, ad library scrapers, and URL guards.
+  - workflow/: Execution loops, candidate ranking, and subagent crew containers.
+  - intelligence/:
+      * validation/: Anti-hallucination checks, verbatim quotes, recency, and DQS scoring.
+      * profiling/: Deep competitor inspection, e-comm buying patterns, and review themes.
+      * market_mapping/: Parameter taxonomy, niche wedge finder, threat watch, and classification.
+      * advisory/: SWOT synthesis, unit economics, executive summaries, and ad copy.
+  - normalizers/: Currency parser, display validator, diffing, and delta merger.
 """
 
 from orchestrator.agents.market_research.agent import execute_market_research
-from orchestrator.agents.market_research.pipeline.loop import execute_research_loop, ResearchLoopResult
-from orchestrator.agents.market_research.analysis.scoring import calculate_dqs, DQSResult
-from orchestrator.agents.market_research.pipeline.subagents import ResearchCrew
-from orchestrator.agents.market_research.analysis.taxonomy import (
+from orchestrator.agents.market_research.workflow.research_loop import (
+    execute_research_loop,
+    ResearchLoopResult,
+    split_named,
+)
+from orchestrator.agents.market_research.workflow.subagents import ResearchCrew
+from orchestrator.agents.market_research.intelligence.validation.scoring import (
+    calculate_dqs,
+    DQSResult,
+)
+from orchestrator.agents.market_research.intelligence.market_mapping.taxonomy import (
     reason_dynamic_parameters,
     calculate_attribute_density,
 )
-from orchestrator.agents.market_research.analysis.synthesis import synthesize_swot_with_llm
+from orchestrator.agents.market_research.intelligence.advisory.synthesis import (
+    synthesize_swot_with_llm,
+)
 
 __all__ = [
     "execute_market_research",
     "execute_research_loop",
     "ResearchLoopResult",
+    "split_named",
     "calculate_dqs",
     "DQSResult",
     "ResearchCrew",

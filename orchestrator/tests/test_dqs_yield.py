@@ -13,12 +13,12 @@ Two defects, both about *acquiring* data rather than about the scoring maths:
 
 from __future__ import annotations
 
-from orchestrator.agents.market_research.analysis.scoring import (
+from orchestrator.agents.market_research.intelligence.validation.scoring import (
     PLACEHOLDER_PRICING,
     calculate_dqs,
 )
-from orchestrator.agents.market_research.discovery.crawler import extract_target_urls
-from orchestrator.agents.market_research.discovery.search import TavilySearchResult
+from orchestrator.agents.market_research.ingestion.page_extractor import extract_target_urls
+from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult
 from orchestrator.schemas.research import CompetitorProfile
 
 

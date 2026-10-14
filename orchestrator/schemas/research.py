@@ -1,6 +1,8 @@
 from __future__ import annotations
+import re
+from typing import Literal, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class DynamicParameterTaxonomy(BaseModel):
@@ -170,6 +172,10 @@ class PricingTier(BaseModel):
         description="amount normalized to a monthly figure when the period allows it, else null",
     )
     has_free_tier: bool = Field(default=False, description="True when a free plan or trial is stated")
+    commercial_motion: str | None = Field(
+        default=None,
+        description="Commercial sales motion: 'plg_freemium', 'flat_subscription', 'usage_based', 'sales_gated', 'service_retainer', or null",
+    )
     raw: str = Field(default="", description="The pricing_model string this was parsed from")
 
 
@@ -231,11 +237,134 @@ class FieldStatus(BaseModel):
     pages_checked: int = Field(default=0, description="Pages and snippets searched for this fact")
 
 
+class BuyingPatternIntelligence(BaseModel):
+    """Observable commercial buying pattern, channel distribution, and price architecture."""
+
+    sales_channels: list[str] = Field(
+        default_factory=list,
+        description="Active sales channels: Brand D2C Website, Amazon Storefront, Walmart, Myntra, TikTok Shop, etc.",
+    )
+    price_architecture: dict[str, str] = Field(
+        default_factory=dict,
+        description="Entry price, flagship SKU price, Average Order Value (AOV) indicators, and bundles.",
+    )
+    promotional_incentives: list[str] = Field(
+        default_factory=list,
+        description="Active buyer incentives: e.g. '15% off first order', Free shipping over $100, BOGO, Klarna/EMI.",
+    )
+    sales_velocity_signals: list[str] = Field(
+        default_factory=list,
+        description="Observed traction signals: Amazon '1k+ bought in past month', review count velocity, Best Seller Rank badges.",
+    )
+    buying_triggers: list[str] = Field(
+        default_factory=list,
+        description="Key hesitation reducers: '30-day wear test guarantee', size/fit guides, free exchange policy, durability warranty.",
+    )
+    trial_structure: str | None = Field(
+        default=None,
+        description="B2B trial or pilot structure, e.g. '14-day free trial no credit card', 'Interactive sandbox', 'Proof of Concept'.",
+    )
+    procurement_hurdles: list[str] = Field(
+        default_factory=list,
+        description="Vendor procurement obstacles: e.g. 'Mandatory annual upfront contract', 'SOC2 / Security questionnaire required', 'Sales-assisted procurement gate'.",
+    )
+    contract_incentives: list[str] = Field(
+        default_factory=list,
+        description="Contract commitments or incentives: e.g. '20% off annual commitment', 'Usage volume tiering', 'Custom MSA redlines'.",
+    )
+    reverse_engineered_strategy: str = Field(
+        default="",
+        description="Synthesized customer acquisition strategy deduced from their channels, pricing, velocity, and buying incentives.",
+    )
+
+
+class ListingItem(BaseModel):
+    """One product card on a store's search, category or brand page."""
+
+    name: str
+    url: str = ""
+    selling_price: float
+    mrp: float | None = None
+    rating: float | None = None
+    image_url: str | None = None
+    avg_90d: float | None = Field(default=None, description="Keepa: 90-day average price (Amazon)")
+    min_90d: float | None = None
+    sales_rank: int | None = Field(default=None, description="Keepa: current Amazon sales rank (lower sells more)")
+    matched_product: str | None = Field(default=None, description="The merchant product this item is closest to")
+    variants: int = Field(default=1, description="Size/colour variants folded into this item")
+
+
+class ChannelListing(BaseModel):
+    """
+    One place a competitor's product is sold: its own site or a marketplace page, with the price,
+    offers and terms shown there on the day we read it. The same shoe is ₹6,999 with a bank offer
+    on one marketplace and ₹7,499 with free exchange on the brand site; a single "price" hides that.
+    Every value is read from the page text; anything not stated stays null.
+    """
+
+    competitor: str = Field(..., description="Brand the listing belongs to")
+    product: str = Field(default="", description="Product/model name as listed")
+    site: str = Field(..., description="Host, e.g. 'myntra.com', 'amazon.in', 'brand.com'")
+    site_type: Literal["d2c", "marketplace", "quick_commerce", "social_shop", "offline_retail"] = "marketplace"
+    url: str = ""
+    currency: str | None = Field(default=None, description="ISO code of the prices below")
+    mrp: float | None = Field(default=None, description="List/MRP price shown, if struck through or stated")
+    selling_price: float | None = Field(default=None, description="Price a buyer pays before checkout offers")
+    discount_pct: float | None = None
+    offers: list[str] = Field(default_factory=list, description="Coupons, bank offers, BOGO, prepaid discounts")
+    rating: float | None = None
+    review_count: int | None = None
+    velocity_signal: str | None = Field(default=None, description="e.g. '500+ bought in past month', 'Bestseller'")
+    seller: str | None = Field(default=None, description="Brand-owned store vs third-party reseller")
+    delivery: str | None = None
+    returns_policy: str | None = None
+    cod_available: bool | None = None
+    observed_at: str | None = Field(default=None, description="ISO date the page was read; prices move")
+    evidence: str = Field(default="", description="Text the values were read from")
+    image_url: str | None = Field(default=None, description="Product photo from the listing page, when it has one")
+    page_kind: Literal["product", "grid"] = Field(
+        default="product",
+        description="product: one product's page. grid: a search/category/brand page listing many of the "
+        "rival's products; selling_price is then the median and price_from the cheapest",
+    )
+    price_from: float | None = Field(default=None, description="Cheapest of the rival's products on a grid page")
+    product_count: int | None = Field(default=None, description="How many of the rival's products the grid page shows")
+    items: list[ListingItem] = Field(default_factory=list, description="The rival's product cards on a grid page")
+    merchant_currency: str | None = Field(default=None, description="Set when the listing's currency differs from the merchant's")
+    price_in_merchant_currency: float | None = Field(default=None, description="selling_price converted at fx_rate")
+    fx_rate: float | None = Field(default=None, description="ECB reference rate used: merchant-currency units per listing-currency unit")
+    avg_90d: float | None = Field(default=None, description="Keepa: 90-day average price (Amazon product pages)")
+    min_90d: float | None = None
+    max_90d: float | None = None
+    sales_rank: int | None = Field(default=None, description="Keepa: current Amazon sales rank (lower sells more)")
+    sales_rank_drops_30d: int | None = Field(default=None, description="Keepa: rank improvements in 30 days, a proxy for sales")
+    matched_product: str | None = Field(
+        default=None,
+        description="Which of the merchant's products this listing is compared against; null when the "
+        "merchant listed a single product or none matched",
+    )
+    source: Literal["page", "search_snippet", "ai_search", "shopping_api"] = Field(
+        default="page",
+        description="page: read from the fetched listing page. search_snippet: read from the search "
+        "engine's excerpt of that page (the page itself was blocked or script-rendered). ai_search: "
+        "returned by a web-search model with this url as its citation, not re-read by us. shopping_api: "
+        "Google Shopping offer data (SerpApi).",
+    )
+
+
 class CompetitorProfile(BaseModel):
     """Structured profile extracted per discovered competitor."""
 
     brand_name: str = Field(..., description="Parent brand (e.g. Logitech)")
     product_name: str = Field(..., description="Specific competing product (e.g. MX Master 3S)")
+    buying_patterns: BuyingPatternIntelligence | None = Field(
+        default=None,
+        description="Observable commercial buying patterns, sales channels, unit economics, and buyer triggers",
+    )
+    channel_listings: list[ChannelListing] = Field(
+        default_factory=list,
+        description="Per-site listings (own site and marketplaces) with price, offers, rating and terms",
+    )
     pricing_model: str | None = Field(
         default=None,
         description="Pricing structure — e.g. 'one-time $99', 'freemium + $15/mo pro tier'",
@@ -362,6 +491,63 @@ class CompetitorProfile(BaseModel):
         description="'leapfrog' (grew from the merchant's level, with evidence), 'catching_up' "
         "(peer-size rival accelerating), 'peer', 'larger', 'incumbent', or '' when unknown",
     )
+    logo_url: str | None = Field(
+        default=None,
+        description="High-resolution brand logo URL resolved from domain favicon, OpenGraph, or CDN",
+    )
+    product_image_url: str | None = Field(
+        default=None,
+        description="Hero product image URL extracted from product listing or crawl metadata",
+    )
+
+    @field_validator("pricing_model", mode="before")
+    @classmethod
+    def clean_pricing_model(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        val = str(v).strip()
+        if not val or val.lower() in {
+            "n/a", "na", "unknown", "none", "null", "undefined", "not specified",
+            "not available", "tbd", "unspecified", "varies", "contact",
+            "-", "none stated", "not stated",
+        }:
+            return None
+        return val
+
+    @field_validator("rating", mode="before")
+    @classmethod
+    def validate_rating(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        val = str(v).strip()
+        if not val or val.lower() in {
+            "n/a", "na", "unknown", "none", "null", "undefined", "not specified",
+            "not available", "tbd", "detected", "-",
+        }:
+            return None
+        m = re.search(r"\b([0-5](?:\.\d{1,2})?)\b", val)
+        if m:
+            try:
+                num = float(m.group(1))
+                if 0.0 <= num <= 5.0:
+                    return f"{num:.1f}" if "." in m.group(1) else str(int(num))
+            except ValueError:
+                pass
+        return None
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def validate_sources(cls, v: Any) -> list[str]:
+        if not v or not isinstance(v, list):
+            return []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in v:
+            s = str(item).strip()
+            if (s.startswith("http://") or s.startswith("https://")) and s not in seen:
+                seen.add(s)
+                cleaned.append(s)
+        return cleaned
 
 
 class SWOTAnalysis(BaseModel):
@@ -371,6 +557,18 @@ class SWOTAnalysis(BaseModel):
     weaknesses: list[str] = Field(default_factory=list)
     opportunities: list[str] = Field(default_factory=list)
     threats: list[str] = Field(default_factory=list)
+
+    @field_validator("strengths", "weaknesses", "opportunities", "threats", mode="before")
+    @classmethod
+    def clean_swot_items(cls, v: Any) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        out: list[str] = []
+        for item in v:
+            s = str(item).strip()
+            if len(s) >= 8 and s.lower() not in {"n/a", "unknown", "none", "tbd"}:
+                out.append(s)
+        return out
 
 
 class MarketPositioningGap(BaseModel):
@@ -550,6 +748,158 @@ class ThreatWatch(BaseModel):
     )
 
 
+
+class DossierAudit(BaseModel):
+    """Critical audit of merchant's product claims, construction, and certification status."""
+
+    verified_claims: list[str] = Field(default_factory=list)
+    unsubstantiated_claims: list[str] = Field(
+        default_factory=list,
+        description="Claims that require physical lab or wear-testing verification before advertising (e.g. 'zero break-in', '12-hour comfort')",
+    )
+    spec_inconsistencies: list[str] = Field(
+        default_factory=list,
+        description="Inconsistencies detected in product descriptions (e.g. Goodyear-welted claim vs cemented hybrid sole)",
+    )
+    regulatory_and_compliance: list[str] = Field(
+        default_factory=list,
+        description="Applicable mandatory standards, certifications, and compliance requirements (e.g. BIS footwear QCO, GST brackets)",
+    )
+
+
+class UnitEconomicsScenario(BaseModel):
+    """One price/CAC scenario in the unit contribution model."""
+
+    label: str = Field(..., description="Scenario name (e.g. 'Base Case', 'Conservative / High Returns')")
+    target_price: float = Field(..., description="Gross retail price")
+    estimated_bom: float = Field(..., description="Landed manufacturing / BOM cost")
+    packaging_and_shipping: float = Field(default=0.0)
+    payment_fee: float = Field(default=0.0)
+    returns_allowance: float = Field(default=0.0, description="Allowance for size exchanges and return logistics")
+    cac: float = Field(default=0.0, description="Blended customer acquisition cost")
+    net_revenue_ex_tax: float = Field(default=0.0, description="Revenue excluding applicable taxes")
+    contribution_per_unit: float = Field(default=0.0, description="Net contribution before fixed overhead")
+    contribution_margin_pct: float = Field(default=0.0, description="Contribution margin as a percentage")
+
+
+class UnitEconomicsModel(BaseModel):
+    """Unit economics simulation for merchant's flagship product."""
+
+    scenarios: list[UnitEconomicsScenario] = Field(default_factory=list)
+    tax_treatment_note: str = Field(default="")
+    break_even_units_per_month: int | None = Field(default=None)
+    financial_decision_rules: list[str] = Field(default_factory=list)
+
+
+class LaunchRoadmapPhase(BaseModel):
+    """One 30-day block in the 90-day launch roadmap."""
+
+    phase_name: str = Field(..., description="e.g. 'Days 1–30: Validate the Product'")
+    objective: str = Field(...)
+    action_items: list[str] = Field(default_factory=list)
+    gate_to_proceed: str = Field(..., description="Quantifiable criteria required to unlock the next phase")
+
+
+class LaunchRoadmap(BaseModel):
+    """Structured 30-60-90 day GTM execution roadmap."""
+
+    phases: list[LaunchRoadmapPhase] = Field(default_factory=list)
+    key_metrics_dashboard: list[dict[str, str]] = Field(default_factory=list)
+
+
+class SourcedPoint(BaseModel):
+    """One market or audience statement and where it came from."""
+
+    text: str
+    source_url: str | None = Field(default=None, description="Page it was read from; null when from the merchant's brief")
+    from_merchant: bool = Field(default=False, description="Taken from the merchant's own brief or documents")
+
+
+class MarketTrend(SourcedPoint):
+    signal: Literal["rising", "falling", "new", "steady"] = "rising"
+
+
+class MarketOverview(BaseModel):
+    """The market around the rivals: what is moving and where the openings are. Every point is sourced."""
+
+    summary: str = ""
+    key_findings: list[SourcedPoint] = Field(default_factory=list)
+    positioning_opportunities: list[SourcedPoint] = Field(default_factory=list)
+    trends: list[MarketTrend] = Field(default_factory=list)
+
+
+class IdealCustomerProfile(BaseModel):
+    name: str = ""
+    description: str = ""
+    attributes: dict[str, str] = Field(default_factory=dict, description="e.g. age band, city tier, income, occasion")
+    why: list[SourcedPoint] = Field(default_factory=list, description="Why this is the customer to win first")
+    fit_signals: list[str] = Field(default_factory=list)
+    low_fit_signals: list[str] = Field(default_factory=list)
+
+
+class AudienceSegment(BaseModel):
+    name: str
+    definition: str = ""
+    trigger: str = ""
+    size_note: str | None = Field(default=None, description="Only a size stated by a source or the merchant; never estimated")
+    source_url: str | None = None
+
+
+class ReachChannel(SourcedPoint):
+    """Where the audience can be reached (text is the channel name) and why."""
+
+    reason: str = ""
+
+
+class AudienceProfile(BaseModel):
+    """Who to sell to, built from rival reviews, buying patterns, market pages and the merchant's brief."""
+
+    icp: IdealCustomerProfile | None = None
+    segments: list[AudienceSegment] = Field(default_factory=list)
+    pains: list[SourcedPoint] = Field(default_factory=list)
+    motivations: list[SourcedPoint] = Field(default_factory=list)
+    behaviors: list[SourcedPoint] = Field(default_factory=list)
+    triggers: list[SourcedPoint] = Field(default_factory=list)
+    barriers: list[SourcedPoint] = Field(default_factory=list)
+    channels: list[ReachChannel] = Field(default_factory=list)
+    preferred_message: str = ""
+
+
+class DemandPoint(BaseModel):
+    date: str
+    value: int = Field(description="Google Trends interest, 0-100 relative to the period's peak")
+
+
+class TrendingSearch(BaseModel):
+    query: str
+    growth: str = Field(default="", description="As Google reports it, e.g. '+40%' or 'Breakout'")
+
+
+class MarketDemand(BaseModel):
+    """How demand for the category is moving, from search interest and marketplace purchase badges."""
+
+    keyword: str
+    geo: str = ""
+    source: str = "Google Trends"
+    available: bool = True
+    unavailable_reason: str | None = None
+    series: list[DemandPoint] = Field(default_factory=list)
+    direction: Literal["rising", "falling", "flat"] = "flat"
+    change_pct: float | None = Field(default=None, description="Last 13 weeks vs the 13 before, %")
+    current_vs_year_pct: float | None = Field(default=None, description="Last 4 weeks vs the 12-month average, %")
+    peak_months: list[str] = Field(default_factory=list)
+    low_months: list[str] = Field(default_factory=list)
+    rising_searches: list[TrendingSearch] = Field(default_factory=list)
+    top_searches: list[str] = Field(default_factory=list)
+    purchase_signals: list[str] = Field(default_factory=list, description="'500+ bought in past month' badges on rival listings")
+    monthly_volume: int | None = Field(default=None, description="DataForSEO / Google Ads: average monthly searches for the keyword")
+    cpc: float | None = Field(default=None, description="Google Ads average cost per click, in the account currency")
+    competition: str | None = Field(default=None, description="Google Ads advertiser competition: LOW / MEDIUM / HIGH")
+    keyword_volumes: list[dict] = Field(default_factory=list, description="[{keyword, volume, cpc}] for related searches")
+    volume_series: list[DemandPoint] = Field(default_factory=list, description="Monthly search counts (absolute)")
+    mood: str = Field(default="", description="One line composed from the figures above")
+
+
 class SWOTReportDelta(BaseModel):
     """
     Immutable delta emitted by the Market Research Agent.
@@ -612,3 +962,23 @@ class SWOTReportDelta(BaseModel):
         default_factory=list,
         description="Aspirational breakout competitors that started similar to the merchant and took a big leap in clients, deals, and valuation",
     )
+    dossier_audit: DossierAudit | None = Field(
+        default=None,
+        description="Critical audit of merchant product claims, specifications, and certification gaps",
+    )
+    unit_economics: UnitEconomicsModel | None = Field(
+        default=None,
+        description="Financial unit economics and contribution margin model across test price points",
+    )
+    market_overview: MarketOverview | None = Field(
+        default=None, description="Market findings, trends and positioning openings, each with its source"
+    )
+    demand: MarketDemand | None = Field(default=None, description="Search-interest trend, seasonality and rising searches")
+    audience: AudienceProfile | None = Field(
+        default=None, description="ICP, segments, pains, triggers and channels, each with its source"
+    )
+    launch_roadmap: LaunchRoadmap | None = Field(
+        default=None,
+        description="30-60-90 day phased go-to-market validation roadmap and decision gates",
+    )
+

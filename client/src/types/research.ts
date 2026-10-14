@@ -135,9 +135,20 @@ export interface FieldStatus {
   pages_checked?: number;
 }
 
+export interface BuyingPatternIntelligence {
+  sales_channels?: string[];
+  price_architecture?: Record<string, string>;
+  promotional_incentives?: string[];
+  sales_velocity_signals?: string[];
+  buying_triggers?: string[];
+  reverse_engineered_strategy?: string;
+}
+
 export interface CompetitorProfile {
   brand_name: string;
   product_name: string;
+  buying_patterns?: BuyingPatternIntelligence | null;
+  channel_listings?: ChannelListing[];
   pricing_model: string | null;
   core_claims: string[];
   weaknesses_mined: string[];
@@ -183,6 +194,10 @@ export interface CompetitorProfile {
   cohort?: string;
   /** You listed this rival; it was researched on top of the ones found independently. */
   named_by_merchant?: boolean;
+  /** High-resolution brand logo URL. */
+  logo_url?: string | null;
+  /** Hero product image URL. */
+  product_image_url?: string | null;
 }
 
 export interface DynamicParameterTaxonomy {
@@ -238,4 +253,135 @@ export interface SWOTReportDelta {
   wedge_scan?: WedgeScan | null;
   threat_watch?: ThreatWatch | null;
   leap_benchmarks?: LeapBenchmark[];
+  market_overview?: MarketOverview | null;
+  audience?: AudienceProfile | null;
+  demand?: MarketDemand | null;
+}
+
+/** One place a rival's product is sold (own site or marketplace), as read from that page. */
+export interface ChannelListing {
+  competitor: string;
+  product?: string;
+  site: string;
+  site_type: "d2c" | "marketplace" | "quick_commerce" | "social_shop" | "offline_retail";
+  url?: string;
+  currency?: string | null;
+  mrp?: number | null;
+  selling_price?: number | null;
+  discount_pct?: number | null;
+  offers?: string[];
+  rating?: number | null;
+  review_count?: number | null;
+  velocity_signal?: string | null;
+  seller?: string | null;
+  delivery?: string | null;
+  returns_policy?: string | null;
+  cod_available?: boolean | null;
+  observed_at?: string | null;
+  evidence?: string;
+  image_url?: string | null;
+  page_kind?: "product" | "grid";
+  price_from?: number | null;
+  product_count?: number | null;
+  items?: ListingItem[];
+  merchant_currency?: string | null;
+  price_in_merchant_currency?: number | null;
+  fx_rate?: number | null;
+  /** Merchant product this listing is compared against; null for single-product merchants. */
+  matched_product?: string | null;
+  /** page: read off the listing page. search_snippet: from the search engine's excerpt. ai_search: cited by a web-search model. */
+  source?: "page" | "search_snippet" | "ai_search" | "shopping_api";
+  avg_90d?: number | null;
+  min_90d?: number | null;
+  max_90d?: number | null;
+  sales_rank?: number | null;
+  sales_rank_drops_30d?: number | null;
+}
+
+/** One market or audience statement and where it came from. */
+export interface SourcedPoint {
+  text: string;
+  source_url?: string | null;
+  from_merchant?: boolean;
+}
+
+export interface MarketTrend extends SourcedPoint {
+  signal: "rising" | "falling" | "new" | "steady";
+}
+
+export interface MarketOverview {
+  summary: string;
+  key_findings: SourcedPoint[];
+  positioning_opportunities: SourcedPoint[];
+  trends: MarketTrend[];
+}
+
+export interface IdealCustomerProfile {
+  name: string;
+  description: string;
+  attributes: Record<string, string>;
+  why: SourcedPoint[];
+  fit_signals: string[];
+  low_fit_signals: string[];
+}
+
+export interface AudienceSegment {
+  name: string;
+  definition: string;
+  trigger: string;
+  size_note?: string | null;
+  source_url?: string | null;
+}
+
+export interface ReachChannel extends SourcedPoint {
+  reason: string;
+}
+
+export interface AudienceProfile {
+  icp?: IdealCustomerProfile | null;
+  segments: AudienceSegment[];
+  pains: SourcedPoint[];
+  motivations: SourcedPoint[];
+  behaviors: SourcedPoint[];
+  triggers: SourcedPoint[];
+  barriers: SourcedPoint[];
+  channels: ReachChannel[];
+  preferred_message: string;
+}
+
+export interface ListingItem {
+  name: string;
+  url: string;
+  selling_price: number;
+  mrp?: number | null;
+  rating?: number | null;
+  image_url?: string | null;
+  avg_90d?: number | null;
+  min_90d?: number | null;
+  sales_rank?: number | null;
+  matched_product?: string | null;
+  variants?: number;
+}
+
+export interface MarketDemand {
+  keyword: string;
+  geo: string;
+  source: string;
+  available: boolean;
+  unavailable_reason?: string | null;
+  series: { date: string; value: number }[];
+  direction: "rising" | "falling" | "flat";
+  change_pct?: number | null;
+  current_vs_year_pct?: number | null;
+  peak_months: string[];
+  low_months: string[];
+  rising_searches: { query: string; growth: string }[];
+  top_searches: string[];
+  purchase_signals: string[];
+  monthly_volume?: number | null;
+  cpc?: number | null;
+  competition?: string | null;
+  keyword_volumes?: { keyword: string; volume: number | null; cpc: number | null }[];
+  volume_series?: { date: string; value: number }[];
+  mood: string;
 }

@@ -18,7 +18,8 @@ import {
   UploadDossierResponse,
 } from "@/types/api";
 import type { SWOTReportDelta } from "@/types/research";
-import type { CampaignStrategyBrief } from "@/types/strategy";
+import type { CampaignStrategyBrief, StrategyCustomizeRequest } from "@/types/strategy";
+import type { ChannelKey, ContentAsset, ContentPack } from "@/types/content";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_URL?.replace(/\/$/, "") || "";
@@ -293,7 +294,16 @@ export interface ChatTurn {
 /** A change the assistant proposed; it only runs when the merchant confirms it. */
 export interface ChatAction {
   id: string;
-  kind: "refresh" | "research" | "edit" | "update_context";
+  kind:
+    | "refresh"
+    | "research"
+    | "edit"
+    | "update_context"
+    | "customize_strategy"
+    | "rewrite_asset"
+    | "channel_approval"
+    | "reschedule"
+    | "regenerate_content";
   title: string;
   detail: string;
   payload: {
@@ -302,6 +312,21 @@ export interface ChatAction {
     field?: string;
     value?: unknown;
     reasoning?: string;
+    budget?: number;
+    campaign_days?: number;
+    sub_goals?: string[];
+    add_sub_goal?: string;
+    campaign_type?: string;
+    selected_option_id?: string;
+    custom_goal?: string;
+    asset_id?: string;
+    instruction?: string;
+    channel?: string;
+    approved?: boolean;
+    shift_days?: number;
+    time_of_day?: string;
+    asset_ids?: string[];
+    reason?: string;
   };
 }
 
@@ -335,6 +360,23 @@ export interface ChatStreamHandlers {
   onStatus?: (status: string) => void;
 }
 
+export interface ChatOpeningResponse {
+  step: string;
+  message: string;
+  suggestions: string[];
+}
+
+/** Fetches the zero-latency opening message and suggested chips for a step. */
+export async function fetchChatOpening(
+  jobId: string,
+  step: string
+): Promise<ChatOpeningResponse> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/chat/opening?step=${encodeURIComponent(step)}`
+  );
+  return handleResponse<ChatOpeningResponse>(response);
+}
+
 /**
  * Asks a question about a run's report. The answer streams as server-sent events over the
  * POST response: text pieces, tool status lines, live source checks, and proposed actions.
@@ -344,12 +386,18 @@ export async function streamReportChat(
   jobId: string,
   messages: ChatTurn[],
   handlers: ChatStreamHandlers,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  step?: string,
+  focusAssetId?: string
 ): Promise<{ offTopic: boolean }> {
+  const body: Record<string, unknown> = { messages };
+  if (step) body.step = step;
+  if (focusAssetId) body.focus_asset_id = focusAssetId;
+
   const response = await fetch(`${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify(body),
     signal,
   });
   if (!response.ok || !response.body) {
@@ -391,15 +439,97 @@ export async function streamReportChat(
 }
 
 /**
+ * Customizes budget allocations, days, sub-goals, and selected strategy option for Campaign Strategy Brief.
+ */
+export async function customizeCampaignStrategy(
+  jobId: string,
+  payload: StrategyCustomizeRequest
+): Promise<CampaignStrategyBrief> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/strategy/customize`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+  return handleResponse<CampaignStrategyBrief>(response);
+}
+
+/**
  * Founder approval gate for Campaign Strategy Brief.
  */
-export async function approveCampaignStrategy(jobId: string): Promise<CampaignStrategyBrief> {
+export async function approveCampaignStrategy(
+  jobId: string,
+  payload?: StrategyCustomizeRequest
+): Promise<CampaignStrategyBrief> {
   const response = await fetch(
     `${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/strategy/approve`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: payload ? JSON.stringify(payload) : undefined,
     }
   );
   return handleResponse<CampaignStrategyBrief>(response);
+}
+
+// ── Campaign content ────────────────────────────────────────────────────────
+
+const contentUrl = (jobId: string, path = "") =>
+  `${API_BASE_URL}/api/v1/campaigns/${encodeURIComponent(jobId)}/content${path}`;
+
+export async function getCampaignContent(jobId: string): Promise<ContentPack | null> {
+  return handleResponse<ContentPack | null>(await fetch(contentUrl(jobId)));
+}
+
+export async function generateCampaignContent(jobId: string): Promise<void> {
+  await handleResponse<unknown>(await fetch(contentUrl(jobId, "/generate"), { method: "POST" }));
+}
+
+export async function editCampaignAsset(
+  jobId: string,
+  assetId: string,
+  fields: Partial<Pick<ContentAsset, "name" | "subject" | "preview_text" | "body" | "headlines" | "descriptions" | "cta" | "landing_url" | "creative_brief" | "hashtags">>
+): Promise<ContentAsset> {
+  return handleResponse<ContentAsset>(
+    await fetch(contentUrl(jobId, `/${encodeURIComponent(assetId)}`), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fields),
+    })
+  );
+}
+
+export async function regenerateCampaignAsset(jobId: string, assetId: string, instruction?: string): Promise<ContentAsset> {
+  return handleResponse<ContentAsset>(
+    await fetch(contentUrl(jobId, `/${encodeURIComponent(assetId)}/regenerate`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instruction: instruction || null }),
+    })
+  );
+}
+
+export async function setChannelApproval(jobId: string, channel: ChannelKey, approved: boolean): Promise<ContentPack> {
+  return handleResponse<ContentPack>(
+    await fetch(contentUrl(jobId, "/approval"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel, approved }),
+    })
+  );
+}
+
+export async function rescheduleCampaignContent(
+  jobId: string,
+  payload: { shift_days?: number; time_of_day?: string; channel?: string; asset_ids?: string[] }
+): Promise<ContentPack> {
+  return handleResponse<ContentPack>(
+    await fetch(contentUrl(jobId, "/reschedule"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+  );
 }

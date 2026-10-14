@@ -43,12 +43,21 @@ export interface BYOKConfig {
 import type { CompetitorProfile, SWOTReportDelta } from "./research";
 import type { CampaignStrategyBrief } from "./strategy";
 
+/** One product in the merchant's line; competitor prices are compared per product. */
+export interface MerchantProduct {
+  name: string;
+  category?: string;
+  price?: number;
+  mrp?: number;
+}
+
 export interface MerchantContext {
   product_name: string;
   category: string;
   primary_value_prop: string;
   goal?: string;
   price_usd?: number;
+  products?: MerchantProduct[];
   known_competitors?: string[];
   existing_customer_profiles?: string[];
   target_geography?: string;

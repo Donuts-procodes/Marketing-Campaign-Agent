@@ -30,7 +30,7 @@ app = create_agent_microservice(
         "media_mix_modeling",
     ],
     input_schema="StrategyState (swot_report, persona_profiles)",
-    output_contract="CampaignBriefDelta (channel_budgets, kpis, schedule)",
+    output_schema="CampaignBriefDelta (channel_budgets, kpis, schedule)",
 )
 
 if __name__ == "__main__":

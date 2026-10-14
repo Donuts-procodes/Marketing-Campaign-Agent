@@ -16,11 +16,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.agents.market_research.agent import execute_market_research
-from orchestrator.agents.market_research.pipeline.loop import (
+from orchestrator.agents.market_research.workflow.research_loop import (
     _extract_brand_from_url,
     extract_preliminary_competitors as _extract_preliminary_competitors,
 )
-from orchestrator.agents.market_research.discovery.search import TavilySearchResult
+from orchestrator.agents.market_research.ingestion.search_client import TavilySearchResult
 from orchestrator.schemas.research import (
     CompetitorProfile,
     MarketPositioningGap,
@@ -306,6 +306,13 @@ class TestSynthesisFallbackInventsNothing:
     A templated SWOT reads like a finding, and the grounding gate validates competitor
     fields rather than SWOT prose, so anything asserted here would go unchallenged.
     """
+
+    @pytest.fixture(autouse=True)
+    def _deep_research(self, monkeypatch):
+        """Retry rounds are carried and capped only in deep research."""
+        from orchestrator.core.config import get_settings
+
+        monkeypatch.setattr(get_settings(), "research_depth", "deep")
 
     @staticmethod
     def _llm_that_fails_synthesis():

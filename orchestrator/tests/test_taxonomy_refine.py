@@ -1,4 +1,4 @@
-from orchestrator.agents.market_research.analysis.taxonomy import refine_parameters_from_findings
+from orchestrator.agents.market_research.intelligence.market_mapping.taxonomy import refine_parameters_from_findings
 from orchestrator.schemas.research import DynamicParameterTaxonomy
 
 BASE = DynamicParameterTaxonomy(critical_jtbd_drivers=["price"], minor_attributes=["support_hours"])

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.agents.market_research.discovery.query_validator import (
+from orchestrator.agents.market_research.ingestion.query_validator import (
     MAX_EXCLUSIONS,
     MAX_QUERY_CHARS,
     validate_search_query,
 )
-from orchestrator.agents.market_research.discovery.search import build_search_queries
+from orchestrator.agents.market_research.ingestion.search_client import build_search_queries
 
 
 class TestRejectsUnusableQueries:

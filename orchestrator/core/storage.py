@@ -28,6 +28,7 @@ class Storage:
     def __init__(self) -> None:
         self.mongo: Any = None
         self.runs: Any = None  # campaign_runs collection
+        self.search_cache: Any = None  # search_cache collection (TTL-expired)
         self.redis: Any = None
 
     async def connect(self) -> None:
@@ -40,6 +41,16 @@ class Storage:
                 await self.mongo.admin.command("ping")
                 self.runs = self.mongo[settings.mongo_db]["campaign_runs"]
                 await self.runs.create_index("job_id", unique=True)
+                if settings.search_cache_ttl_hours > 0:
+                    self.search_cache = self.mongo[settings.mongo_db]["search_cache"]
+                    await self.search_cache.create_index("key", unique=True)
+                    ttl = settings.search_cache_ttl_hours * 3600
+                    try:
+                        await self.search_cache.create_index("created_at", expireAfterSeconds=ttl)
+                    except Exception:
+                        # TTL changed since the index was built: rebuild it with the new window.
+                        await self.search_cache.drop_index("created_at_1")
+                        await self.search_cache.create_index("created_at", expireAfterSeconds=ttl)
                 logger.info("MongoDB connected (%s)", settings.mongo_db)
             except Exception as exc:
                 logger.warning("MongoDB unavailable, runs are kept in memory only: %s", type(exc).__name__)
@@ -62,7 +73,7 @@ class Storage:
     async def _close_mongo(self) -> None:
         if self.mongo is not None:
             await self.mongo.close()
-        self.mongo = self.runs = None
+        self.mongo = self.runs = self.search_cache = None
 
     async def _close_redis(self) -> None:
         if self.redis is not None:
@@ -101,9 +112,10 @@ class Storage:
         if not name_lower:
             return None
         try:
+            # Match on a light projection first; only the winning run's full body is fetched.
             cursor = self.runs.find(
                 {"status": "complete"},
-                {"_id": 0},
+                {"_id": 0, "job_id": 1, "merchant_context.product_name": 1, "merchant_context.category": 1},
             ).sort("finished_at", -1).limit(50)
             async for doc in cursor:
                 ctx = doc.get("merchant_context", {})
@@ -111,7 +123,7 @@ class Storage:
                 stored_cat = (ctx.get("category") or "").strip().lower()
                 if stored_name == name_lower:
                     if not category or not stored_cat or stored_cat == category.strip().lower():
-                        return doc
+                        return await self.runs.find_one({"job_id": doc["job_id"]}, {"_id": 0})
         except Exception as exc:
             logger.warning("Could not query prior run for %r: %s", product_name, type(exc).__name__)
         return None
@@ -130,6 +142,32 @@ class Storage:
         except Exception as exc:
             logger.warning("Could not list runs from MongoDB: %s", type(exc).__name__)
             return []
+
+    # ── MongoDB: cross-run search cache ─────────────────────────────────────
+
+    async def get_cached_search(self, key: str) -> list[dict[str, Any]] | None:
+        if self.search_cache is None:
+            return None
+        try:
+            doc = await self.search_cache.find_one({"key": key}, {"_id": 0, "results": 1})
+            return doc["results"] if doc else None
+        except Exception as exc:
+            logger.debug("Search cache read failed: %s", type(exc).__name__)
+            return None
+
+    async def set_cached_search(self, key: str, results: list[dict[str, Any]]) -> None:
+        if self.search_cache is None:
+            return
+        from datetime import datetime, timezone
+
+        try:
+            await self.search_cache.replace_one(
+                {"key": key},
+                {"key": key, "results": results, "created_at": datetime.now(timezone.utc)},
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.debug("Search cache write failed: %s", type(exc).__name__)
 
     async def update_run(self, job_id: str, fields: dict[str, Any]) -> bool:
         """Merges `fields` into a saved run (e.g. a label). True when a run was updated."""
